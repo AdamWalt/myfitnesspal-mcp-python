@@ -9,7 +9,12 @@ A [Model Context Protocol (MCP)](https://modelcontextprotocol.io/) server that e
 | `mfp_get_diary` | Read | Get food diary entries for any date |
 | `mfp_search_food` | Read | Search the MyFitnessPal food database |
 | `mfp_get_food_details` | Read | Get detailed nutrition info for a food item |
+| `mfp_get_recent_foods` | Read | Get recently used foods from the authenticated account |
+| `mfp_get_frequent_foods` | Read | Get most-used foods from the authenticated account |
+| `mfp_get_my_foods` | Read | Get foods created or saved by the authenticated account |
 | `mfp_add_food_to_diary` | Write | Add a food item to your diary for a specific meal and date |
+| `mfp_update_food_entry` | Write | Update an existing diary entry by `entry_id` |
+| `mfp_delete_food_entry` | Write | Delete an existing diary entry by `entry_id` |
 | `mfp_get_measurements` | Read | Get weight/body measurement history |
 | `mfp_set_measurement` | Write | Log a new weight or body measurement |
 | `mfp_get_exercises` | Read | Get logged exercises (cardio & strength) |
@@ -371,6 +376,20 @@ pip install -e .
 2. Check the date format (YYYY-MM-DD)
 3. Try a recent date where you know you have entries
 
+### `My Foods` or `My Meals` routes redirect to logout
+
+**Problem**: Newer account pages like `/food/mine`, `/meal/mine`, or `/food/new`
+can redirect to `/account/logout` even when diary reads and API token fetches still work.
+
+**Solution**:
+1. Use the MCP tools `mfp_get_recent_foods`, `mfp_get_frequent_foods`, and `mfp_get_my_foods`
+2. Those tools intentionally use the legacy add-to-diary page and its AJAX endpoints:
+   - `/food/load_recent`
+   - `/food/load_most_used`
+   - `/food/load_my_foods`
+3. If you are extending the server, fetch a fresh CSRF token from `/user/<username>/diary/add?...`
+   and send the AJAX headers that page expects
+
 ### Double parentheses in terminal prompt like "((venv) )"
 
 **Problem**: VS Code/Cursor Python extension bug with venv prompt.
@@ -392,6 +411,8 @@ Get food diary for a specific date.
 - `date` (optional): YYYY-MM-DD format, defaults to today
 - `response_format`: "markdown" or "json"
 
+When `response_format` is `json`, each meal entry includes an `entry_id` that can be passed to `mfp_update_food_entry` and `mfp_delete_food_entry`.
+
 ### mfp_search_food
 Search the MyFitnessPal food database.
 - `query` (required): Search term
@@ -402,6 +423,24 @@ Search the MyFitnessPal food database.
 Get detailed nutrition for a food item.
 - `mfp_id` (required): MyFitnessPal food ID from search results
 - `response_format`: "markdown" or "json"
+
+### mfp_get_recent_foods
+Get recently used foods for the authenticated account.
+- `limit` (optional): Max results (default 10, max 100)
+- `response_format`: "markdown" or "json"
+
+### mfp_get_frequent_foods
+Get most-used foods for the authenticated account.
+- `limit` (optional): Max results (default 10, max 100)
+- `response_format`: "markdown" or "json"
+
+### mfp_get_my_foods
+Get foods created or saved by the authenticated account.
+- `limit` (optional): Max results (default 100, max 100)
+- `response_format`: "markdown" or "json"
+
+These three tools use the legacy add-to-diary AJAX endpoints because the newer
+`/food/mine` and related pages can redirect away from authenticated sessions.
 
 ### mfp_add_food_to_diary
 Add a food item to your diary for a specific meal and date.
@@ -414,6 +453,24 @@ Add a food item to your diary for a specific meal and date.
 **Example workflow:**
 1. Use `mfp_search_food` to find a food item and get its `mfp_id`
 2. Use `mfp_add_food_to_diary` with the `mfp_id` to add it to your diary
+
+The add response includes the created `entry_id` when the server can confirm the new diary row.
+
+### mfp_update_food_entry
+Update an existing diary entry.
+- `entry_id` (required): Diary entry ID from `mfp_get_diary` JSON output
+- `date` (optional): YYYY-MM-DD format (default: today)
+- `meal` (optional): New meal name
+- `quantity` (optional): New number of servings
+- `unit` (optional): New serving-size label
+- `weight_id` (optional): Raw MyFitnessPal serving-size option ID
+
+MyFitnessPal can rewrite an entry during edit and return a replacement row. The tool response includes `current_entry_id` and `entry_id_changed` so callers can keep tracking the right diary row after an update.
+
+### mfp_delete_food_entry
+Delete an existing diary entry.
+- `entry_id` (required): Diary entry ID from `mfp_get_diary` JSON output
+- `date` (optional): YYYY-MM-DD format (default: today)
 
 ### mfp_get_measurements
 Get body measurement history.
