@@ -22,6 +22,7 @@ from typing import Optional, Dict, Any, List
 from enum import Enum
 from collections import OrderedDict
 import time
+from cryptography.fernet import Fernet
 
 import httpx
 from mcp.server.fastmcp import FastMCP
@@ -133,6 +134,47 @@ def dict_to_cookiejar(cookies_dict: Dict[str, str], domain: str = ".myfitnesspal
     
     return jar
 
+def looks_like_fernet_token(value: str) -> bool:
+    """Return True if the value appears to be a Fernet token."""
+    if not value:
+        return False
+    # Fernet tokens are URL-safe base64-encoded and typically begin with "gAAAAA".
+    # Use a lightweight prefix check so plaintext credentials continue to work
+    # even when MFP_SECRET_KEY is configured.
+    return value.startswith("gAAAAA")
+
+
+def get_decrypted_credential(env_var_name: str) -> Optional[str]:
+    """Retrieves credentials from environment variables, decrypting Fernet tokens when needed.
+
+    Returns the decrypted string on success, the raw value when no decryption is needed,
+    or None if the env var is missing or decryption fails.
+    """
+    encrypted_value = os.environ.get(env_var_name)
+    secret_key = os.environ.get("MFP_SECRET_KEY")
+
+    if not encrypted_value:
+        logger.warning(f"Missing {env_var_name}.")
+        return encrypted_value
+
+    if not secret_key:
+        if looks_like_fernet_token(encrypted_value):
+            logger.info(
+                f"{env_var_name} appears to be encrypted, but MFP_SECRET_KEY is not set. "
+                "Using raw value as provided."
+            )
+        return encrypted_value
+
+    if not looks_like_fernet_token(encrypted_value):
+        logger.info(f"{env_var_name} does not appear to be Fernet-encrypted; using raw value.")
+        return encrypted_value
+
+    try:
+        f = Fernet(secret_key.encode())
+        return f.decrypt(encrypted_value.encode()).decode()
+    except Exception as e:
+        logger.error(f"Decryption failed for {env_var_name}: {e}")
+        return None
 
 def authenticate_with_credentials(username: str, password: str) -> Dict[str, str]:
     """
@@ -226,8 +268,8 @@ def get_mfp_client():
     last_error = None
     
     # Method 1: Try environment variable credentials
-    username = os.environ.get("MFP_USERNAME")
-    password = os.environ.get("MFP_PASSWORD")
+    username = get_decrypted_credential("MFP_USERNAME")
+    password = get_decrypted_credential("MFP_PASSWORD")
     
     if username and password:
         logger.info("Attempting authentication with environment credentials")

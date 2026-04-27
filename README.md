@@ -35,7 +35,8 @@ This MCP supports multiple authentication methods:
 
 | Method | Setup | Persistence |
 |--------|-------|-------------|
-| **Credentials in config** | Add `MFP_USERNAME` and `MFP_PASSWORD` to Claude Desktop config | Automatic (session cached 30 days) |
+| **Encrypted credentials** | Add `MFP_USERNAME`, `MFP_PASSWORD`, and `MFP_SECRET_KEY` to Claude Desktop config | Automatic (session cached 30 days) |
+| **Plain credentials** | Add `MFP_USERNAME` and `MFP_PASSWORD` to Claude Desktop config | Automatic (session cached 30 days) |
 | **Browser cookies** | Log into myfitnesspal.com in Chrome/Firefox | Until browser session expires |
 
 ## Installation
@@ -104,7 +105,29 @@ print('Authentication successful!')
 
 If the file doesn't exist, create it. Add or merge the following configuration:
 
-#### Option A: With Credentials (Recommended - No Browser Required)
+#### Option A: With Encrypted Credentials (Enhanced Security)
+
+Encrypt your credentials before storing them in the config file. See [Encrypted Credentials](#encrypted-credentials-enhanced-security) for setup instructions.
+
+> ⚠️ **Security note**: Encryption only provides meaningful protection if `MFP_SECRET_KEY` is stored **separately** from the config file (e.g., set in your shell profile or OS keychain). Storing the key alongside the encrypted values in the same config file means anyone who obtains the config can still decrypt your credentials.
+
+**macOS Example** (with key set separately in your shell environment):
+```json
+{
+  "mcpServers": {
+    "myfitnesspal": {
+      "command": "/Users/yourname/myfitnesspal-mcp-python/venv/bin/python",
+      "args": ["-m", "mfp_mcp.server"],
+      "env": {
+        "MFP_USERNAME": "gAAAAAB...<encrypted_email>",
+        "MFP_PASSWORD": "gAAAAAB...<encrypted_password>"
+      }
+    }
+  }
+}
+```
+
+#### Option B: With Plain Credentials (No Browser Required)
 
 **macOS Example:**
 ```json
@@ -169,7 +192,7 @@ In Claude Desktop, you should see a hammer icon (🔨) indicating MCP tools are 
 The MCP server supports three authentication methods, tried in this order:
 
 ### 1. Environment Variables (Recommended)
-Set `MFP_USERNAME` and `MFP_PASSWORD` in your Claude Desktop config's `env` section. This is the most reliable method and doesn't require a browser.
+Set `MFP_USERNAME` and `MFP_PASSWORD` in your Claude Desktop config's `env` section. This is the most reliable method and doesn't require a browser. You can store them as plain text or encrypted (see below).
 
 ```json
 "env": {
@@ -177,6 +200,55 @@ Set `MFP_USERNAME` and `MFP_PASSWORD` in your Claude Desktop config's `env` sect
   "MFP_PASSWORD": "your_password"
 }
 ```
+
+### Encrypted Credentials (Enhanced Security)
+
+Instead of storing plain-text credentials, you can encrypt them using [Fernet symmetric encryption](https://cryptography.io/en/latest/fernet/) from the `cryptography` library. The server decrypts them at runtime using `MFP_SECRET_KEY`.
+
+**Step 1 — Generate a secret key:**
+
+```python
+from cryptography.fernet import Fernet
+print(Fernet.generate_key().decode())
+# Output example: abc123XYZ...==
+```
+
+**Step 2 — Encrypt your credentials:**
+
+```python
+from cryptography.fernet import Fernet
+
+key = b"abc123XYZ...=="  # your key from step 1
+f = Fernet(key)
+
+encrypted_user = f.encrypt(b"your_email@example.com").decode()
+encrypted_pass = f.encrypt(b"your_password").decode()
+
+print("MFP_USERNAME:", encrypted_user)
+print("MFP_PASSWORD:", encrypted_pass)
+```
+
+**Step 3 — Store the secret key separately and add encrypted values to your config:**
+
+> ⚠️ **Important**: For encryption to be meaningful, `MFP_SECRET_KEY` must be kept **outside** the Claude Desktop config file. If the key and ciphertext are in the same file, anyone with the config can decrypt your credentials. Store the key in your shell profile (`~/.zshrc`, `~/.bashrc`), your OS keychain, or another secure location that is not backed up alongside your config.
+
+Set the key in your environment (do **not** put it in `claude_desktop_config.json`):
+
+```bash
+# Add to ~/.zshrc or ~/.bashrc
+export MFP_SECRET_KEY="abc123XYZ...=="
+```
+
+Then add only the encrypted values to your config:
+
+```json
+"env": {
+  "MFP_USERNAME": "gAAAAAB...<encrypted>",
+  "MFP_PASSWORD": "gAAAAAB...<encrypted>"
+}
+```
+
+If `MFP_SECRET_KEY` is not set, the server treats `MFP_USERNAME` and `MFP_PASSWORD` as plain text (backward compatible).
 
 ### 2. Stored Session Cookies
 After successful authentication, session cookies are saved to `~/.mfp_mcp/cookies.json`. These persist for 30 days, so you won't need to re-authenticate frequently.
@@ -186,11 +258,12 @@ If no credentials are provided and no stored cookies exist, the server falls bac
 
 ## Security Note on Credentials
 
-Your MyFitnessPal credentials in the Claude Desktop config are stored locally on your machine. The config file is only readable by your user account. However, if you're concerned about storing credentials:
+Your MyFitnessPal credentials in the Claude Desktop config are stored locally on your machine. The config file is only readable by your user account. Options to harden this further:
 
-1. Use Option B (browser cookies) instead
-2. Or use a dedicated MyFitnessPal account for API access
-3. Session cookies are stored in `~/.mfp_mcp/cookies.json` with restricted permissions
+1. **Encrypt credentials** using `MFP_SECRET_KEY` **only if the secret key is stored separately from the Claude Desktop config file** (recommended — see [Encrypted Credentials](#encrypted-credentials-enhanced-security)). If the encrypted credentials and `MFP_SECRET_KEY` are stored in the same config file, encryption does not materially reduce the impact of a config-file leak.
+2. Use browser cookies instead (no credentials stored in config)
+3. Use a dedicated MyFitnessPal account for API access
+4. Session cookies are stored in `~/.mfp_mcp/cookies.json` with restricted permissions
 
 ## Usage Examples
 
@@ -462,7 +535,9 @@ Get nutrition report over a date range.
 
 ## Security & Privacy
 
-- **Credentials**: If using username/password authentication, credentials are stored in your Claude Desktop config file which is only readable by your user account. Session cookies are cached in `~/.mfp_mcp/cookies.json` for 30 days.
+- **Encrypted Credentials**: Credentials can be stored as Fernet-encrypted ciphertext in your config. The server decrypts them at runtime using `MFP_SECRET_KEY`. See [Encrypted Credentials](#encrypted-credentials-enhanced-security) for setup.
+- **Plain Credentials**: If `MFP_SECRET_KEY` is absent, `MFP_USERNAME` and `MFP_PASSWORD` are used as-is. The Claude Desktop config file is only readable by your user account.
+- **Session Cookies**: After successful authentication, session cookies are cached in `~/.mfp_mcp/cookies.json` (restricted permissions) for 30 days.
 - **Browser Cookies**: As a fallback, the server can read your browser cookies to authenticate with MyFitnessPal.
 - **Local Only**: The server runs locally on your machine via stdio transport. No data is sent to any third-party servers.
 - **No External Transmission**: Your MyFitnessPal data is only transmitted between your computer and MyFitnessPal's servers (myfitnesspal.com).
