@@ -22,6 +22,8 @@ from typing import Optional, Dict, Any, List
 from enum import Enum
 from collections import OrderedDict
 import time
+from cryptography.fernet import Fernet
+import keyring
 
 import httpx
 from mcp.server.fastmcp import FastMCP
@@ -133,6 +135,79 @@ def dict_to_cookiejar(cookies_dict: Dict[str, str], domain: str = ".myfitnesspal
     
     return jar
 
+def looks_like_fernet_token(value: str) -> bool:
+    """Return True if the value appears to be a Fernet token."""
+    if not value:
+        return False
+    # Fernet tokens are URL-safe base64-encoded and typically begin with "gAAAAA".
+    # Use a lightweight prefix check so plaintext credentials continue to work
+    # even when MFP_SECRET_KEY is configured.
+    return value.startswith("gAAAAA")
+
+
+KEYRING_SERVICE = "mfp-mcp"
+KEYRING_SECRET_KEY_ACCOUNT = "MFP_SECRET_KEY"
+
+
+def get_secret_key() -> Optional[str]:
+    """Resolves MFP_SECRET_KEY from, in order:
+    1. The MFP_SECRET_KEY environment variable.
+    2. The OS keychain (service: 'mfp-mcp', account: 'MFP_SECRET_KEY').
+
+    Returns the key string, or None if not found in either location.
+    """
+    key = os.environ.get("MFP_SECRET_KEY")
+    if key:
+        logger.info("MFP_SECRET_KEY loaded from environment variable.")
+        return key
+
+    try:
+        key = keyring.get_password(KEYRING_SERVICE, KEYRING_SECRET_KEY_ACCOUNT)
+        if key:
+            logger.info("MFP_SECRET_KEY loaded from OS keychain.")
+            return key
+    except Exception as e:
+        logger.warning(f"Keychain lookup failed: {e}")
+
+    return None
+
+
+def get_decrypted_credential(env_var_name: str) -> Optional[str]:
+    """Retrieves credentials from environment variables, decrypting Fernet tokens when needed.
+
+    The decryption key (MFP_SECRET_KEY) is resolved from the environment variable first,
+    then from the OS keychain as a fallback.
+
+    Returns the decrypted string on success, the raw value when no decryption is needed,
+    or None if the env var is missing, decryption fails, or the value looks encrypted but
+    no key is available (to avoid passing ciphertext to the auth flow).
+    """
+    encrypted_value = os.environ.get(env_var_name)
+
+    if not encrypted_value:
+        logger.warning(f"Missing {env_var_name}.")
+        return None
+
+    if not looks_like_fernet_token(encrypted_value):
+        # Plain-text credential — no key lookup needed.
+        return encrypted_value
+
+    # Value looks like a Fernet token; resolve the secret key only now.
+    secret_key = get_secret_key()
+
+    if not secret_key:
+        logger.warning(
+            f"{env_var_name} appears to be encrypted but MFP_SECRET_KEY is not set. "
+            "Credential auth will be skipped to avoid passing ciphertext to the auth flow."
+        )
+        return None
+
+    try:
+        f = Fernet(secret_key.encode())
+        return f.decrypt(encrypted_value.encode()).decode()
+    except Exception as e:
+        logger.error(f"Decryption failed for {env_var_name}: {e}")
+        return None
 
 def authenticate_with_credentials(username: str, password: str) -> Dict[str, str]:
     """
@@ -226,8 +301,8 @@ def get_mfp_client():
     last_error = None
     
     # Method 1: Try environment variable credentials
-    username = os.environ.get("MFP_USERNAME")
-    password = os.environ.get("MFP_PASSWORD")
+    username = get_decrypted_credential("MFP_USERNAME")
+    password = get_decrypted_credential("MFP_PASSWORD")
     
     if username and password:
         logger.info("Attempting authentication with environment credentials")
