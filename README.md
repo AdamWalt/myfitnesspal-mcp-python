@@ -35,7 +35,7 @@ This MCP supports multiple authentication methods:
 
 | Method | Setup | Persistence |
 |--------|-------|-------------|
-| **Encrypted credentials** | Add `MFP_USERNAME`, `MFP_PASSWORD`, and `MFP_SECRET_KEY` to Claude Desktop config | Automatic (session cached 30 days) |
+| **Encrypted credentials** | Add encrypted `MFP_USERNAME` and `MFP_PASSWORD` to Claude Desktop config; set `MFP_SECRET_KEY` outside the config (for example via shell env or OS keychain) | Automatic (session cached 30 days) |
 | **Plain credentials** | Add `MFP_USERNAME` and `MFP_PASSWORD` to Claude Desktop config | Automatic (session cached 30 days) |
 | **Browser cookies** | Log into myfitnesspal.com in Chrome/Firefox | Until browser session expires |
 
@@ -161,7 +161,7 @@ Encrypt your credentials before storing them in the config file. See [Encrypted 
 }
 ```
 
-#### Option B: Without Credentials (Browser Cookie Fallback)
+#### Option C: Without Credentials (Browser Cookie Fallback)
 
 **macOS Example:**
 ```json
@@ -205,20 +205,25 @@ Set `MFP_USERNAME` and `MFP_PASSWORD` in your Claude Desktop config's `env` sect
 
 Instead of storing plain-text credentials, you can encrypt them using [Fernet symmetric encryption](https://cryptography.io/en/latest/fernet/) from the `cryptography` library. The server decrypts them at runtime using `MFP_SECRET_KEY`.
 
-**Step 1 — Generate a secret key:**
+> ⚠️ **Important**: For encryption to be meaningful, `MFP_SECRET_KEY` must be kept **outside** the Claude Desktop config file. The server resolves it in this order:
+> 1. `MFP_SECRET_KEY` environment variable (shell profile, not the Claude config)
+> 2. OS keychain — service `mfp-mcp`, account `MFP_SECRET_KEY` **(recommended)**
 
-```python
-from cryptography.fernet import Fernet
-print(Fernet.generate_key().decode())
-# Output example: abc123XYZ...==
+**Step 1 — Generate and store the key in one command:**
+
+```bash
+npm install
+npm run store-key
 ```
+
+`store-key` generates a Fernet-compatible key, stores it in the OS keychain (`mfp-mcp` / `MFP_SECRET_KEY`), and prints the key so you can use it in Step 2. See [Key Management CLI](#key-management-cli) for all available flags.
 
 **Step 2 — Encrypt your credentials:**
 
 ```python
 from cryptography.fernet import Fernet
 
-key = b"abc123XYZ...=="  # your key from step 1
+key = b"abc123XYZ...=="  # your key from Step 1
 f = Fernet(key)
 
 encrypted_user = f.encrypt(b"your_email@example.com").decode()
@@ -228,18 +233,7 @@ print("MFP_USERNAME:", encrypted_user)
 print("MFP_PASSWORD:", encrypted_pass)
 ```
 
-**Step 3 — Store the secret key separately and add encrypted values to your config:**
-
-> ⚠️ **Important**: For encryption to be meaningful, `MFP_SECRET_KEY` must be kept **outside** the Claude Desktop config file. If the key and ciphertext are in the same file, anyone with the config can decrypt your credentials. Store the key in your shell profile (`~/.zshrc`, `~/.bashrc`), your OS keychain, or another secure location that is not backed up alongside your config.
-
-Set the key in your environment (do **not** put it in `claude_desktop_config.json`):
-
-```bash
-# Add to ~/.zshrc or ~/.bashrc
-export MFP_SECRET_KEY="abc123XYZ...=="
-```
-
-Then add only the encrypted values to your config:
+**Step 3 — Add only the encrypted values to your Claude Desktop config:**
 
 ```json
 "env": {
@@ -248,7 +242,16 @@ Then add only the encrypted values to your config:
 }
 ```
 
-If `MFP_SECRET_KEY` is not set, the server treats `MFP_USERNAME` and `MFP_PASSWORD` as plain text (backward compatible).
+The key stays in the keychain — it never touches the config file.
+
+**Alternative: shell profile (simpler, still outside the Claude config):**
+
+```bash
+# Add to ~/.zshrc or ~/.bashrc — do NOT put this in claude_desktop_config.json
+export MFP_SECRET_KEY="abc123XYZ...=="
+```
+
+If `MFP_SECRET_KEY` is not found in the environment or keychain, the server treats `MFP_USERNAME` and `MFP_PASSWORD` as plain text (backward compatible).
 
 ### 2. Stored Session Cookies
 After successful authentication, session cookies are saved to `~/.mfp_mcp/cookies.json`. These persist for 30 days, so you won't need to re-authenticate frequently.
@@ -260,10 +263,11 @@ If no credentials are provided and no stored cookies exist, the server falls bac
 
 Your MyFitnessPal credentials in the Claude Desktop config are stored locally on your machine. The config file is only readable by your user account. Options to harden this further:
 
-1. **Encrypt credentials** using `MFP_SECRET_KEY` **only if the secret key is stored separately from the Claude Desktop config file** (recommended — see [Encrypted Credentials](#encrypted-credentials-enhanced-security)). If the encrypted credentials and `MFP_SECRET_KEY` are stored in the same config file, encryption does not materially reduce the impact of a config-file leak.
-2. Use browser cookies instead (no credentials stored in config)
-3. Use a dedicated MyFitnessPal account for API access
-4. Session cookies are stored in `~/.mfp_mcp/cookies.json` with restricted permissions
+1. **Encrypt credentials + store the key in the OS keychain** — the strongest option. The ciphertext lives in the config; the key never does. See [Encrypted Credentials](#encrypted-credentials-enhanced-security).
+2. **Encrypt credentials + export the key in your shell profile** — still separates key from ciphertext, though the key is on disk.
+3. Use browser cookies instead (no credentials stored in config at all)
+4. Use a dedicated MyFitnessPal account for API access
+5. Session cookies are stored in `~/.mfp_mcp/cookies.json` with restricted permissions
 
 ## Usage Examples
 
@@ -310,13 +314,57 @@ Once configured, you can interact with your MyFitnessPal data through Claude:
 "Generate a nutrition report for January"
 ```
 
+## Key Management CLI
+
+`scripts/store-key.ts` is a one-time setup tool that generates and stores `MFP_SECRET_KEY` in your OS keychain (macOS Keychain, Windows Credential Vault, Linux Secret Service). Node.js 18+ is required.
+
+### Prerequisites
+
+```bash
+npm install
+```
+
+### Commands
+
+| Command | What it does |
+|---------|-------------|
+| `npm run store-key` | Generate a new Fernet key and store it in the keychain |
+| `npm run store-key -- --key <val>` | Store an existing key instead of generating one |
+| `npm run store-key -- --overwrite` | Replace a key that is already stored |
+| `npm run store-key -- --show` | Print the currently stored key |
+| `npm run store-key -- --delete` | Remove the stored key from the keychain |
+
+### Example output
+
+```
+✅ MFP_SECRET_KEY stored in OS keychain
+   service : mfp-mcp
+   account : MFP_SECRET_KEY
+   source  : generated
+
+Your key (use this to encrypt MFP_USERNAME / MFP_PASSWORD):
+
+  abc123XYZ...==
+
+Next — encrypt your credentials with Python:
+
+  from cryptography.fernet import Fernet
+  f = Fernet(b"abc123XYZ...==")
+  print("MFP_USERNAME:", f.encrypt(b"your_email@example.com").decode())
+  print("MFP_PASSWORD:", f.encrypt(b"your_password").decode())
+```
+
 ## Project Structure
 
 ```
 myfitnesspal-mcp-python/
 ├── Dockerfile              # Container deployment
-├── pyproject.toml          # Package configuration
+├── package.json            # Node tooling (store-key CLI)
+├── tsconfig.json           # TypeScript config for scripts/
+├── pyproject.toml          # Python package configuration
 ├── README.md               # This file
+├── scripts/
+│   └── store-key.ts        # One-time key management CLI
 └── src/
     └── mfp_mcp/
         ├── __init__.py     # Package initialization
@@ -535,8 +583,9 @@ Get nutrition report over a date range.
 
 ## Security & Privacy
 
-- **Encrypted Credentials**: Credentials can be stored as Fernet-encrypted ciphertext in your config. The server decrypts them at runtime using `MFP_SECRET_KEY`. See [Encrypted Credentials](#encrypted-credentials-enhanced-security) for setup.
-- **Plain Credentials**: If `MFP_SECRET_KEY` is absent, `MFP_USERNAME` and `MFP_PASSWORD` are used as-is. The Claude Desktop config file is only readable by your user account.
+- **Encrypted Credentials**: Credentials can be stored as Fernet-encrypted ciphertext in your config. `MFP_SECRET_KEY` is resolved at runtime from the environment variable first, then the OS keychain (`mfp-mcp` / `MFP_SECRET_KEY`). See [Encrypted Credentials](#encrypted-credentials-enhanced-security) for setup.
+- **OS Keychain**: Storing `MFP_SECRET_KEY` in the native keychain (macOS Keychain, Windows Credential Vault, Linux Secret Service) means the decryption key never touches the config file or any backup.
+- **Plain Credentials**: If `MFP_SECRET_KEY` is absent from both environment and keychain, `MFP_USERNAME` and `MFP_PASSWORD` are used as-is (backward compatible).
 - **Session Cookies**: After successful authentication, session cookies are cached in `~/.mfp_mcp/cookies.json` (restricted permissions) for 30 days.
 - **Browser Cookies**: As a fallback, the server can read your browser cookies to authenticate with MyFitnessPal.
 - **Local Only**: The server runs locally on your machine via stdio transport. No data is sent to any third-party servers.
