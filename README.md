@@ -27,7 +27,8 @@ A [Model Context Protocol (MCP)](https://modelcontextprotocol.io/) server that e
 - **MyFitnessPal account**
 - **One of the following for authentication:**
   - Your MFP username/email and password (recommended), OR
-  - Chrome or Firefox with an active MyFitnessPal login session
+  - Any Chromium-based browser (Arc, Chrome, Edge, Brave, Vivaldi, Opera, ...)
+    or Firefox with an active MyFitnessPal login session
 
 ### Authentication Options
 
@@ -35,9 +36,16 @@ This MCP supports multiple authentication methods:
 
 | Method | Setup | Persistence |
 |--------|-------|-------------|
-| **Encrypted credentials** | Add encrypted `MFP_USERNAME` and `MFP_PASSWORD` to Claude Desktop config; set `MFP_SECRET_KEY` outside the config (for example via shell env or OS keychain) | Automatic (session cached 30 days) |
-| **Plain credentials** | Add `MFP_USERNAME` and `MFP_PASSWORD` to Claude Desktop config | Automatic (session cached 30 days) |
-| **Browser cookies** | Log into myfitnesspal.com in Chrome/Firefox | Until browser session expires |
+| **Chromium browser auto-discovery (macOS, recommended)** | Log into myfitnesspal.com in any Chromium-based browser (Arc, Chrome, Edge, Brave, Vivaldi, Opera, ...). The MCP auto-detects installed browsers via the macOS keychain and uses whichever one is logged in. | Until browser session expires (cached for 30 days in `~/.mfp_mcp/cookies.json`) |
+| **Encrypted credentials (legacy)** | Add encrypted `MFP_USERNAME` and `MFP_PASSWORD` to Claude Desktop config; set `MFP_SECRET_KEY` outside the config (for example via shell env or OS keychain) | Form login no longer works against MFP's NextAuth backend — only useful if cached cookies are still valid |
+| **Plain credentials (legacy)** | Add `MFP_USERNAME` and `MFP_PASSWORD` to Claude Desktop config | Same as above — form login flow is deprecated |
+| **Browser cookies (browser_cookie3 fallback)** | Log into myfitnesspal.com in Chrome or Firefox via the default profile paths | Until browser session expires |
+
+> **Note**: MyFitnessPal migrated their authentication to NextAuth, so the
+> legacy form-POST `authenticate_with_credentials` path almost always fails
+> for fresh logins. The Chromium auto-discovery path is the reliable way to
+> get a session on macOS — just log in via any modern browser and the MCP
+> picks it up automatically on the next call.
 
 ## Installation
 
@@ -256,8 +264,35 @@ If `MFP_SECRET_KEY` is not found in the environment or keychain, the server trea
 ### 2. Stored Session Cookies
 After successful authentication, session cookies are saved to `~/.mfp_mcp/cookies.json`. These persist for 30 days, so you won't need to re-authenticate frequently.
 
-### 3. Browser Cookies (Fallback)
-If no credentials are provided and no stored cookies exist, the server falls back to reading cookies from Chrome or Firefox. You must be logged into myfitnesspal.com in your browser.
+### 3. Chromium Browser Auto-Discovery (macOS)
+
+If no credentials are provided and stored cookies are absent or expired, the
+server scans the macOS keychain for `<Browser> Safe Storage` entries to find
+every installed Chromium-based browser, then tries each one's cookies
+database until it finds a valid MyFitnessPal session token.
+
+This works out of the box with Arc, Chrome, Edge, Brave, Vivaldi, Opera,
+Chromium, and any other Chromium-derived browser. You only need to be
+logged into [myfitnesspal.com](https://www.myfitnesspal.com) in one of
+them.
+
+The first successful extraction is persisted to `~/.mfp_mcp/cookies.json`,
+so subsequent calls skip the discovery step until the session expires.
+
+You can also force a specific browser via the `refresh_browser_cookies`
+MCP tool:
+
+```
+refresh_browser_cookies(browser="arc")     # or "chrome", "edge", "brave", ...
+refresh_browser_cookies(browser="auto")    # scan everything (default)
+refresh_browser_cookies(browser="firefox") # via browser_cookie3
+```
+
+### 4. browser_cookie3 Fallback (Legacy)
+A final fallback uses [`browser_cookie3`](https://pypi.org/project/browser-cookie3/)
+to read Chrome or Firefox cookies from the default profile paths. Useful on
+Linux/Windows or if the macOS auto-discovery path can't access your
+keychain.
 
 ## Security Note on Credentials
 
@@ -450,13 +485,21 @@ pip install -e .
 **Problem**: The server can't authenticate with your credentials or read browser cookies.
 
 **Solutions**:
-1. **If using credentials**: Double-check your MFP_USERNAME and MFP_PASSWORD in the config
-2. **If using browser cookies**: Make sure you're logged into myfitnesspal.com in Chrome or Firefox
-3. Try logging out and back in to MyFitnessPal
-4. Clear browser cookies and log in fresh
-5. On **macOS**, grant **Full Disk Access** to Claude Desktop:
-   - System Settings → Privacy & Security → Full Disk Access
-   - Add Claude.app
+1. **Easiest (macOS)**: Log into [myfitnesspal.com](https://www.myfitnesspal.com)
+   in any Chromium-based browser (Arc, Chrome, Edge, Brave, ...). The MCP
+   will auto-discover the session on the next call.
+2. **Force a refresh**: Call the `refresh_browser_cookies` tool — `auto`
+   scans every browser, or pass a specific name (`arc`, `chrome`, `edge`,
+   `brave`, `vivaldi`, `opera`, `firefox`).
+3. **If using credentials**: Double-check your MFP_USERNAME and MFP_PASSWORD
+   in the config. Note that the legacy form-login flow no longer works
+   against MFP's NextAuth backend — credentials are only useful while
+   `~/.mfp_mcp/cookies.json` still holds a valid session.
+4. Try logging out and back in to MyFitnessPal in your browser.
+5. Clear `~/.mfp_mcp/cookies.json` and let the auto-discovery rebuild it.
+6. On **macOS**, the auto-discovery path needs to read your login keychain.
+   If the MCP runs inside Claude Desktop, you may see a one-time keychain
+   prompt — click "Always Allow".
 
 ### "No module named 'mfp_mcp'"
 
