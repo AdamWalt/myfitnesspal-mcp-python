@@ -14,10 +14,10 @@ Authentication Methods (in order of priority):
 4. browser_cookie3 fallback (legacy Chrome/Firefox paths on any OS)
 """
 
+import hashlib
 import json
 import logging
 import os
-import shutil
 import sqlite3
 import subprocess
 import sys
@@ -257,9 +257,17 @@ def _derive_chromium_aes_key_macos(safe_storage_password: bytes) -> bytes:
 
 
 def _decrypt_chromium_value_macos(encrypted_value: bytes,
-                                   aes_key: bytes) -> Optional[str]:
+                                   aes_key: bytes,
+                                   host_key: str = "") -> Optional[str]:
     """Decrypt a single Chromium cookie `encrypted_value`. Returns None on
-    failure or for unsupported schemes (e.g. v20 app-bound encryption)."""
+    failure or for unsupported schemes (e.g. v20 app-bound encryption).
+
+    `host_key` is the cookie's host column from SQLite; modern Chromium
+    prepends `SHA-256(host_key)` to the plaintext as an integrity tag, so
+    we strip exactly that 32-byte prefix when it's present. Without this
+    check, long ASCII cookie values from legacy rows would be silently
+    truncated by 32 bytes (the shortened plaintext still decodes as UTF-8).
+    """
     from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
     from cryptography.hazmat.backends import default_backend
     if not encrypted_value or len(encrypted_value) < 3:
@@ -286,40 +294,65 @@ def _decrypt_chromium_value_macos(encrypted_value: bytes,
     if pad_len < 1 or pad_len > 16:
         return None
     plaintext = plaintext[:-pad_len]
-    # Modern Chromium prefixes the plaintext with a 32-byte SHA-256 of the
-    # host_key for integrity. Try with the prefix stripped first; if that
-    # doesn't decode cleanly, fall back to the raw plaintext (older format).
-    if len(plaintext) >= 32:
-        try:
-            return plaintext[32:].decode("utf-8", errors="strict")
-        except UnicodeDecodeError:
-            pass
+    # Strip the SHA-256(host_key) integrity prefix only when it actually
+    # matches — never blindly. Legacy rows without the prefix have shorter
+    # but otherwise normal plaintexts.
+    if host_key and len(plaintext) >= 32:
+        expected_prefix = hashlib.sha256(host_key.encode("utf-8")).digest()
+        if plaintext[:32] == expected_prefix:
+            plaintext = plaintext[32:]
     try:
         return plaintext.decode("utf-8", errors="strict")
     except UnicodeDecodeError:
         return None
 
 
+def _snapshot_sqlite_db(src: Path, dst: str) -> None:
+    """Copy a live SQLite DB into `dst` using the backup API.
+
+    The browser's cookies DB may be open in WAL mode with active writers;
+    a plain `shutil.copy` misses committed rows that still live in the
+    `-wal` sidecar. The backup API handles WAL/SHM correctly, takes a
+    consistent snapshot, and doesn't require taking a write lock — opening
+    the source read-only is enough.
+    """
+    src_con = sqlite3.connect(f"file:{src}?mode=ro", uri=True)
+    try:
+        dst_con = sqlite3.connect(dst)
+        try:
+            src_con.backup(dst_con)
+        finally:
+            dst_con.close()
+    finally:
+        src_con.close()
+
+
 def _extract_chromium_cookies_macos(
     cookies_db_path: Path,
     aes_key: bytes,
-    domain_substring: str = "myfitnesspal.com",
+    domain: str = "myfitnesspal.com",
 ) -> Dict[str, str]:
-    """Read cookies for the given domain from a Chromium cookies DB.
+    """Read cookies for `domain` (and its subdomains) from a Chromium DB.
 
-    The DB is copied to a temp file before reading so we don't contend with
-    the browser's WAL lock. Cookies whose decrypted value isn't clean UTF-8
-    are skipped — those can't go into HTTP headers anyway.
+    The DB is snapshotted via the SQLite backup API so rows pending in the
+    `-wal` file are included. Cookies whose decrypted value isn't clean
+    UTF-8 are skipped — those can't go into HTTP headers anyway.
     """
-    tmp_path = tempfile.mktemp(suffix=".cookies.db")
+    # `mkstemp` gives us a uniquely-named file we own, immune to the
+    # time-of-check/time-of-use race that `mktemp` would create.
+    fd, tmp_path = tempfile.mkstemp(suffix=".cookies.db")
+    os.close(fd)
     try:
-        shutil.copy(cookies_db_path, tmp_path)
+        _snapshot_sqlite_db(cookies_db_path, tmp_path)
         con = sqlite3.connect(tmp_path)
         try:
+            # `host_key = 'myfitnesspal.com' OR host_key LIKE '%.myfitnesspal.com'`
+            # — exact match + any subdomain. Avoids matching unrelated hosts
+            # like `notmyfitnesspal.com` that the loose LIKE pattern would.
             rows = con.execute(
-                "SELECT name, value, encrypted_value FROM cookies "
-                "WHERE host_key LIKE ?",
-                (f"%{domain_substring}%",),
+                "SELECT name, value, encrypted_value, host_key FROM cookies "
+                "WHERE host_key = ? OR host_key LIKE ?",
+                (domain, f"%.{domain}"),
             ).fetchall()
         finally:
             con.close()
@@ -329,8 +362,11 @@ def _extract_chromium_cookies_macos(
         except OSError:
             pass
     cookies: Dict[str, str] = {}
-    for name, plain, enc in rows:
-        value = plain if plain else _decrypt_chromium_value_macos(enc, aes_key)
+    for name, plain, enc, host_key in rows:
+        value = (
+            plain if plain
+            else _decrypt_chromium_value_macos(enc, aes_key, host_key)
+        )
         if value is None or "�" in value:
             continue
         cookies[name] = value
@@ -1943,29 +1979,34 @@ async def mfp_get_report(params: GetReportInput) -> str:
 
 
 def _verify_cookies_and_format(cookies: Dict[str, str], source: str) -> str:
-    """Save + verify cookies against a real MFP API call. Used by
-    `refresh_browser_cookies`."""
+    """Verify cookies via a live MFP round-trip, then persist on success.
+
+    Persisting only after verification matches the auto-discovery path's
+    anti-poisoning behavior — a stale/expired session can't clobber a
+    previously good `cookies.json`.
+    """
     if not _has_real_mfp_session(cookies):
         return (
             f"No MyFitnessPal session token found in {source}. "
             "Make sure you are logged into myfitnesspal.com in that browser, "
             "then try again."
         )
-    save_cookies(cookies)
     try:
         import myfitnesspal
         cookiejar = dict_to_cookiejar(cookies)
         client = myfitnesspal.Client(cookiejar=cookiejar)
         _ = client.get_date(date.today())
-        return (
-            f"Successfully extracted and verified {len(cookies)} cookies "
-            f"from {source}. Authentication is now working."
-        )
     except Exception as e:
         return (
             f"Cookies were extracted from {source} but verification failed: "
-            f"{e}. The session may have expired — log in again and retry."
+            f"{e}. The session may have expired — log in again and retry. "
+            f"(cookies.json was NOT overwritten.)"
         )
+    save_cookies(cookies)
+    return (
+        f"Successfully extracted and verified {len(cookies)} cookies "
+        f"from {source}. Authentication is now working."
+    )
 
 
 @mcp.tool()
@@ -2005,18 +2046,33 @@ def refresh_browser_cookies(browser: str = "auto") -> str:
         browser_name, cookies = result
         return _verify_cookies_and_format(cookies, browser_name)
 
-    # Explicit Chromium browser via our own decryption path
+    # Explicit Chromium browser
     if browser_key in _CHROMIUM_BROWSER_ALIASES:
-        service_name = f"{_CHROMIUM_BROWSER_ALIASES[browser_key]} Safe Storage"
-        cookies = _try_extract_from_chromium_browser(service_name)
-        if cookies is None:
-            return (
-                f"Could not read cookies from "
-                f"{_CHROMIUM_BROWSER_ALIASES[browser_key]}. Make sure the "
-                "browser is installed and you have logged in at least once."
-            )
-        return _verify_cookies_and_format(
-            cookies, _CHROMIUM_BROWSER_ALIASES[browser_key]
+        canonical = _CHROMIUM_BROWSER_ALIASES[browser_key]
+        if sys.platform == "darwin":
+            service_name = f"{canonical} Safe Storage"
+            cookies = _try_extract_from_chromium_browser(service_name)
+            if cookies is None:
+                return (
+                    f"Could not read cookies from {canonical}. Make sure "
+                    "the browser is installed and you have logged in at "
+                    "least once."
+                )
+            return _verify_cookies_and_format(cookies, canonical)
+        # Non-macOS: keychain-based path doesn't apply. browser_cookie3
+        # handles chrome/chromium on Linux/Windows via their default
+        # profile paths; other Chromium browsers aren't supported there.
+        if browser_key in ("chrome", "chromium"):
+            try:
+                import browser_cookie3
+                cj = browser_cookie3.chrome(domain_name=".myfitnesspal.com")
+                cookies = {c.name: c.value for c in cj}
+            except Exception as e:
+                return f"Error extracting cookies from {browser_key}: {e}"
+            return _verify_cookies_and_format(cookies, browser_key)
+        return (
+            f"{canonical} cookie extraction requires macOS (keychain-backed "
+            f"Safe Storage). On this platform, use 'chrome' or 'firefox'."
         )
 
     # Firefox via browser_cookie3 (it has its own format, not Chromium)
@@ -2029,10 +2085,10 @@ def refresh_browser_cookies(browser: str = "auto") -> str:
             return f"Error extracting cookies from firefox: {e}"
         return _verify_cookies_and_format(cookies, "firefox")
 
+    valid_options = sorted({*_CHROMIUM_BROWSER_ALIASES, "firefox", "auto"})
     return (
         f"Unsupported browser: {browser!r}. Use 'auto' to scan all installed "
-        f"Chromium browsers, or one of: "
-        f"{', '.join(sorted(_CHROMIUM_BROWSER_ALIASES) | {'firefox'})}."
+        f"Chromium browsers, or one of: {', '.join(valid_options)}."
     )
 
 
