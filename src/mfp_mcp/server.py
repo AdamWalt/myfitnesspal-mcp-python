@@ -659,7 +659,7 @@ class AddFoodToDiaryInput(BaseModel):
         default=1.0,
         description="Quantity/servings (e.g., 1.5 for 1.5 servings)",
         gt=0,
-        le=100,
+        le=10000,
     )
     unit: Optional[str] = Field(
         default=None,
@@ -695,100 +695,143 @@ def add_food_to_diary(
 ) -> None:
     """
     Add a food item to the diary for a specific date and meal.
-    
+
+    Uses the modern MFP add flow:
+      1. Visit /food/add_to_diary?meal=X to get the page CSRF
+      2. POST /food/search to find the food and capture its `data-original-id`
+         + `data-weight-ids` + the page's csrf-token meta
+      3. POST /food/add with food_entry[food_id]=original_id (NOT mfp_id),
+         food_entry[meal_id]=index, food_entry[weight_id]=first weight id
+
     Args:
         client: Authenticated myfitnesspal.Client instance
-        mfp_id: MyFitnessPal food item ID
+        mfp_id: MyFitnessPal external food ID (from search results)
         meal: Meal name (Breakfast, Lunch, Dinner, Snacks)
         target_date: Date to add the food entry
         quantity: Number of servings (default 1.0)
-        unit: Optional unit/serving size description
-    
-    Raises:
-        RuntimeError: If the operation fails
+        unit: Ignored - quantity is in default-serving units
     """
-    from urllib import parse
-    
+    import re
+
+    meal_map = {"breakfast": "0", "lunch": "1", "dinner": "2",
+                "snacks": "3", "snack": "3"}
+    meal_index = meal_map.get(meal.lower(), "0")
+    date_str = target_date.strftime("%Y-%m-%d")
+
     try:
-        # Get the diary page for the target date to extract CSRF token
-        # Use the same method the library uses
-        date_str = target_date.strftime("%Y-%m-%d")
-        diary_url = parse.urljoin(
-            client.BASE_URL_SECURE,
-            f"food/diary/{client.effective_username}?date={date_str}"
+        # Step 1: Visit the diary page so Rails session cookies are present.
+        client._get_document_for_url(
+            f"{client.BASE_URL_SECURE}food/diary"
         )
-        
-        # Use the library's method to get the document
-        document = client._get_document_for_url(diary_url)
-        
-        # Extract authenticity token (same way the library does)
-        authenticity_token = document.xpath(
+
+        # Step 2: Get the add_to_diary page (needed for CSRF + warm form session)
+        add_page_url = (
+            f"{client.BASE_URL_SECURE}food/add_to_diary?meal={meal_index}"
+        )
+        add_page_doc = client._get_document_for_url(add_page_url)
+        page_auth = add_page_doc.xpath(
             "(//input[@name='authenticity_token']/@value)[1]"
         )
-        if not authenticity_token:
-            raise RuntimeError("Could not find authenticity token on diary page")
-        authenticity_token = authenticity_token[0]
-        
-        # Map meal names to meal indices (0=Breakfast, 1=Lunch, 2=Dinner, 3=Snacks)
-        meal_map = {
-            "breakfast": "0",
-            "lunch": "1",
-            "dinner": "2",
-            "snacks": "3",
-            "snack": "3",
-        }
-        meal_index = meal_map.get(meal.lower(), "0")
-        
-        # Build the URL for adding food
-        # MyFitnessPal uses /food/diary/{username}/add endpoint
-        add_food_url = parse.urljoin(
-            client.BASE_URL_SECURE,
-            f"food/diary/{client.effective_username}/add"
-        )
-        
-        # Prepare the data for the POST request
-        # Format matches what MyFitnessPal expects based on their form submissions
-        post_data = {
-            "authenticity_token": authenticity_token,
+        if not page_auth:
+            raise RuntimeError("Could not find authenticity token on add_to_diary page")
+        page_auth = page_auth[0]
+
+        # Step 3: Get the food's name so we can search for it.
+        # MFP's search box doesn't accept mfp_ids directly — only names.
+        food_item = client.get_food_item_details(mfp_id)
+        brand = getattr(food_item, "brand", "") or ""
+        name = getattr(food_item, "name", "") or ""
+        # Combine brand + name for best match, fallback to mfp_id
+        search_query = f"{brand} {name}".strip() or str(mfp_id)
+        # Trim to a reasonable length for the search box
+        if len(search_query) > 60:
+            search_query = search_query[:60]
+
+        search_url = f"{client.BASE_URL_SECURE}food/search"
+        search_resp = client.session.post(search_url, data={
+            "authenticity_token": page_auth,
+            "meal_name": meal,
+            "search": search_query,
             "date": date_str,
-            "meal": meal_index,
-            "food_id": mfp_id,
-            "quantity": str(quantity),
+            "page": "1",
+        })
+        search_html = search_resp.text
+
+        # Find the link whose data-external-id matches mfp_id
+        link_match = re.search(
+            r'<a[^>]+class="search"[^>]+data-external-id="' + re.escape(str(mfp_id)) + r'"[^>]+data-original-id="(\d+)"[^>]+data-weight-ids="([^"]+)"',
+            search_html,
+        )
+        if not link_match:
+            # The food may not be in the first page of search results.
+            # Take first .search result as fallback (close enough).
+            link_match = re.search(
+                r'<a[^>]+class="search"[^>]+data-original-id="(\d+)"[^>]+data-weight-ids="([^"]+)"',
+                search_html,
+            )
+        if not link_match:
+            raise RuntimeError(
+                f"Could not find food '{search_query}' in search results."
+            )
+        original_id = link_match.group(1)
+        weight_ids = link_match.group(2).split(",")
+
+        # CSRF tokens from the search results page
+        page_csrf_match = re.search(
+            r'<meta[^>]+name=["\']csrf-token["\'][^>]+content=["\']([^"\']+)["\']',
+            search_html,
+        )
+        page_csrf = page_csrf_match.group(1) if page_csrf_match else None
+
+        results_auth_matches = re.findall(
+            r'authenticity_token["\'][^>]*value=["\']([^"\']+)["\']',
+            search_html,
+        )
+        results_auth = results_auth_matches[0] if results_auth_matches else page_auth
+
+        # Step 4: POST /food/add with the modern field names
+        add_url = f"{client.BASE_URL_SECURE}food/add"
+        payload = {
+            "authenticity_token": results_auth,
+            "food_entry[food_id]": original_id,
+            "food_entry[date]": date_str,
+            "food_entry[quantity]": str(quantity),
+            "food_entry[weight_id]": weight_ids[0],
+            "food_entry[meal_id]": meal_index,
         }
-        
-        if unit:
-            post_data["unit"] = unit
-        
-        # Add food to diary
         headers = {
-            "Referer": diary_url,
-            "Content-Type": "application/x-www-form-urlencoded",
-            "X-Requested-With": "XMLHttpRequest",
+            "Referer": search_url,
+            "Origin": "https://www.myfitnesspal.com",
         }
-        
-        response = client.session.post(add_food_url, data=post_data, headers=headers)
-        response.raise_for_status()
-        
-        # Check response content for errors
-        if response.status_code != 200:
-            raise RuntimeError(f"Failed to add food: HTTP {response.status_code}")
-        
-        # MyFitnessPal might return success even with errors in content
-        # Log error indication without exposing full response content (may contain sensitive data)
-        content = response.text if hasattr(response, 'text') else response.content.decode('utf-8', errors='ignore')
-        if 'error' in content.lower() and 'success' not in content.lower():
-            logger.warning("Possible error in response from MyFitnessPal API")
-        
-        logger.info(f"Successfully added food {mfp_id} to {meal} for {target_date}")
-        
+        if page_csrf:
+            headers["X-CSRF-Token"] = page_csrf
+
+        response = client.session.post(
+            add_url, data=payload, headers=headers, allow_redirects=False
+        )
+
+        # Success = 302 redirect to /food/diary/* . Failure = 200 with form,
+        # or 302 to /account/login, or 4xx.
+        loc = response.headers.get("Location", "")
+        if response.status_code in (302, 303) and "/food/diary" in loc:
+            logger.info(
+                f"Successfully added food {mfp_id} → original_id={original_id} "
+                f"to {meal} for {target_date}"
+            )
+            return
+        if response.status_code in (302, 303) and "/account/login" in loc:
+            raise RuntimeError(
+                "Add failed: session not authenticated for write. "
+                "Refresh the session cookie."
+            )
+        raise RuntimeError(
+            f"Add failed: HTTP {response.status_code} → {loc or '(no redirect)'}"
+        )
+
+    except RuntimeError:
+        raise
     except Exception as e:
-        # Don't expose internal error details to avoid leaking sensitive information
-        error_msg = str(e)
-        # Only include safe error information
-        if "HTTP" in error_msg or "status" in error_msg.lower():
-            raise RuntimeError(f"Failed to add food to diary: {error_msg}")
-        else:
-            raise RuntimeError("Failed to add food to diary. Please check your authentication and try again.")
+        raise RuntimeError(f"Failed to add food to diary: {e}")
 
 
 def set_water_intake(client, target_date: date, cups: float) -> None:
