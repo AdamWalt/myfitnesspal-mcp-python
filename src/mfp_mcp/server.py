@@ -639,7 +639,7 @@ class GetReportInput(BaseModel):
 class AddFoodToDiaryInput(BaseModel):
     """Input model for adding food to diary."""
 
-    model_config = ConfigDict(str_strip_whitespace=True)
+    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
 
     mfp_id: str = Field(
         ...,
@@ -657,13 +657,14 @@ class AddFoodToDiaryInput(BaseModel):
     )
     quantity: float = Field(
         default=1.0,
-        description="Quantity/servings (e.g., 1.5 for 1.5 servings)",
+        description=(
+            "Quantity in number of default servings (e.g., 1.5 for 1.5 servings). "
+            "The 'default serving' is the first weight option for the food in "
+            "MyFitnessPal — call mfp_get_food_details(mfp_id) to see what the "
+            "default unit actually is for any given food."
+        ),
         gt=0,
         le=10000,
-    )
-    unit: Optional[str] = Field(
-        default=None,
-        description="Unit/serving size description (e.g., '1 cup', '100g'). If not provided, uses default serving size from food item.",
     )
 
 
@@ -731,7 +732,7 @@ class SetWaterInput(BaseModel):
 
 
 def add_food_to_diary(
-    client, mfp_id: str, meal: str, target_date: date, quantity: float = 1.0, unit: Optional[str] = None
+    client, mfp_id: str, meal: str, target_date: date, quantity: float = 1.0,
 ) -> None:
     """
     Add a food item to the diary for a specific date and meal.
@@ -743,13 +744,19 @@ def add_food_to_diary(
       3. POST /food/add with food_entry[food_id]=original_id (NOT mfp_id),
          food_entry[meal_id]=index, food_entry[weight_id]=first weight id
 
+    The food's default weight_id (first one MFP exposes for the food) is
+    always used. The quantity is in units of that default serving.
+
+    Raises RuntimeError if no search result exactly matches the requested
+    mfp_id — we do NOT silently substitute another food, because adding the
+    wrong item to a diary is materially worse than failing the call.
+
     Args:
         client: Authenticated myfitnesspal.Client instance
         mfp_id: MyFitnessPal external food ID (from search results)
         meal: Meal name (Breakfast, Lunch, Dinner, Snacks)
         target_date: Date to add the food entry
-        quantity: Number of servings (default 1.0)
-        unit: Ignored - quantity is in default-serving units
+        quantity: Number of default servings (default 1.0)
     """
     import re
 
@@ -778,11 +785,21 @@ def add_food_to_diary(
 
         # Step 3: Get the food's name so we can search for it.
         # MFP's search box doesn't accept mfp_ids directly — only names.
-        food_item = client.get_food_item_details(mfp_id)
-        brand = getattr(food_item, "brand", "") or ""
-        name = getattr(food_item, "name", "") or ""
-        # Combine brand + name for best match, fallback to mfp_id
-        search_query = f"{brand} {name}".strip() or str(mfp_id)
+        try:
+            food_item = client.get_food_item_details(mfp_id)
+            brand = getattr(food_item, "brand", "") or ""
+            name = getattr(food_item, "name", "") or ""
+            search_query = f"{brand} {name}".strip() or str(mfp_id)
+        except Exception as details_err:
+            # If we can't resolve the food's name, the id may simply be
+            # invalid. Continue with the id as the query so the search step
+            # gives a clean "no results" error, which is more actionable
+            # than the lxml/HTTP failure here.
+            logger.warning(
+                f"Could not fetch details for food {mfp_id}: {details_err}"
+            )
+            search_query = str(mfp_id)
+
         # Trim to a reasonable length for the search box
         if len(search_query) > 60:
             search_query = search_query[:60]
@@ -797,21 +814,35 @@ def add_food_to_diary(
         })
         search_html = search_resp.text
 
-        # Find the link whose data-external-id matches mfp_id
+        # Find the link whose data-external-id matches mfp_id exactly.
+        # We deliberately do NOT fall back to "first result" if the exact
+        # match isn't there — silently adding the wrong food to a diary
+        # is a far worse failure mode than raising. The caller can use
+        # mfp_search_food to pick a more specific id and retry.
         link_match = re.search(
             r'<a[^>]+class="search"[^>]+data-external-id="' + re.escape(str(mfp_id)) + r'"[^>]+data-original-id="(\d+)"[^>]+data-weight-ids="([^"]+)"',
             search_html,
         )
         if not link_match:
-            # The food may not be in the first page of search results.
-            # Take first .search result as fallback (close enough).
-            link_match = re.search(
-                r'<a[^>]+class="search"[^>]+data-original-id="(\d+)"[^>]+data-weight-ids="([^"]+)"',
+            # See if ANY results came back, to give the caller a hint about
+            # whether the issue is "wrong id" vs "search returned nothing".
+            has_any_results = bool(re.search(
+                r'<a[^>]+class="search"[^>]+data-external-id=',
                 search_html,
-            )
-        if not link_match:
+            ))
+            if has_any_results:
+                raise RuntimeError(
+                    f"Food {mfp_id} (search query '{search_query}') was not "
+                    "in the first page of search results. The mfp_id may be "
+                    "stale or the food may be hard to surface from its name. "
+                    "Try mfp_search_food with a more specific query, pick a "
+                    "result whose mfp_id appears in the returned list, then "
+                    "retry mfp_add_food_to_diary with that id."
+                )
             raise RuntimeError(
-                f"Could not find food '{search_query}' in search results."
+                f"No search results returned for food {mfp_id} "
+                f"(query '{search_query}'). Try mfp_search_food directly "
+                "to find a valid id, then retry."
             )
         original_id = link_match.group(1)
         weight_ids = link_match.group(2).split(",")
@@ -1545,8 +1576,7 @@ async def mfp_add_food_to_diary(params: AddFoodToDiaryInput) -> str:
             - mfp_id (str): MyFitnessPal food item ID (from mfp_search_food)
             - meal (str): Meal name - 'Breakfast', 'Lunch', 'Dinner', or 'Snacks' (default: 'Breakfast')
             - date (str, optional): Date in YYYY-MM-DD format, defaults to today
-            - quantity (float): Number of servings (default: 1.0)
-            - unit (str, optional): Unit/serving size (e.g., '1 cup', '100g')
+            - quantity (float): Number of default servings for this food (default: 1.0)
 
     Returns:
         str: Confirmation message with details of the added food entry
@@ -1554,12 +1584,12 @@ async def mfp_add_food_to_diary(params: AddFoodToDiaryInput) -> str:
     try:
         client = get_mfp_client()
         target_date = parse_date(params.date)
-        
+
         # Normalize meal name (capitalize first letter)
         meal = params.meal.strip().capitalize()
         if meal.lower() == "snack":
             meal = "Snacks"
-        
+
         # Add food to diary
         add_food_to_diary(
             client=client,
@@ -1567,16 +1597,15 @@ async def mfp_add_food_to_diary(params: AddFoodToDiaryInput) -> str:
             meal=meal,
             target_date=target_date,
             quantity=params.quantity,
-            unit=params.unit,
         )
-        
+
         # Get food details for confirmation
         try:
             food_item = client.get_food_item_details(params.mfp_id)
             food_name = getattr(food_item, "description", "Unknown Food")
         except:
             food_name = "Food item"
-        
+
         return json.dumps(
             {
                 "success": True,
@@ -1586,7 +1615,6 @@ async def mfp_add_food_to_diary(params: AddFoodToDiaryInput) -> str:
                 "food_id": params.mfp_id,
                 "food_name": food_name,
                 "quantity": params.quantity,
-                "unit": params.unit,
             },
             indent=2,
         )
