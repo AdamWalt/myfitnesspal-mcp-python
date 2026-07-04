@@ -40,8 +40,12 @@ function keychainGet(): string | null {
     }
     if (PLATFORM === 'win32') {
       // Use built-in PowerShell/.NET interop — no third-party modules required.
+      // Target name MUST be SERVICE alone (not SERVICE/ACCOUNT) so that
+      // Python's keyring.WinVaultKeyring.get_password(SERVICE, ACCOUNT)
+      // finds the credential we stored. WinVaultKeyring looks up by
+      // TargetName == SERVICE and matches on UserName == ACCOUNT.
       const ps = `
-$target = '${SERVICE}/${ACCOUNT}'
+$target = '${SERVICE}'
 Add-Type -TypeDefinition @"
 using System;
 using System.Runtime.InteropServices;
@@ -103,19 +107,36 @@ function keychainSet(key: string): void {
   }
   if (PLATFORM === 'win32') {
     // cmdkey doesn't accept stdin; pass via argument — execFileSync avoids shell expansion.
+    // Target name is SERVICE alone so Python keyring.WinVaultKeyring lookup
+    // matches. keychainGet uses the same target format.
     execFileSync(
       'cmdkey',
-      [`/generic:${SERVICE}/${ACCOUNT}`, `/user:${ACCOUNT}`, `/pass:${key}`],
+      [`/generic:${SERVICE}`, `/user:${ACCOUNT}`, `/pass:${key}`],
       { stdio: 'inherit' }
     );
     return;
   }
   // Linux — pipe key via stdin to avoid it appearing on the command line.
-  spawnSync(
+  // spawnSync doesn't throw on non-zero exit, so check the result explicitly:
+  // otherwise a missing `secret-tool` binary or unreachable D-Bus secret
+  // service would silently print "stored" and confuse the user.
+  const linuxResult = spawnSync(
     'secret-tool',
     ['store', '--label=mfp-mcp secret key', 'service', SERVICE, 'username', ACCOUNT],
     { input: key, stdio: ['pipe', 'inherit', 'inherit'] }
   );
+  if (linuxResult.error) {
+    throw new Error(
+      `secret-tool failed: ${linuxResult.error.message}. ` +
+      `Install libsecret-tools (e.g. \`sudo apt install libsecret-tools\`).`
+    );
+  }
+  if (linuxResult.status !== 0) {
+    throw new Error(
+      `secret-tool exited with status ${linuxResult.status}. ` +
+      `Is a Secret Service provider (GNOME Keyring, KeePassXC, ...) running?`
+    );
+  }
 }
 
 function keychainDelete(): boolean {
@@ -129,7 +150,7 @@ function keychainDelete(): boolean {
     } else if (PLATFORM === 'win32') {
       execFileSync(
         'cmdkey',
-        [`/delete:${SERVICE}/${ACCOUNT}`],
+        [`/delete:${SERVICE}`],
         { stdio: ['pipe', 'pipe', 'pipe'] }
       );
     } else {

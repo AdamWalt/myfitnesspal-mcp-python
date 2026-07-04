@@ -26,9 +26,14 @@ A [Model Context Protocol (MCP)](https://modelcontextprotocol.io/) server that e
 - **pip 21.3+** (for pyproject.toml support; upgrade with `pip install --upgrade pip`)
 - **MyFitnessPal account**
 - **One of the following for authentication:**
-  - Your MFP username/email and password (recommended), OR
-  - Any Chromium-based browser (Arc, Chrome, Edge, Brave, Vivaldi, Opera, ...)
-    or Firefox with an active MyFitnessPal login session
+  - **Recommended (macOS):** any Chromium-based browser (Arc, Chrome, Edge,
+    Brave, Vivaldi, Opera, ...) with an active MyFitnessPal login session —
+    the MCP auto-discovers the session on next call
+  - Firefox with an active MyFitnessPal login session (via the
+    `browser_cookie3` fallback)
+  - Legacy: your MFP username/email and password (see caveats below —
+    MFP's NextAuth backend rejects the form-POST flow, so credential auth
+    only works while cached cookies remain valid)
 
 ### Authentication Options
 
@@ -197,10 +202,18 @@ In Claude Desktop, you should see a hammer icon (🔨) indicating MCP tools are 
 
 ## Authentication Methods
 
-The MCP server supports three authentication methods, tried in this order:
+The MCP server supports four authentication methods, tried in this order:
 
-### 1. Environment Variables (Recommended)
-Set `MFP_USERNAME` and `MFP_PASSWORD` in your Claude Desktop config's `env` section. This is the most reliable method and doesn't require a browser. You can store them as plain text or encrypted (see below).
+### 1. Environment Variables (Legacy)
+Set `MFP_USERNAME` and `MFP_PASSWORD` in your Claude Desktop config's `env`
+section. You can store them as plain text or encrypted (see below).
+
+> ⚠️ **Note**: MyFitnessPal migrated to a NextAuth backend, so the form-POST
+> flow this method uses no longer produces a session cookie. Credential auth
+> only succeeds while `~/.mfp_mcp/cookies.json` still holds a valid session
+> from a previous browser login — after that, this method silently falls
+> through to the browser cookie paths below. Prefer the Chromium
+> auto-discovery method on macOS.
 
 ```json
 "env": {
@@ -497,9 +510,14 @@ pip install -e .
    `~/.mfp_mcp/cookies.json` still holds a valid session.
 4. Try logging out and back in to MyFitnessPal in your browser.
 5. Clear `~/.mfp_mcp/cookies.json` and let the auto-discovery rebuild it.
-6. On **macOS**, the auto-discovery path needs to read your login keychain.
-   If the MCP runs inside Claude Desktop, you may see a one-time keychain
-   prompt — click "Always Allow".
+6. On **macOS**, the auto-discovery path reads each browser's `Safe Storage`
+   password from your login keychain. On the very first run, macOS shows a
+   dialog: *"<binary> wants to use information stored in your keychain"* —
+   click **Always Allow**. If Claude Desktop is spawning the MCP headlessly
+   in the background, this dialog can be easy to miss; if auto-discovery
+   returns "no browser had a session", bring Claude Desktop to the
+   foreground and retry so the prompt is visible. Once approved, the key
+   is cached and the prompt won't repeat.
 
 ### "No module named 'mfp_mcp'"
 

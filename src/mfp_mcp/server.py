@@ -194,6 +194,15 @@ def _safe_storage_keychain_password(service_name: str) -> Optional[bytes]:
     """Look up `service_name` in the macOS Keychain and return the raw bytes.
 
     Returns None if the entry doesn't exist or access is denied.
+
+    NOTE: on a fresh install the first read of another app's Safe Storage
+    entry triggers a macOS keychain authorization dialog ("<app> wants to
+    use information stored in your keychain"). If this MCP is running
+    headless (e.g. spawned by Claude Desktop with no UI focus), the prompt
+    is silently denied and this call returns None after the 5s timeout.
+    The user only needs to click "Always Allow" once, but they need to
+    know to look for the prompt — the README troubleshooting section
+    documents this.
     """
     try:
         result = subprocess.run(
@@ -454,6 +463,13 @@ def looks_like_fernet_token(value: str) -> bool:
     # Fernet tokens are URL-safe base64-encoded and typically begin with "gAAAAA".
     # Use a lightweight prefix check so plaintext credentials continue to work
     # even when MFP_SECRET_KEY is configured.
+    #
+    # Edge case: a genuine plaintext password that starts with "gAAAAA" is
+    # misclassified as a ciphertext, fails Fernet decryption, and
+    # `get_decrypted_credential` returns None — credential auth is silently
+    # skipped and the caller falls through to cookie-based auth. Extremely
+    # unlikely for a real password, and the fallback is graceful, so we
+    # accept this heuristic rather than adding a length/base64 check.
     return value.startswith("gAAAAA")
 
 
