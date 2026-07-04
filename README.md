@@ -37,6 +37,7 @@ This MCP supports multiple authentication methods:
 |--------|-------|-------------|
 | **Credentials in config** | Add `MFP_USERNAME` and `MFP_PASSWORD` to Claude Desktop config | Automatic (session cached 30 days) |
 | **Browser cookies** | Log into myfitnesspal.com in Chrome/Firefox | Until browser session expires |
+| **Firefox profile** | Set `MFP_FIREFOX_PROFILE_DIR` to a profile logged into myfitnesspal.com | Until the profile's session expires |
 
 ## Installation
 
@@ -166,10 +167,29 @@ In Claude Desktop, you should see a hammer icon (🔨) indicating MCP tools are 
 
 ## Authentication Methods
 
-The MCP server supports three authentication methods, tried in this order:
+The MCP server supports these authentication methods, tried in this order:
 
-### 1. Environment Variables (Recommended)
-Set `MFP_USERNAME` and `MFP_PASSWORD` in your Claude Desktop config's `env` section. This is the most reliable method and doesn't require a browser.
+### 0. Firefox Profile Cookies (headless / container friendly)
+Set `MFP_FIREFOX_PROFILE_DIR` to a Firefox profile that is logged into
+myfitnesspal.com. The server reads session cookies straight out of that
+profile's `cookies.sqlite` — no browser needs to be installed or running, and
+the profile can be a read-only mount. This is the easiest path for headless
+servers and Docker deployments (log in once in a real Firefox, then mount the
+profile).
+
+```json
+"env": {
+  "MFP_FIREFOX_PROFILE_DIR": "/path/to/.mozilla/firefox/abcd1234.default-release"
+}
+```
+
+You can point it at a specific profile directory, or at the parent
+`.mozilla/firefox` directory (the most recently used profile is chosen). The
+`cookies.sqlite` file is copied before reading, so a live/locked Firefox
+profile works fine.
+
+### 1. Environment Variables
+Set `MFP_USERNAME` and `MFP_PASSWORD` in your Claude Desktop config's `env` section. This doesn't require a browser.
 
 ```json
 "env": {

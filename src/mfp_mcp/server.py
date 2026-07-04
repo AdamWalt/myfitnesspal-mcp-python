@@ -6,15 +6,19 @@ with MyFitnessPal data including food diary, exercises, measurements, goals,
 water intake, and food search.
 
 Authentication Methods (in order of priority):
-1. Environment variables: MFP_USERNAME and MFP_PASSWORD
-2. Stored session cookies: ~/.mfp_mcp/cookies.json
-3. Browser cookies: Chrome/Firefox (fallback)
+1. Firefox profile cookies: MFP_FIREFOX_PROFILE_DIR (headless / container friendly)
+2. Environment variables: MFP_USERNAME and MFP_PASSWORD
+3. Stored session cookies: ~/.mfp_mcp/cookies.json
+4. Browser cookies: Chrome/Firefox (fallback)
 """
 
 import json
 import logging
 import os
+import shutil
+import sqlite3
 import sys
+import tempfile
 from datetime import date, datetime, timedelta
 from http.cookiejar import CookieJar, Cookie
 from pathlib import Path
@@ -130,8 +134,130 @@ def dict_to_cookiejar(cookies_dict: Dict[str, str], domain: str = ".myfitnesspal
             rfc2109=False,
         )
         jar.set_cookie(cookie)
-    
+
     return jar
+
+
+MFP_DOMAIN_SUFFIX = "myfitnesspal.com"
+
+
+def _find_firefox_cookies_sqlite(profile_dir: Path) -> Optional[Path]:
+    """
+    Locate cookies.sqlite inside a Firefox profile directory.
+
+    Accepts either a profile directory mounted directly, or a parent
+    ``~/.mozilla/firefox`` directory whose profiles live one level down as
+    subdirectories like ``abcd1234.default-release``. When several profiles
+    are present the most recently modified cookies.sqlite wins.
+    """
+    direct = profile_dir / "cookies.sqlite"
+    if direct.is_file():
+        return direct
+    candidates = sorted(
+        profile_dir.glob("*/cookies.sqlite"),
+        key=lambda p: p.stat().st_mtime,
+        reverse=True,
+    )
+    return candidates[0] if candidates else None
+
+
+def load_firefox_profile_cookiejar(profile_dir: str) -> CookieJar:
+    """
+    Read MyFitnessPal session cookies directly out of a Firefox profile.
+
+    This is aimed at headless and containerized deployments where
+    browser_cookie3 is awkward (no browser installed, or the profile lives on
+    a read-only mount). Log into myfitnesspal.com once in a real Firefox
+    profile, then point MFP_FIREFOX_PROFILE_DIR at that profile (or at the
+    parent ``.mozilla/firefox`` directory).
+
+    The cookies.sqlite database is copied to a temp file before reading:
+    Firefox keeps a lock on the live file, and with SQLite in WAL mode the
+    newest rows live in cookies.sqlite-wal, which is copied alongside so the
+    read sees a consistent, current snapshot.
+
+    Args:
+        profile_dir: Path to a Firefox profile directory, or a directory
+            containing one.
+
+    Returns:
+        CookieJar: session cookies for myfitnesspal.com.
+
+    Raises:
+        RuntimeError: if no profile / cookies.sqlite / MFP cookies are found.
+    """
+    profile_path = Path(profile_dir)
+    if not profile_path.is_dir():
+        raise RuntimeError(
+            f"MFP_FIREFOX_PROFILE_DIR={profile_dir} is not a directory"
+        )
+    db_path = _find_firefox_cookies_sqlite(profile_path)
+    if db_path is None:
+        raise RuntimeError(
+            f"No cookies.sqlite found under {profile_dir} (looked in the "
+            "directory and one level down). Point MFP_FIREFOX_PROFILE_DIR at a "
+            "Firefox profile that is logged into myfitnesspal.com."
+        )
+
+    tmpdir = tempfile.mkdtemp(prefix="mfp-cookies-")
+    try:
+        # Copy the db out first (the live file is locked); copy the WAL/-shm
+        # too so uncheckpointed rows are visible.
+        tmp_db = Path(tmpdir) / "cookies.sqlite"
+        shutil.copy2(db_path, tmp_db)
+        for suffix in ("-wal", "-shm"):
+            side = db_path.with_name(db_path.name + suffix)
+            if side.is_file():
+                try:
+                    shutil.copy2(side, tmp_db.with_name(tmp_db.name + suffix))
+                except OSError as e:
+                    logger.warning(f"Could not copy {side}: {e}")
+
+        jar = CookieJar()
+        conn = sqlite3.connect(tmp_db)
+        try:
+            rows = conn.execute(
+                "SELECT host, path, isSecure, expiry, name, value "
+                "FROM moz_cookies WHERE host LIKE ?",
+                (f"%{MFP_DOMAIN_SUFFIX}",),
+            ).fetchall()
+        finally:
+            conn.close()
+
+        now = time.time()
+        for host, path, is_secure, expiry, name, value in rows:
+            if expiry and expiry < now:
+                continue  # skip already-expired cookies
+            jar.set_cookie(
+                Cookie(
+                    version=0,
+                    name=name,
+                    value=value,
+                    port=None,
+                    port_specified=False,
+                    domain=host,
+                    domain_specified=True,
+                    domain_initial_dot=host.startswith("."),
+                    path=path or "/",
+                    path_specified=True,
+                    secure=bool(is_secure),
+                    expires=int(expiry) if expiry else None,
+                    discard=False,
+                    comment=None,
+                    comment_url=None,
+                    rest={"HttpOnly": None},
+                    rfc2109=False,
+                )
+            )
+        if len(jar) == 0:
+            raise RuntimeError(
+                f"No {MFP_DOMAIN_SUFFIX} cookies found in {db_path}. "
+                "Log into myfitnesspal.com in this Firefox profile first."
+            )
+        logger.info(f"Loaded {len(jar)} MyFitnessPal cookies from {db_path}")
+        return jar
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
 
 
 def authenticate_with_credentials(username: str, password: str) -> Dict[str, str]:
@@ -211,9 +337,10 @@ def get_mfp_client():
     Get an authenticated MyFitnessPal client.
     
     Authentication is attempted in this order:
-    1. Environment variables (MFP_USERNAME, MFP_PASSWORD)
-    2. Stored session cookies (~/.mfp_mcp/cookies.json)
-    3. Browser cookies (Chrome/Firefox)
+    1. Firefox profile cookies (MFP_FIREFOX_PROFILE_DIR)
+    2. Environment variables (MFP_USERNAME, MFP_PASSWORD)
+    3. Stored session cookies (~/.mfp_mcp/cookies.json)
+    4. Browser cookies (Chrome/Firefox)
 
     Returns:
         myfitnesspal.Client: Authenticated client instance
@@ -222,9 +349,27 @@ def get_mfp_client():
         RuntimeError: If all authentication methods fail
     """
     import myfitnesspal
-    
+
     last_error = None
-    
+
+    # Method 0: Firefox profile cookies (headless / container friendly).
+    # Reads cookies.sqlite straight out of a mounted Firefox profile, so no
+    # browser needs to be installed/running on the host. Opt-in via env var.
+    profile_dir = os.environ.get("MFP_FIREFOX_PROFILE_DIR")
+    if profile_dir:
+        logger.info("Attempting authentication with Firefox profile cookies")
+        try:
+            cookiejar = load_firefox_profile_cookiejar(profile_dir)
+            client = myfitnesspal.Client(cookiejar=cookiejar)
+            # Test the connection
+            _ = client.get_date(date.today())
+            logger.info("Successfully authenticated with Firefox profile cookies")
+            return client
+        except Exception as e:
+            last_error = e
+            logger.warning(f"Firefox profile authentication failed: {e}")
+            # Fall through to other methods
+
     # Method 1: Try environment variable credentials
     username = os.environ.get("MFP_USERNAME")
     password = os.environ.get("MFP_PASSWORD")
@@ -292,9 +437,10 @@ def get_mfp_client():
         raise RuntimeError(
             f"All authentication methods failed. Last error: {str(last_error)}\n\n"
             "Please try one of these solutions:\n"
-            "1. Set MFP_USERNAME and MFP_PASSWORD environment variables in Claude Desktop config\n"
-            "2. Log into myfitnesspal.com in Chrome or Firefox\n"
-            "3. Check ~/.mfp_mcp/cookies.json for stored session"
+            "1. Set MFP_FIREFOX_PROFILE_DIR to a Firefox profile logged into myfitnesspal.com\n"
+            "2. Set MFP_USERNAME and MFP_PASSWORD environment variables in Claude Desktop config\n"
+            "3. Log into myfitnesspal.com in Chrome or Firefox\n"
+            "4. Check ~/.mfp_mcp/cookies.json for stored session"
         )
 
 
