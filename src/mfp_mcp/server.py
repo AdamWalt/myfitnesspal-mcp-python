@@ -676,6 +676,46 @@ class AddFoodToDiaryInput(BaseModel):
     )
 
 
+class RemoveFoodFromDiaryInput(BaseModel):
+    """Input model for removing food entries from diary."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    date: Optional[str] = Field(
+        default=None,
+        description="Date in YYYY-MM-DD format. Defaults to today.",
+        pattern=r"^\d{4}-\d{2}-\d{2}$",
+    )
+    entry_id: Optional[str] = Field(
+        default=None,
+        description=(
+            "Specific food_entry_id to remove. If omitted, name_contains is "
+            "used to match by name."
+        ),
+    )
+    name_contains: Optional[str] = Field(
+        default=None,
+        description=(
+            "Case-insensitive substring to match against entry names "
+            "(e.g. 'banana' or '0.5 cup rice'). Ignored if entry_id is set."
+        ),
+    )
+    meal: Optional[str] = Field(
+        default=None,
+        description=(
+            "Restrict matching to a meal: Breakfast, Lunch, Dinner, Snacks."
+        ),
+    )
+    max_matches: int = Field(
+        default=1,
+        gt=0,
+        le=50,
+        description=(
+            "Safety cap on how many matching entries to delete in one call."
+        ),
+    )
+
+
 class SetWaterInput(BaseModel):
     """Input model for setting water intake."""
 
@@ -864,6 +904,84 @@ def add_food_to_diary(
     except (ValueError, KeyError, IndexError):
         logger.warning("Entry created but MyFitnessPal returned no entry id")
         return None
+
+
+def list_diary_entries(client, target_date: date) -> List[Dict[str, str]]:
+    """
+    Scrape the diary page for the given date and return a list of entries
+    with their internal food_entry_id (needed for deletion), name, and meal.
+
+    Returns:
+        List of {"entry_id", "name", "meal"} dicts in display order.
+    """
+    import re
+
+    date_str = target_date.strftime("%Y-%m-%d")
+    diary_url = f"{client.BASE_URL_SECURE}food/diary?date={date_str}"
+    # Use the library's session to ensure cookies/CSRF/etc. are aligned
+    response = client.session.get(diary_url)
+    src = response.text
+
+    entries: List[Dict[str, str]] = []
+    # Walk through the HTML linearly. Track the most recent meal header.
+    current_meal = None
+    pattern = re.compile(
+        r'(class="meal_header"[^>]*>\s*<[^>]+>([^<]+)</[^>]+>)|'
+        r'(<a[^>]+data-food-entry-id="(\d+)"[^>]+class="js-show-edit-food"[^>]*>'
+        r'([^<]+)</a>)',
+        re.DOTALL,
+    )
+    for m in pattern.finditer(src):
+        if m.group(2):
+            current_meal = m.group(2).strip()
+        elif m.group(4):
+            entries.append({
+                "entry_id": m.group(4),
+                "name": m.group(5).strip(),
+                "meal": current_meal or "",
+            })
+    return entries
+
+
+def remove_food_entry(client, entry_id: str) -> None:
+    """
+    Delete a food diary entry by its food_entry_id.
+
+    Uses the legacy /food/remove/{id} endpoint with X-CSRF-Token from
+    the diary page meta tag.
+    """
+    import re
+
+    # Need a fresh CSRF token from the diary page
+    diary_resp = client.session.get(
+        f"{client.BASE_URL_SECURE}food/diary"
+    )
+    csrf_match = re.search(
+        r'<meta[^>]+name=["\']csrf-token["\'][^>]+content=["\']([^"\']+)["\']',
+        diary_resp.text,
+    )
+    if not csrf_match:
+        raise RuntimeError("Could not extract csrf-token from diary page")
+    csrf = csrf_match.group(1)
+
+    response = client.session.request(
+        "DELETE",
+        f"{client.BASE_URL_SECURE}food/remove/{entry_id}",
+        headers={
+            "Referer": f"{client.BASE_URL_SECURE}food/diary",
+            "X-CSRF-Token": csrf,
+            "X-Requested-With": "XMLHttpRequest",
+            "Accept": "application/json, text/javascript, */*; q=0.01",
+        },
+        allow_redirects=False,
+    )
+    # Success = 302 redirect to diary, or 200 with empty body
+    if response.status_code in (200, 204, 302, 303):
+        logger.info(f"Removed diary entry {entry_id}")
+        return
+    raise RuntimeError(
+        f"Remove failed for entry {entry_id}: HTTP {response.status_code}"
+    )
 
 
 def set_water_intake(client, target_date: date, cups: float) -> None:
@@ -1508,6 +1626,106 @@ async def mfp_add_food_to_diary(params: AddFoodToDiaryInput) -> str:
         
     except Exception as e:
         return f"Error adding food to diary: {str(e)}"
+
+
+@mcp.tool(
+    name="mfp_remove_food_from_diary",
+    annotations={
+        "title": "Remove Food From Diary",
+        "readOnlyHint": False,
+        "destructiveHint": True,
+        "idempotentHint": False,
+        "openWorldHint": True,
+    },
+)
+async def mfp_remove_food_from_diary(params: RemoveFoodFromDiaryInput) -> str:
+    """
+    Remove (delete) one or more food entries from your diary.
+
+    Two modes:
+
+    1. By entry_id (precise): delete exactly the entry whose
+       food_entry_id matches. Use this when you already know the ID.
+
+    2. By name_contains (fuzzy): list the day's entries, find ones whose
+       name contains the given substring (case-insensitive), optionally
+       restricted to a meal, and delete up to max_matches of them.
+
+    Args:
+        params: RemoveFoodFromDiaryInput with one of:
+            - entry_id: exact food_entry_id to delete
+            - name_contains: substring match against entry names
+            - meal: restrict matching to one meal
+            - max_matches: safety cap for fuzzy matches (default 1)
+            - date: date to operate on (default today)
+
+    Returns:
+        JSON describing each entry that was removed.
+    """
+    try:
+        client = get_mfp_client()
+        target_date = parse_date(params.date)
+
+        # Mode 1: delete a single entry by ID
+        if params.entry_id:
+            remove_food_entry(client, params.entry_id)
+            return json.dumps({
+                "success": True,
+                "removed": [{"entry_id": params.entry_id}],
+                "date": str(target_date),
+            }, indent=2)
+
+        # Mode 2: fuzzy match by name (+ optional meal filter)
+        if not params.name_contains:
+            return ("Error removing food: provide either entry_id or "
+                    "name_contains")
+
+        entries = list_diary_entries(client, target_date)
+        needle = params.name_contains.lower()
+        meal_filter = (
+            params.meal.lower() if params.meal else None
+        )
+
+        matches = []
+        for e in entries:
+            if needle not in e["name"].lower():
+                continue
+            if meal_filter and meal_filter not in e["meal"].lower():
+                continue
+            matches.append(e)
+
+        if not matches:
+            return json.dumps({
+                "success": False,
+                "removed": [],
+                "message": (
+                    f"No entries matched '{params.name_contains}'"
+                    + (f" in {params.meal}" if params.meal else "")
+                ),
+            }, indent=2)
+
+        to_remove = matches[: params.max_matches]
+        removed = []
+        for e in to_remove:
+            remove_food_entry(client, e["entry_id"])
+            removed.append({
+                "entry_id": e["entry_id"],
+                "name": e["name"],
+                "meal": e["meal"],
+            })
+
+        return json.dumps({
+            "success": True,
+            "removed": removed,
+            "matched_count": len(matches),
+            "remaining_matches_skipped": max(
+                0, len(matches) - len(to_remove)
+            ),
+            "date": str(target_date),
+        }, indent=2, ensure_ascii=False)
+
+    except Exception as e:
+        return f"Error removing food: {e}"
 
 
 @mcp.tool(
