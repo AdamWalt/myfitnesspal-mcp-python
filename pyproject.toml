@@ -8,7 +8,9 @@ version = "1.0.0"
 description = "MCP Server for MyFitnessPal - track food diary, exercises, measurements, and nutrition goals"
 readme = "README.md"
 license = "MIT"
-requires-python = ">=3.10"
+# Upper bound is due to lxml (via myfitnesspal): no wheels for 3.13+ at the
+# time of writing, and building from source fails against the 3.14 C API.
+requires-python = ">=3.10,<3.13"
 authors = [
     { name = "Adam" }
 ]
