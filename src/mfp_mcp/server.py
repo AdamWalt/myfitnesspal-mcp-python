@@ -42,6 +42,12 @@ mcp = FastMCP("myfitnesspal_mcp")
 CONFIG_DIR = Path.home() / ".mfp_mcp"
 COOKIES_FILE = CONFIG_DIR / "cookies.json"
 
+# MyFitnessPal's v2 JSON API, used for diary writes. The legacy HTML form
+# endpoint (/food/diary/{user}/add) was removed by MFP and now returns 404.
+MFP_API_BASE = "https://api.myfitnesspal.com"
+MFP_CLIENT_ID = "mfp-main-js"
+VALID_MEALS = ("Breakfast", "Lunch", "Dinner", "Snacks")
+
 
 # ============================================================================
 # Authentication Helper Functions
@@ -51,6 +57,7 @@ COOKIES_FILE = CONFIG_DIR / "cookies.json"
 def ensure_config_dir():
     """Ensure the config directory exists."""
     CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    CONFIG_DIR.chmod(0o700)
 
 
 def save_cookies(cookies: Dict[str, str]):
@@ -67,6 +74,8 @@ def save_cookies(cookies: Dict[str, str]):
     }
     with open(COOKIES_FILE, "w") as f:
         json.dump(cookie_data, f, indent=2)
+    # Session cookies grant full account access - restrict to owner only
+    COOKIES_FILE.chmod(0o600)
     logger.info(f"Saved session cookies to {COOKIES_FILE}")
 
 
@@ -639,7 +648,7 @@ class GetReportInput(BaseModel):
 class AddFoodToDiaryInput(BaseModel):
     """Input model for adding food to diary."""
 
-    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
+    model_config = ConfigDict(str_strip_whitespace=True)
 
     mfp_id: str = Field(
         ...,
@@ -657,14 +666,13 @@ class AddFoodToDiaryInput(BaseModel):
     )
     quantity: float = Field(
         default=1.0,
-        description=(
-            "Quantity in number of default servings (e.g., 1.5 for 1.5 servings). "
-            "The 'default serving' is the first weight option for the food in "
-            "MyFitnessPal — call mfp_get_food_details(mfp_id) to see what the "
-            "default unit actually is for any given food."
-        ),
+        description="Quantity/servings (e.g., 1.5 for 1.5 servings)",
         gt=0,
-        le=10000,
+        le=100,
+    )
+    unit: Optional[str] = Field(
+        default=None,
+        description="Unit/serving size description (e.g., '1 cup', '100g'). If not provided, uses default serving size from food item.",
     )
 
 
@@ -731,178 +739,171 @@ class SetWaterInput(BaseModel):
 # ============================================================================
 
 
-def add_food_to_diary(
-    client, mfp_id: str, meal: str, target_date: date, quantity: float = 1.0,
-) -> None:
+def _mfp_api_headers(client, json_body: bool = False) -> Dict[str, str]:
     """
-    Add a food item to the diary for a specific date and meal.
+    Build auth headers for MyFitnessPal's v2 JSON API.
 
-    Uses the modern MFP add flow:
-      1. Visit /food/add_to_diary?meal=X to get the page CSRF
-      2. POST /food/search to find the food and capture its `data-original-id`
-         + `data-weight-ids` + the page's csrf-token meta
-      3. POST /food/add with food_entry[food_id]=original_id (NOT mfp_id),
-         food_entry[meal_id]=index, food_entry[weight_id]=first weight id
+    The v2 API backs the current MFP web client. It requires the session's
+    OAuth bearer token plus an mfp-client-id identifying the calling client.
+    """
+    headers = {
+        "Authorization": f"Bearer {client.access_token}",
+        "mfp-client-id": MFP_CLIENT_ID,
+        "mfp-user-id": str(client.user_id),
+        "Accept": "application/json",
+    }
+    if json_body:
+        headers["Content-Type"] = "application/json"
+    return headers
 
-    The food's default weight_id (first one MFP exposes for the food) is
-    always used. The quantity is in units of that default serving.
 
-    Raises RuntimeError if no search result exactly matches the requested
-    mfp_id — we do NOT silently substitute another food, because adding the
-    wrong item to a diary is materially worse than failing the call.
+def get_food_v2(client, mfp_id: str) -> Dict[str, Any]:
+    """
+    Fetch a food's full v2 record, including its version and serving sizes.
+
+    The diary API rejects entries whose food version does not match the
+    current stored version, so this must be read fresh rather than cached.
 
     Args:
         client: Authenticated myfitnesspal.Client instance
-        mfp_id: MyFitnessPal external food ID (from search results)
+        mfp_id: MyFitnessPal food item ID
+
+    Returns:
+        The food object as returned by the v2 API
+
+    Raises:
+        RuntimeError: If the food cannot be retrieved
+    """
+    response = client.session.get(
+        f"{MFP_API_BASE}/v2/foods",
+        params={"ids": str(mfp_id)},
+        headers=_mfp_api_headers(client),
+        timeout=30,
+    )
+    if response.status_code != 200:
+        raise RuntimeError(
+            f"Could not look up food {mfp_id}: HTTP {response.status_code}"
+        )
+
+    items = response.json().get("items") or []
+    if not items:
+        raise RuntimeError(f"No food found with ID {mfp_id}")
+    return items[0]
+
+
+def select_serving_size(food: Dict[str, Any], unit: Optional[str] = None) -> Dict[str, Any]:
+    """
+    Choose which of a food's serving sizes to log against.
+
+    Args:
+        food: Food object from get_food_v2
+        unit: Optional unit to match (e.g. "oz", "medium breast"). Matching is
+            case-insensitive and accepts a substring. Falls back to the food's
+            default (first) serving size when omitted or unmatched.
+
+    Returns:
+        The serving size dict, trimmed to the fields the diary API permits
+
+    Raises:
+        RuntimeError: If the food declares no serving sizes
+    """
+    serving_sizes = food.get("serving_sizes") or []
+    if not serving_sizes:
+        raise RuntimeError(f"Food {food.get('id')} has no serving sizes")
+
+    chosen = serving_sizes[0]
+    if unit:
+        wanted = unit.strip().lower()
+        for size in serving_sizes:
+            size_unit = str(size.get("unit", "")).lower()
+            if size_unit == wanted or wanted in size_unit:
+                chosen = size
+                break
+        else:
+            logger.warning(
+                f"Unit {unit!r} not found for food {food.get('id')}; "
+                f"using default serving {chosen.get('unit')!r}"
+            )
+
+    # The diary endpoint rejects any serving_size field beyond these three.
+    return {
+        "value": chosen["value"],
+        "unit": chosen["unit"],
+        "nutrition_multiplier": chosen["nutrition_multiplier"],
+    }
+
+
+def add_food_to_diary(
+    client, mfp_id: str, meal: str, target_date: date, quantity: float = 1.0, unit: Optional[str] = None
+) -> Optional[str]:
+    """
+    Add a food item to the diary for a specific date and meal.
+
+    Args:
+        client: Authenticated myfitnesspal.Client instance
+        mfp_id: MyFitnessPal food item ID
         meal: Meal name (Breakfast, Lunch, Dinner, Snacks)
         target_date: Date to add the food entry
-        quantity: Number of default servings (default 1.0)
+        quantity: Number of servings (default 1.0)
+        unit: Optional serving unit to log against (e.g. "oz")
+
+    Returns:
+        The new entry's UUID, or None if MFP did not return one
+
+    Raises:
+        RuntimeError: If the operation fails
     """
-    import re
+    food = get_food_v2(client, mfp_id)
+    serving_size = select_serving_size(food, unit)
 
-    meal_map = {"breakfast": "0", "lunch": "1", "dinner": "2",
-                "snacks": "3", "snack": "3"}
-    meal_index = meal_map.get(meal.lower(), "0")
-    date_str = target_date.strftime("%Y-%m-%d")
-
-    try:
-        # Step 1: Visit the diary page so Rails session cookies are present.
-        client._get_document_for_url(
-            f"{client.BASE_URL_SECURE}food/diary"
-        )
-
-        # Step 2: Get the add_to_diary page (needed for CSRF + warm form session)
-        add_page_url = (
-            f"{client.BASE_URL_SECURE}food/add_to_diary?meal={meal_index}"
-        )
-        add_page_doc = client._get_document_for_url(add_page_url)
-        page_auth = add_page_doc.xpath(
-            "(//input[@name='authenticity_token']/@value)[1]"
-        )
-        if not page_auth:
-            raise RuntimeError("Could not find authenticity token on add_to_diary page")
-        page_auth = page_auth[0]
-
-        # Step 3: Get the food's name so we can search for it.
-        # MFP's search box doesn't accept mfp_ids directly — only names.
-        try:
-            food_item = client.get_food_item_details(mfp_id)
-            brand = getattr(food_item, "brand", "") or ""
-            name = getattr(food_item, "name", "") or ""
-            search_query = f"{brand} {name}".strip() or str(mfp_id)
-        except Exception as details_err:
-            # If we can't resolve the food's name, the id may simply be
-            # invalid. Continue with the id as the query so the search step
-            # gives a clean "no results" error, which is more actionable
-            # than the lxml/HTTP failure here.
-            logger.warning(
-                f"Could not fetch details for food {mfp_id}: {details_err}"
-            )
-            search_query = str(mfp_id)
-
-        # Trim to a reasonable length for the search box
-        if len(search_query) > 60:
-            search_query = search_query[:60]
-
-        search_url = f"{client.BASE_URL_SECURE}food/search"
-        search_resp = client.session.post(search_url, data={
-            "authenticity_token": page_auth,
-            "meal_name": meal,
-            "search": search_query,
-            "date": date_str,
-            "page": "1",
-        })
-        search_html = search_resp.text
-
-        # Find the link whose data-external-id matches mfp_id exactly.
-        # We deliberately do NOT fall back to "first result" if the exact
-        # match isn't there — silently adding the wrong food to a diary
-        # is a far worse failure mode than raising. The caller can use
-        # mfp_search_food to pick a more specific id and retry.
-        link_match = re.search(
-            r'<a[^>]+class="search"[^>]+data-external-id="' + re.escape(str(mfp_id)) + r'"[^>]+data-original-id="(\d+)"[^>]+data-weight-ids="([^"]+)"',
-            search_html,
-        )
-        if not link_match:
-            # See if ANY results came back, to give the caller a hint about
-            # whether the issue is "wrong id" vs "search returned nothing".
-            has_any_results = bool(re.search(
-                r'<a[^>]+class="search"[^>]+data-external-id=',
-                search_html,
-            ))
-            if has_any_results:
-                raise RuntimeError(
-                    f"Food {mfp_id} (search query '{search_query}') was not "
-                    "in the first page of search results. The mfp_id may be "
-                    "stale or the food may be hard to surface from its name. "
-                    "Try mfp_search_food with a more specific query, pick a "
-                    "result whose mfp_id appears in the returned list, then "
-                    "retry mfp_add_food_to_diary with that id."
-                )
-            raise RuntimeError(
-                f"No search results returned for food {mfp_id} "
-                f"(query '{search_query}'). Try mfp_search_food directly "
-                "to find a valid id, then retry."
-            )
-        original_id = link_match.group(1)
-        weight_ids = link_match.group(2).split(",")
-
-        # CSRF tokens from the search results page
-        page_csrf_match = re.search(
-            r'<meta[^>]+name=["\']csrf-token["\'][^>]+content=["\']([^"\']+)["\']',
-            search_html,
-        )
-        page_csrf = page_csrf_match.group(1) if page_csrf_match else None
-
-        results_auth_matches = re.findall(
-            r'authenticity_token["\'][^>]*value=["\']([^"\']+)["\']',
-            search_html,
-        )
-        results_auth = results_auth_matches[0] if results_auth_matches else page_auth
-
-        # Step 4: POST /food/add with the modern field names
-        add_url = f"{client.BASE_URL_SECURE}food/add"
-        payload = {
-            "authenticity_token": results_auth,
-            "food_entry[food_id]": original_id,
-            "food_entry[date]": date_str,
-            "food_entry[quantity]": str(quantity),
-            "food_entry[weight_id]": weight_ids[0],
-            "food_entry[meal_id]": meal_index,
-        }
-        headers = {
-            "Referer": search_url,
-            "Origin": "https://www.myfitnesspal.com",
-        }
-        if page_csrf:
-            headers["X-CSRF-Token"] = page_csrf
-
-        response = client.session.post(
-            add_url, data=payload, headers=headers, allow_redirects=False
-        )
-
-        # Success = 302 redirect to /food/diary/* . Failure = 200 with form,
-        # or 302 to /account/login, or 4xx.
-        loc = response.headers.get("Location", "")
-        if response.status_code in (302, 303) and "/food/diary" in loc:
-            logger.info(
-                f"Successfully added food {mfp_id} → original_id={original_id} "
-                f"to {meal} for {target_date}"
-            )
-            return
-        if response.status_code in (302, 303) and "/account/login" in loc:
-            raise RuntimeError(
-                "Add failed: session not authenticated for write. "
-                "Refresh the session cookie."
-            )
+    meal_name = meal.strip().capitalize()
+    if meal_name not in VALID_MEALS:
         raise RuntimeError(
-            f"Add failed: HTTP {response.status_code} → {loc or '(no redirect)'}"
+            f"Invalid meal {meal!r}. Expected one of: {', '.join(VALID_MEALS)}"
         )
 
-    except RuntimeError:
-        raise
-    except Exception as e:
-        raise RuntimeError(f"Failed to add food to diary: {e}")
+    entry = {
+        "type": "food_entry",
+        "date": target_date.strftime("%Y-%m-%d"),
+        "meal_name": meal_name,
+        "servings": float(quantity),
+        "food": {"id": str(food["id"]), "version": str(food["version"])},
+        "serving_size": serving_size,
+    }
+
+    response = client.session.post(
+        f"{MFP_API_BASE}/v2/diary",
+        headers=_mfp_api_headers(client, json_body=True),
+        data=json.dumps({"items": [entry]}),
+        timeout=30,
+    )
+
+    if response.status_code not in (200, 201):
+        detail = ""
+        try:
+            body = response.json()
+            detail = body.get("error_details", {}).get("item_error") or body.get(
+                "error_description", ""
+            )
+        except Exception:
+            pass
+        raise RuntimeError(
+            f"Failed to add food to diary: HTTP {response.status_code}"
+            + (f" - {detail}" if detail else "")
+        )
+
+    logger.info(
+        f"Added food {mfp_id} ({serving_size['value']} {serving_size['unit']} "
+        f"x{quantity}) to {meal_name} for {target_date}"
+    )
+
+    # MFP returns the new entry's id here and nowhere else - the diary page
+    # exposes only legacy numeric ids, which the v2 API does not accept.
+    try:
+        return response.json()["items"][0]["id"]
+    except (ValueError, KeyError, IndexError):
+        logger.warning("Entry created but MyFitnessPal returned no entry id")
+        return None
 
 
 def list_diary_entries(client, target_date: date) -> List[Dict[str, str]]:
@@ -1576,7 +1577,8 @@ async def mfp_add_food_to_diary(params: AddFoodToDiaryInput) -> str:
             - mfp_id (str): MyFitnessPal food item ID (from mfp_search_food)
             - meal (str): Meal name - 'Breakfast', 'Lunch', 'Dinner', or 'Snacks' (default: 'Breakfast')
             - date (str, optional): Date in YYYY-MM-DD format, defaults to today
-            - quantity (float): Number of default servings for this food (default: 1.0)
+            - quantity (float): Number of servings (default: 1.0)
+            - unit (str, optional): Unit/serving size (e.g., '1 cup', '100g')
 
     Returns:
         str: Confirmation message with details of the added food entry
@@ -1584,37 +1586,40 @@ async def mfp_add_food_to_diary(params: AddFoodToDiaryInput) -> str:
     try:
         client = get_mfp_client()
         target_date = parse_date(params.date)
-
+        
         # Normalize meal name (capitalize first letter)
         meal = params.meal.strip().capitalize()
         if meal.lower() == "snack":
             meal = "Snacks"
-
+        
         # Add food to diary
-        add_food_to_diary(
+        entry_id = add_food_to_diary(
             client=client,
             mfp_id=params.mfp_id,
             meal=meal,
             target_date=target_date,
             quantity=params.quantity,
+            unit=params.unit,
         )
 
         # Get food details for confirmation
         try:
             food_item = client.get_food_item_details(params.mfp_id)
             food_name = getattr(food_item, "description", "Unknown Food")
-        except:
+        except Exception:
             food_name = "Food item"
 
         return json.dumps(
             {
                 "success": True,
                 "message": f"Successfully added {food_name} to {meal}",
+                "entry_id": entry_id,
                 "date": str(target_date),
                 "meal": meal,
                 "food_id": params.mfp_id,
                 "food_name": food_name,
                 "quantity": params.quantity,
+                "unit": params.unit,
             },
             indent=2,
         )
