@@ -42,6 +42,12 @@ mcp = FastMCP("myfitnesspal_mcp")
 CONFIG_DIR = Path.home() / ".mfp_mcp"
 COOKIES_FILE = CONFIG_DIR / "cookies.json"
 
+# MyFitnessPal's v2 JSON API, used for diary writes. The legacy HTML form
+# endpoint (/food/diary/{user}/add) was removed by MFP and now returns 404.
+MFP_API_BASE = "https://api.myfitnesspal.com"
+MFP_CLIENT_ID = "mfp-main-js"
+VALID_MEALS = ("Breakfast", "Lunch", "Dinner", "Snacks")
+
 
 # ============================================================================
 # Authentication Helper Functions
@@ -51,6 +57,7 @@ COOKIES_FILE = CONFIG_DIR / "cookies.json"
 def ensure_config_dir():
     """Ensure the config directory exists."""
     CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    CONFIG_DIR.chmod(0o700)
 
 
 def save_cookies(cookies: Dict[str, str]):
@@ -67,6 +74,8 @@ def save_cookies(cookies: Dict[str, str]):
     }
     with open(COOKIES_FILE, "w") as f:
         json.dump(cookie_data, f, indent=2)
+    # Session cookies grant full account access - restrict to owner only
+    COOKIES_FILE.chmod(0o600)
     logger.info(f"Saved session cookies to {COOKIES_FILE}")
 
 
@@ -690,105 +699,171 @@ class SetWaterInput(BaseModel):
 # ============================================================================
 
 
+def _mfp_api_headers(client, json_body: bool = False) -> Dict[str, str]:
+    """
+    Build auth headers for MyFitnessPal's v2 JSON API.
+
+    The v2 API backs the current MFP web client. It requires the session's
+    OAuth bearer token plus an mfp-client-id identifying the calling client.
+    """
+    headers = {
+        "Authorization": f"Bearer {client.access_token}",
+        "mfp-client-id": MFP_CLIENT_ID,
+        "mfp-user-id": str(client.user_id),
+        "Accept": "application/json",
+    }
+    if json_body:
+        headers["Content-Type"] = "application/json"
+    return headers
+
+
+def get_food_v2(client, mfp_id: str) -> Dict[str, Any]:
+    """
+    Fetch a food's full v2 record, including its version and serving sizes.
+
+    The diary API rejects entries whose food version does not match the
+    current stored version, so this must be read fresh rather than cached.
+
+    Args:
+        client: Authenticated myfitnesspal.Client instance
+        mfp_id: MyFitnessPal food item ID
+
+    Returns:
+        The food object as returned by the v2 API
+
+    Raises:
+        RuntimeError: If the food cannot be retrieved
+    """
+    response = client.session.get(
+        f"{MFP_API_BASE}/v2/foods",
+        params={"ids": str(mfp_id)},
+        headers=_mfp_api_headers(client),
+        timeout=30,
+    )
+    if response.status_code != 200:
+        raise RuntimeError(
+            f"Could not look up food {mfp_id}: HTTP {response.status_code}"
+        )
+
+    items = response.json().get("items") or []
+    if not items:
+        raise RuntimeError(f"No food found with ID {mfp_id}")
+    return items[0]
+
+
+def select_serving_size(food: Dict[str, Any], unit: Optional[str] = None) -> Dict[str, Any]:
+    """
+    Choose which of a food's serving sizes to log against.
+
+    Args:
+        food: Food object from get_food_v2
+        unit: Optional unit to match (e.g. "oz", "medium breast"). Matching is
+            case-insensitive and accepts a substring. Falls back to the food's
+            default (first) serving size when omitted or unmatched.
+
+    Returns:
+        The serving size dict, trimmed to the fields the diary API permits
+
+    Raises:
+        RuntimeError: If the food declares no serving sizes
+    """
+    serving_sizes = food.get("serving_sizes") or []
+    if not serving_sizes:
+        raise RuntimeError(f"Food {food.get('id')} has no serving sizes")
+
+    chosen = serving_sizes[0]
+    if unit:
+        wanted = unit.strip().lower()
+        for size in serving_sizes:
+            size_unit = str(size.get("unit", "")).lower()
+            if size_unit == wanted or wanted in size_unit:
+                chosen = size
+                break
+        else:
+            logger.warning(
+                f"Unit {unit!r} not found for food {food.get('id')}; "
+                f"using default serving {chosen.get('unit')!r}"
+            )
+
+    # The diary endpoint rejects any serving_size field beyond these three.
+    return {
+        "value": chosen["value"],
+        "unit": chosen["unit"],
+        "nutrition_multiplier": chosen["nutrition_multiplier"],
+    }
+
+
 def add_food_to_diary(
     client, mfp_id: str, meal: str, target_date: date, quantity: float = 1.0, unit: Optional[str] = None
-) -> None:
+) -> Optional[str]:
     """
     Add a food item to the diary for a specific date and meal.
-    
+
     Args:
         client: Authenticated myfitnesspal.Client instance
         mfp_id: MyFitnessPal food item ID
         meal: Meal name (Breakfast, Lunch, Dinner, Snacks)
         target_date: Date to add the food entry
         quantity: Number of servings (default 1.0)
-        unit: Optional unit/serving size description
-    
+        unit: Optional serving unit to log against (e.g. "oz")
+
+    Returns:
+        The new entry's UUID, or None if MFP did not return one
+
     Raises:
         RuntimeError: If the operation fails
     """
-    from urllib import parse
-    
+    food = get_food_v2(client, mfp_id)
+    serving_size = select_serving_size(food, unit)
+
+    meal_name = meal.strip().capitalize()
+    if meal_name not in VALID_MEALS:
+        raise RuntimeError(
+            f"Invalid meal {meal!r}. Expected one of: {', '.join(VALID_MEALS)}"
+        )
+
+    entry = {
+        "type": "food_entry",
+        "date": target_date.strftime("%Y-%m-%d"),
+        "meal_name": meal_name,
+        "servings": float(quantity),
+        "food": {"id": str(food["id"]), "version": str(food["version"])},
+        "serving_size": serving_size,
+    }
+
+    response = client.session.post(
+        f"{MFP_API_BASE}/v2/diary",
+        headers=_mfp_api_headers(client, json_body=True),
+        data=json.dumps({"items": [entry]}),
+        timeout=30,
+    )
+
+    if response.status_code not in (200, 201):
+        detail = ""
+        try:
+            body = response.json()
+            detail = body.get("error_details", {}).get("item_error") or body.get(
+                "error_description", ""
+            )
+        except Exception:
+            pass
+        raise RuntimeError(
+            f"Failed to add food to diary: HTTP {response.status_code}"
+            + (f" - {detail}" if detail else "")
+        )
+
+    logger.info(
+        f"Added food {mfp_id} ({serving_size['value']} {serving_size['unit']} "
+        f"x{quantity}) to {meal_name} for {target_date}"
+    )
+
+    # MFP returns the new entry's id here and nowhere else - the diary page
+    # exposes only legacy numeric ids, which the v2 API does not accept.
     try:
-        # Get the diary page for the target date to extract CSRF token
-        # Use the same method the library uses
-        date_str = target_date.strftime("%Y-%m-%d")
-        diary_url = parse.urljoin(
-            client.BASE_URL_SECURE,
-            f"food/diary/{client.effective_username}?date={date_str}"
-        )
-        
-        # Use the library's method to get the document
-        document = client._get_document_for_url(diary_url)
-        
-        # Extract authenticity token (same way the library does)
-        authenticity_token = document.xpath(
-            "(//input[@name='authenticity_token']/@value)[1]"
-        )
-        if not authenticity_token:
-            raise RuntimeError("Could not find authenticity token on diary page")
-        authenticity_token = authenticity_token[0]
-        
-        # Map meal names to meal indices (0=Breakfast, 1=Lunch, 2=Dinner, 3=Snacks)
-        meal_map = {
-            "breakfast": "0",
-            "lunch": "1",
-            "dinner": "2",
-            "snacks": "3",
-            "snack": "3",
-        }
-        meal_index = meal_map.get(meal.lower(), "0")
-        
-        # Build the URL for adding food
-        # MyFitnessPal uses /food/diary/{username}/add endpoint
-        add_food_url = parse.urljoin(
-            client.BASE_URL_SECURE,
-            f"food/diary/{client.effective_username}/add"
-        )
-        
-        # Prepare the data for the POST request
-        # Format matches what MyFitnessPal expects based on their form submissions
-        post_data = {
-            "authenticity_token": authenticity_token,
-            "date": date_str,
-            "meal": meal_index,
-            "food_id": mfp_id,
-            "quantity": str(quantity),
-        }
-        
-        if unit:
-            post_data["unit"] = unit
-        
-        # Add food to diary
-        headers = {
-            "Referer": diary_url,
-            "Content-Type": "application/x-www-form-urlencoded",
-            "X-Requested-With": "XMLHttpRequest",
-        }
-        
-        response = client.session.post(add_food_url, data=post_data, headers=headers)
-        response.raise_for_status()
-        
-        # Check response content for errors
-        if response.status_code != 200:
-            raise RuntimeError(f"Failed to add food: HTTP {response.status_code}")
-        
-        # MyFitnessPal might return success even with errors in content
-        # Log error indication without exposing full response content (may contain sensitive data)
-        content = response.text if hasattr(response, 'text') else response.content.decode('utf-8', errors='ignore')
-        if 'error' in content.lower() and 'success' not in content.lower():
-            logger.warning("Possible error in response from MyFitnessPal API")
-        
-        logger.info(f"Successfully added food {mfp_id} to {meal} for {target_date}")
-        
-    except Exception as e:
-        # Don't expose internal error details to avoid leaking sensitive information
-        error_msg = str(e)
-        # Only include safe error information
-        if "HTTP" in error_msg or "status" in error_msg.lower():
-            raise RuntimeError(f"Failed to add food to diary: {error_msg}")
-        else:
-            raise RuntimeError("Failed to add food to diary. Please check your authentication and try again.")
+        return response.json()["items"][0]["id"]
+    except (ValueError, KeyError, IndexError):
+        logger.warning("Entry created but MyFitnessPal returned no entry id")
+        return None
 
 
 def set_water_intake(client, target_date: date, cups: float) -> None:
@@ -1400,7 +1475,7 @@ async def mfp_add_food_to_diary(params: AddFoodToDiaryInput) -> str:
             meal = "Snacks"
         
         # Add food to diary
-        add_food_to_diary(
+        entry_id = add_food_to_diary(
             client=client,
             mfp_id=params.mfp_id,
             meal=meal,
@@ -1408,18 +1483,19 @@ async def mfp_add_food_to_diary(params: AddFoodToDiaryInput) -> str:
             quantity=params.quantity,
             unit=params.unit,
         )
-        
+
         # Get food details for confirmation
         try:
             food_item = client.get_food_item_details(params.mfp_id)
             food_name = getattr(food_item, "description", "Unknown Food")
-        except:
+        except Exception:
             food_name = "Food item"
-        
+
         return json.dumps(
             {
                 "success": True,
                 "message": f"Successfully added {food_name} to {meal}",
+                "entry_id": entry_id,
                 "date": str(target_date),
                 "meal": meal,
                 "food_id": params.mfp_id,
