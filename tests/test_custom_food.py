@@ -194,3 +194,23 @@ def test_country_code_is_load_bearing_for_eu_and_us():
         session = _FakeSession()
         server.create_custom_food(_FakeClient(session), _spec(country_code=code))
         assert session.posted["item"]["country_code"] == code
+
+
+def test_user_id_is_not_sent():
+    """Ownership comes from the session, so user_id is deliberately omitted.
+
+    Posting without it returns 200 with the correct owner (verified against the
+    live API). Sending it would cost an extra request to discover the value and
+    would degrade for an account that has no custom foods yet.
+    """
+    session = _FakeSession()
+    server.create_custom_food(_FakeClient(session), _spec())
+    assert "user_id" not in session.posted["item"]
+
+
+def test_error_detail_prefers_structured_fields():
+    """Failures report MFP's own message rather than a slice of the raw body."""
+    resp = _FakeResponse(400, {"error_description": "Request payload does not contain any food objects"})
+    assert server._api_error_detail(resp) == "Request payload does not contain any food objects"
+    assert server._api_error_detail(_FakeResponse(400, {"error": "bad-request"})) == "bad-request"
+    assert server._api_error_detail(_FakeResponse(500, "not json at all")) == ""

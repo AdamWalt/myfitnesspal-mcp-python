@@ -1175,6 +1175,7 @@ class DeleteCustomFoodInput(BaseModel):
     model_config = ConfigDict(str_strip_whitespace=True)
 
     food_id: str = Field(..., description="Food id (from mfp_create_custom_food or mfp_list_own_foods)", min_length=1)
+    response_format: str = Field(default="markdown", description="'markdown' or 'json'")
 
 
 class ListOwnFoodsInput(BaseModel):
@@ -1402,6 +1403,26 @@ def _web_headers(csrf: Optional[str] = None, json_body: bool = False) -> Dict[st
     return headers
 
 
+def _api_error_detail(response) -> str:
+    """Pull MFP's structured error text out of a failed response.
+
+    Mirrors how add_food_to_diary surfaces v2 errors, so we report the API's own
+    message rather than echoing an arbitrary slice of the response body.
+    """
+    try:
+        body = response.json()
+    except Exception:
+        return ""
+    if not isinstance(body, dict):
+        return ""
+    return str(
+        body.get("error_description")
+        or body.get("error_details", {}).get("item_error")
+        or body.get("error")
+        or ""
+    )
+
+
 def _get_csrf_token(client) -> Optional[str]:
     """Fetch a CSRF token. Returns None if unavailable; POST will then 403."""
     try:
@@ -1466,14 +1487,6 @@ def create_custom_food(client, spec: Dict[str, Any]) -> Dict[str, Any]:
     """
     csrf = _get_csrf_token(client)
 
-    user_id = None
-    try:
-        mine = list_own_foods(client, "")
-        if mine:
-            user_id = mine[0].get("user_id")
-    except Exception as e:
-        logger.warning(f"Could not resolve user_id from own foods: {e}")
-
     nutrition: Dict[str, Any] = {
         "energy": {"unit": "calories", "value": spec["calories"]},
         "grams": 1,
@@ -1494,8 +1507,10 @@ def create_custom_food(client, spec: Dict[str, Any]) -> Dict[str, Any]:
         ),
     }
     item["country_code"] = spec.get("country_code") or "NL"
-    if user_id:
-        item["user_id"] = user_id
+    # Ownership is assigned by MyFitnessPal from the session, so user_id is not
+    # sent: posting without it returns 200 with the correct owner. Sending it
+    # would also mean an extra request, and would fail for an account that has
+    # no custom foods yet.
 
     r = client.session.post(
         f"{MFP_WEB_BASE}/api/services/foods",
@@ -1506,9 +1521,9 @@ def create_custom_food(client, spec: Dict[str, Any]) -> Dict[str, Any]:
 
     if r.status_code not in (200, 201):
         hint = "" if csrf else " (no CSRF token acquired)"
-        detail = r.text[:200]
         raise RuntimeError(
-            f"Failed to create custom food: HTTP {r.status_code}{hint} - {detail}"
+            f"Failed to create custom food: HTTP {r.status_code}{hint}"
+            + (f" - {_api_error_detail(r)}" if _api_error_detail(r) else "")
         )
 
     # MFP returns a bare list of the created food object(s); older docs/clients
@@ -1539,7 +1554,8 @@ def delete_custom_food(client, food_id: str) -> int:
     )
     if r.status_code not in (200, 204):
         raise RuntimeError(
-            f"Failed to delete custom food {food_id}: HTTP {r.status_code} - {r.text[:200]}"
+            f"Failed to delete custom food {food_id}: HTTP {r.status_code}"
+            + (f" - {_api_error_detail(r)}" if _api_error_detail(r) else "")
         )
     logger.info(f"Deleted custom food {food_id}")
     return r.status_code
@@ -2797,7 +2813,8 @@ async def mfp_delete_custom_food(params: DeleteCustomFoodInput) -> str:
     try:
         client = get_mfp_client()
         status = delete_custom_food(client, params.food_id)
-        return f"Deleted custom food {params.food_id} (HTTP {status})"
+        data = {"food_id": params.food_id, "deleted": True, "status": status}
+        return format_response(data, params.response_format, "Custom Food Deleted")
     except Exception as e:
         return f"Error deleting custom food: {str(e)}"
 
