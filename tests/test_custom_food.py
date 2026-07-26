@@ -170,3 +170,27 @@ def test_csrf_token_is_sent_as_header():
 def test_delete_returns_status():
     session = _FakeSession()
     assert server.delete_custom_food(_FakeClient(session), "123") == 204
+
+def test_public_flag_is_transmitted():
+    """`public=True` reaches the payload.
+
+    Only the outbound field is asserted. Creating a genuinely public food would
+    publish into MyFitnessPal's shared database for other users, so that is
+    deliberately not exercised against a live account.
+    """
+    session = _FakeSession()
+    server.create_custom_food(_FakeClient(session), _spec(public=True))
+    assert session.posted["item"]["public"] is True
+
+
+def test_country_code_is_load_bearing_for_eu_and_us():
+    """Both conventions are transmitted verbatim.
+
+    Live behaviour (verified 2026-07-26, carbohydrates=42 + fiber=8):
+      NL/DE/GB/IT -> stored 50/42  (sent value read as NET)
+      US/CA/absent -> stored 42/34 (sent value read as TOTAL)
+    """
+    for code in ("NL", "DE", "GB", "IT", "US", "CA"):
+        session = _FakeSession()
+        server.create_custom_food(_FakeClient(session), _spec(country_code=code))
+        assert session.posted["item"]["country_code"] == code
