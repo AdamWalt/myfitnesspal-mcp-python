@@ -10,6 +10,9 @@ A [Model Context Protocol (MCP)](https://modelcontextprotocol.io/) server that e
 | `mfp_search_food` | Read | Search the MyFitnessPal food database |
 | `mfp_get_food_details` | Read | Get detailed nutrition info for a food item |
 | `mfp_add_food_to_diary` | Write | Add a food item to your diary for a specific meal and date |
+| `mfp_create_custom_food` | Write | Create a private custom food with a full nutrition panel |
+| `mfp_list_own_foods` | Read | List your own custom foods (private ones do not appear in search) |
+| `mfp_delete_custom_food` | Write | Delete one of your custom foods |
 | `mfp_get_measurements` | Read | Get weight/body measurement history |
 | `mfp_set_measurement` | Write | Log a new weight or body measurement |
 | `mfp_get_exercises` | Read | Get logged exercises (cardio & strength) |
@@ -26,6 +29,12 @@ MyFitnessPal has no public API. Reads here are scraped from the website via
 [`python-myfitnesspal`](https://github.com/coddingtonbear/python-myfitnesspal), and **diary
 writes go through MFP's internal v2 JSON API** — the same one their web client uses,
 authenticated with your existing session token.
+
+**Custom-food writes** (`mfp_create_custom_food`, `mfp_list_own_foods`,
+`mfp_delete_custom_food`) use a different endpoint family: MFP's v2 API exposes no
+custom-food create, so these call the same cookie-authenticated web endpoints their
+website uses (`/api/auth/csrf`, `/api/services/users/foods/mine`, `/api/services/foods`).
+No browser needs to be running , the stored session cookies are sufficient.
 
 That interface is undocumented and was determined by observing the web client. It works today,
 but MyFitnessPal can change it without notice. They have already done so once: this server
@@ -641,6 +650,48 @@ Add a food item to your diary for a specific meal and date.
 **Example workflow:**
 1. Use `mfp_search_food` to find a food item and get its `mfp_id`
 2. Use `mfp_add_food_to_diary` with the `mfp_id` to add it to your diary
+
+### mfp_create_custom_food
+Create a private custom food in your account. Returns the new food's `id`, which
+`mfp_add_food_to_diary` accepts.
+- `description` (required): Food name as it appears in MFP
+- `calories` (required): Calories per serving
+- `brand_name` (optional): Brand; packaged = label brand, restaurant = venue, homemade = "Generic" (default: "Generic")
+- `serving_amount` (optional): Serving size number (default: 100)
+- `serving_unit` (optional): Serving unit, e.g. "g", "ml", "piece" (default: "g")
+- Nutrients (all optional): `carbs`, `fiber`, `sugar`, `protein`, `fat`, `saturated_fat`,
+  `polyunsaturated_fat`, `monounsaturated_fat`, `trans_fat`, `cholesterol` (mg), `sodium` (mg),
+  `potassium` (mg), `vitamin_a`, `vitamin_c`, `calcium`, `iron` (last four are %DV)
+- `country_code` (optional): Label convention (default: "NL") , **see the carbs note below**
+- `public` (optional): Share publicly (default: false)
+- `response_format`: "markdown" or "json"
+
+**`carbs` is NET carbs, and `country_code` is what makes it so.** The field selects which
+label convention your number follows, so it changes the meaning of `carbs`:
+
+| `country_code` | `carbs` is read as | MFP stores |
+|------|------|-------------|
+| `"NL"` and other EU codes (labels exclude fibre) | **NET** | `net_carbs = carbs`, `carbohydrates = carbs + fiber` |
+| omitted / US (labels include fibre) | TOTAL | `carbohydrates = carbs`, `net_carbs = carbs − fiber` |
+
+Sending `carbs=42, fiber=8` stores `50/42` under `"NL"` but `42/34` without it. Pass the number
+straight off the label and leave `country_code` matching that label's origin , do not pre-subtract
+fibre.
+
+**MyFitnessPal has no custom-food update endpoint.** To correct a food, create the corrected
+version and then `mfp_delete_custom_food` the old one.
+
+### mfp_list_own_foods
+List your own custom foods, newest first. Private custom foods do not reliably appear in
+`mfp_search_food`, so this is how to find the `id` of something you created earlier.
+- `search` (optional): Substring filter on the food name
+- `limit` (optional): Max foods to return (default: 25)
+- `response_format`: "markdown" or "json"
+
+### mfp_delete_custom_food
+Delete one of your custom foods. Destructive and not recoverable; MyFitnessPal may refuse if the
+food is referenced by a logged diary entry.
+- `food_id` (required): Food id from `mfp_create_custom_food` or `mfp_list_own_foods`
 
 ### mfp_get_measurements
 Get body measurement history.
