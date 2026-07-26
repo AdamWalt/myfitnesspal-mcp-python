@@ -35,7 +35,7 @@ authenticated with your existing session token.
 `mfp_delete_custom_food`) use a different endpoint family: MFP's v2 API exposes no
 custom-food create, so these call the same cookie-authenticated web endpoints their
 website uses (`/api/auth/csrf`, `/api/services/users/foods/mine`, `/api/services/foods`).
-No browser needs to be running , the stored session cookies are sufficient.
+No browser needs to be running — the stored session cookies are sufficient.
 
 That interface is undocumented and was determined by observing the web client. It works today,
 but MyFitnessPal can change it without notice. They have already done so once: this server
@@ -663,7 +663,7 @@ Create a private custom food in your account. Returns the new food's `id`, which
 - Nutrients (all optional): `carbs`, `fiber`, `sugar`, `protein`, `fat`, `saturated_fat`,
   `polyunsaturated_fat`, `monounsaturated_fat`, `trans_fat`, `cholesterol` (mg), `sodium` (mg),
   `potassium` (mg), `vitamin_a`, `vitamin_c`, `calcium`, `iron` (last four are %DV)
-- `country_code` (optional): Label convention (default: "NL") , **see the carbs note below**
+- `country_code` (optional): Label convention (default: "NL") — **see the carbs note below**
 - `public` (optional): Share publicly (default: false)
 - `response_format`: "markdown" or "json"
 
@@ -676,7 +676,7 @@ label convention your number follows, so it changes the meaning of `carbs`:
 | omitted / US (labels include fibre) | TOTAL | `carbohydrates = carbs`, `net_carbs = carbs − fiber` |
 
 Sending `carbs=42, fiber=8` stores `50/42` under `"NL"` but `42/34` without it. Pass the number
-straight off the label and leave `country_code` matching that label's origin , do not pre-subtract
+straight off the label and leave `country_code` matching that label's origin — do not pre-subtract
 fibre.
 
 **MyFitnessPal has no custom-food update endpoint.** To correct a food, create the corrected
