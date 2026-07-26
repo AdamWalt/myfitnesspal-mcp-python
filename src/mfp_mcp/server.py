@@ -1112,6 +1112,81 @@ class AddFoodToDiaryInput(BaseModel):
     )
 
 
+class CreateCustomFoodInput(BaseModel):
+    """Input model for creating a private custom food."""
+
+    model_config = ConfigDict(str_strip_whitespace=True)
+
+    description: str = Field(
+        ..., description="Food name as it appears in MFP", min_length=1, max_length=200
+    )
+    brand_name: str = Field(
+        default="Generic",
+        description="Brand. Packaged food = label brand; restaurant = venue name; homemade = 'Generic'.",
+        max_length=200,
+    )
+    serving_amount: float = Field(
+        default=100, description="Serving size number (e.g. 100 for '100 g')", gt=0
+    )
+    serving_unit: str = Field(
+        default="g", description="Serving unit (e.g. 'g', 'ml', 'piece', 'box (100 g)')"
+    )
+    calories: float = Field(..., description="Calories per serving", ge=0)
+
+    carbs: Optional[float] = Field(
+        default=None,
+        description="NET carbs in g (MFP adds fiber itself to report total; never pre-add fiber)",
+        ge=0,
+    )
+    fiber: Optional[float] = Field(default=None, description="Fiber, g", ge=0)
+    sugar: Optional[float] = Field(default=None, description="Sugars, g", ge=0)
+    protein: Optional[float] = Field(default=None, description="Protein, g", ge=0)
+    fat: Optional[float] = Field(default=None, description="Total fat, g", ge=0)
+    saturated_fat: Optional[float] = Field(default=None, description="Saturated fat, g", ge=0)
+    polyunsaturated_fat: Optional[float] = Field(default=None, description="Polyunsaturated fat, g", ge=0)
+    monounsaturated_fat: Optional[float] = Field(default=None, description="Monounsaturated fat, g", ge=0)
+    trans_fat: Optional[float] = Field(default=None, description="Trans fat, g", ge=0)
+    cholesterol: Optional[float] = Field(default=None, description="Cholesterol, mg", ge=0)
+    sodium: Optional[float] = Field(default=None, description="Sodium, mg", ge=0)
+    potassium: Optional[float] = Field(default=None, description="Potassium, mg", ge=0)
+    vitamin_a: Optional[float] = Field(default=None, description="Vitamin A, %DV", ge=0)
+    vitamin_c: Optional[float] = Field(default=None, description="Vitamin C, %DV", ge=0)
+    calcium: Optional[float] = Field(default=None, description="Calcium, %DV", ge=0)
+    iron: Optional[float] = Field(default=None, description="Iron, %DV", ge=0)
+
+    country_code: str = Field(
+        default="NL",
+        description=(
+            "Label convention, and it changes carb meaning. 'NL'/EU: `carbs` is read as NET "
+            "(MFP reports total = carbs + fiber). Omitting/US: `carbs` is read as TOTAL. "
+            "Keep 'NL' unless deliberately entering a US-style total-carb label."
+        ),
+        min_length=2, max_length=2,
+    )
+    public: bool = Field(
+        default=False, description="Share publicly. Keep False for personal entries."
+    )
+    response_format: str = Field(default="markdown", description="'markdown' or 'json'")
+
+
+class DeleteCustomFoodInput(BaseModel):
+    """Input model for deleting a custom food."""
+
+    model_config = ConfigDict(str_strip_whitespace=True)
+
+    food_id: str = Field(..., description="Food id (from mfp_create_custom_food or mfp_list_own_foods)", min_length=1)
+
+
+class ListOwnFoodsInput(BaseModel):
+    """Input model for listing the user's own custom foods."""
+
+    model_config = ConfigDict(str_strip_whitespace=True)
+
+    search: str = Field(default="", description="Optional substring filter on the food name")
+    limit: int = Field(default=25, description="Max foods to return", gt=0, le=200)
+    response_format: str = Field(default="markdown", description="'markdown' or 'json'")
+
+
 class RemoveFoodFromDiaryInput(BaseModel):
     """Input model for removing food entries from diary."""
 
@@ -1267,6 +1342,207 @@ def select_serving_size(food: Dict[str, Any], unit: Optional[str] = None) -> Dic
         "unit": chosen["unit"],
         "nutrition_multiplier": chosen["nutrition_multiplier"],
     }
+
+
+
+# ============================================================================
+# Custom-food creation (web BFF /api/services/foods)
+#
+# MFP exposes no custom-food create on the v2 OAuth API, but its own web client
+# does it with three plain HTTP calls, all cookie-authenticated. Since this
+# server already holds a logged-in cookie jar, it can call them directly , no
+# browser automation, no Chrome running.
+#
+#   GET  /api/auth/csrf                  -> { csrfToken }
+#   GET  /api/services/users/foods/mine  -> [ ...foods ]   (source of user_id)
+#   POST /api/services/foods             -> { item: {...} } (201/200)
+#   DELETE /api/services/foods/{id}      -> 204
+#
+# CARBS + COUNTRY_CODE (verified 2026-07-26, both directions):
+# `country_code` decides how MFP reads nutritional_contents.carbohydrates.
+#   country_code="NL" (EU labels exclude fibre):
+#       sent value = NET  -> stores net_carbs=sent, carbohydrates=sent+fiber
+#   country_code omitted (US default, labels include fibre):
+#       sent value = TOTAL -> stores carbohydrates=sent, net_carbs=sent-fiber
+# Sending carbohydrates=42, fiber=8 gives 50/42 with "NL" and 42/34 without.
+# So country_code is NOT cosmetic: omitting it silently shifts every carb value
+# by the fibre amount. Default "NL" and pass NET carbs.
+# ============================================================================
+
+MFP_WEB_BASE = "https://www.myfitnesspal.com"
+
+# canonical arg -> MFP nutritional_contents key
+_NUTRIENT_KEYS = {
+    "fat": "fat",
+    "saturated_fat": "saturated_fat",
+    "polyunsaturated_fat": "polyunsaturated_fat",
+    "monounsaturated_fat": "monounsaturated_fat",
+    "trans_fat": "trans_fat",
+    "cholesterol": "cholesterol",
+    "sodium": "sodium",
+    "potassium": "potassium",
+    "carbs": "carbohydrates",
+    "fiber": "fiber",
+    "sugar": "sugar",
+    "protein": "protein",
+    "vitamin_a": "vitamin_a",
+    "vitamin_c": "vitamin_c",
+    "calcium": "calcium",
+    "iron": "iron",
+}
+
+
+def _web_headers(csrf: Optional[str] = None, json_body: bool = False) -> Dict[str, str]:
+    """Headers for the cookie-authenticated web BFF."""
+    headers = {"Accept": "application/json"}
+    if json_body:
+        headers["Content-Type"] = "application/json"
+    if csrf:
+        headers["x-csrf-token"] = csrf
+    return headers
+
+
+def _get_csrf_token(client) -> Optional[str]:
+    """Fetch a CSRF token. Returns None if unavailable; POST will then 403."""
+    try:
+        r = client.session.get(
+            f"{MFP_WEB_BASE}/api/auth/csrf", headers=_web_headers(), timeout=30
+        )
+        if r.status_code == 200:
+            return r.json().get("csrfToken")
+    except Exception as e:
+        logger.warning(f"Could not fetch CSRF token: {e}")
+    return None
+
+
+def list_own_foods(client, search: str = "") -> List[Dict[str, Any]]:
+    """List the user's own custom foods (newest first), optionally filtered."""
+    r = client.session.get(
+        f"{MFP_WEB_BASE}/api/services/users/foods/mine",
+        params={"search": search},
+        headers=_web_headers(),
+        timeout=30,
+    )
+    if r.status_code != 200:
+        raise RuntimeError(
+            f"Could not list own foods: HTTP {r.status_code}. "
+            "The stored session may have expired , run refresh_browser_cookies."
+        )
+    return r.json() or []
+
+
+def _serving_sizes(amount: float, unit: str) -> List[Dict[str, Any]]:
+    """Primary serving plus the container wrapper MFP's own client sends."""
+    return [
+        {
+            "value": amount,
+            "unit": unit,
+            "nutrition_multiplier": 1,
+            "gram_weight": 1,
+            "fraction": False,
+            "index": 0,
+        },
+        {
+            "value": 1,
+            "unit": f"container ({amount} {unit} ea.)",
+            "nutrition_multiplier": 1,
+            "gram_weight": 1,
+            "fraction": False,
+            "index": 1,
+        },
+    ]
+
+
+def create_custom_food(client, spec: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Create a private custom food via the web BFF.
+
+    Args:
+        client: authenticated myfitnesspal.Client
+        spec: validated CreateCustomFoodInput as a dict
+
+    Returns:
+        {"id": str|None, "status": int, "description": str}
+    """
+    csrf = _get_csrf_token(client)
+
+    user_id = None
+    try:
+        mine = list_own_foods(client, "")
+        if mine:
+            user_id = mine[0].get("user_id")
+    except Exception as e:
+        logger.warning(f"Could not resolve user_id from own foods: {e}")
+
+    nutrition: Dict[str, Any] = {
+        "energy": {"unit": "calories", "value": spec["calories"]},
+        "grams": 1,
+    }
+    for arg, api_key in _NUTRIENT_KEYS.items():
+        value = spec.get(arg)
+        if value is not None:
+            nutrition[api_key] = value
+
+    item = {
+        "description": spec["description"],
+        "brand_name": spec.get("brand_name") or "Generic",
+        "public": bool(spec.get("public", False)),
+        "type": "food",
+        "nutritional_contents": nutrition,
+        "serving_sizes": _serving_sizes(
+            spec.get("serving_amount", 100), spec.get("serving_unit", "g")
+        ),
+    }
+    item["country_code"] = spec.get("country_code") or "NL"
+    if user_id:
+        item["user_id"] = user_id
+
+    r = client.session.post(
+        f"{MFP_WEB_BASE}/api/services/foods",
+        headers=_web_headers(csrf, json_body=True),
+        data=json.dumps({"item": item}),
+        timeout=30,
+    )
+
+    if r.status_code not in (200, 201):
+        hint = "" if csrf else " (no CSRF token acquired)"
+        detail = r.text[:200]
+        raise RuntimeError(
+            f"Failed to create custom food: HTTP {r.status_code}{hint} - {detail}"
+        )
+
+    # MFP returns a bare list of the created food object(s); older docs/clients
+    # assumed {"item": {...}}. Accept both.
+    new_id = None
+    try:
+        body = r.json()
+        if isinstance(body, list) and body:
+            new_id = body[0].get("id")
+        elif isinstance(body, dict):
+            new_id = (body.get("item") or body).get("id")
+    except Exception:
+        pass
+    if new_id is None:
+        logger.warning("Food created but MyFitnessPal returned no id")
+
+    logger.info(f"Created custom food {new_id}: {spec['description']}")
+    return {"id": new_id, "status": r.status_code, "description": spec["description"]}
+
+
+def delete_custom_food(client, food_id: str) -> int:
+    """Delete a custom food by id. MFP has no update endpoint , recreate + delete."""
+    csrf = _get_csrf_token(client)
+    r = client.session.delete(
+        f"{MFP_WEB_BASE}/api/services/foods/{food_id}",
+        headers=_web_headers(csrf),
+        timeout=30,
+    )
+    if r.status_code not in (200, 204):
+        raise RuntimeError(
+            f"Failed to delete custom food {food_id}: HTTP {r.status_code} - {r.text[:200]}"
+        )
+    logger.info(f"Deleted custom food {food_id}")
+    return r.status_code
 
 
 def add_food_to_diary(
@@ -2405,6 +2681,125 @@ def refresh_browser_cookies(browser: str = "auto") -> str:
 # ============================================================================
 # Main Entry Point
 # ============================================================================
+
+
+
+@mcp.tool(
+    name="mfp_create_custom_food",
+    annotations={
+        "title": "Create Custom Food",
+        "readOnlyHint": False,
+        "destructiveHint": False,
+        "idempotentHint": False,
+        "openWorldHint": True,
+    },
+)
+async def mfp_create_custom_food(params: CreateCustomFoodInput) -> str:
+    """
+    Create a private custom food in the user's MyFitnessPal account.
+
+    Fills the full nutrition panel MFP supports (macros, fats breakdown,
+    cholesterol, sodium, potassium, fiber, sugars, and the four %DV micros).
+    Uses the cookie-authenticated web endpoint, so no browser needs to be
+    running. Returns the new food's id, which mfp_add_food_to_diary accepts.
+
+    CARBS ARE NET (with the default country_code="NL"): pass net carbs in
+    `carbs`; MFP stores net_carbs as given and reports total = carbs + fiber.
+    Never pre-add fiber. Verified: carbs=42/fiber=8 stores 50/42 under "NL" but
+    42/34 with country_code omitted, so the field is load-bearing, not cosmetic.
+
+    MFP has no update endpoint. To correct a food, create the corrected version
+    then mfp_delete_custom_food the old one.
+
+    Args:
+        params: CreateCustomFoodInput (description, brand_name, serving_amount,
+            serving_unit, calories + optional nutrients, public, response_format)
+
+    Returns:
+        str: The created food's id, description and HTTP status
+    """
+    try:
+        client = get_mfp_client()
+        result = create_custom_food(client, params.model_dump())
+        return format_response(result, params.response_format, "Custom Food Created")
+    except Exception as e:
+        return f"Error creating custom food: {str(e)}"
+
+
+@mcp.tool(
+    name="mfp_list_own_foods",
+    annotations={
+        "title": "List Own Custom Foods",
+        "readOnlyHint": True,
+        "destructiveHint": False,
+        "idempotentHint": True,
+        "openWorldHint": True,
+    },
+)
+async def mfp_list_own_foods(params: ListOwnFoodsInput) -> str:
+    """
+    List the user's own custom foods, newest first.
+
+    Private custom foods do not reliably surface in mfp_search_food, so this is
+    the way to find the id of something previously created.
+
+    Args:
+        params: ListOwnFoodsInput (search, limit, response_format)
+
+    Returns:
+        str: Matching custom foods with id, description, brand and calories
+    """
+    try:
+        client = get_mfp_client()
+        foods = list_own_foods(client, params.search)[: params.limit]
+        data = {
+            "count": len(foods),
+            "foods": [
+                {
+                    "id": f.get("id"),
+                    "description": f.get("description"),
+                    "brand_name": f.get("brand_name"),
+                    "calories": (f.get("nutritional_contents", {}).get("energy", {}) or {}).get("value"),
+                    "serving": (f.get("serving_sizes") or [{}])[0].get("unit"),
+                    "public": f.get("public"),
+                }
+                for f in foods
+            ],
+        }
+        return format_response(data, params.response_format, "My Custom Foods")
+    except Exception as e:
+        return f"Error listing own foods: {str(e)}"
+
+
+@mcp.tool(
+    name="mfp_delete_custom_food",
+    annotations={
+        "title": "Delete Custom Food",
+        "readOnlyHint": False,
+        "destructiveHint": True,
+        "idempotentHint": True,
+        "openWorldHint": True,
+    },
+)
+async def mfp_delete_custom_food(params: DeleteCustomFoodInput) -> str:
+    """
+    Delete one of the user's custom foods by id.
+
+    Destructive and not recoverable. A food actively referenced by a logged
+    diary entry may be refused by MyFitnessPal.
+
+    Args:
+        params: DeleteCustomFoodInput (food_id)
+
+    Returns:
+        str: Confirmation with the HTTP status
+    """
+    try:
+        client = get_mfp_client()
+        status = delete_custom_food(client, params.food_id)
+        return f"Deleted custom food {params.food_id} (HTTP {status})"
+    except Exception as e:
+        return f"Error deleting custom food: {str(e)}"
 
 
 def main():
