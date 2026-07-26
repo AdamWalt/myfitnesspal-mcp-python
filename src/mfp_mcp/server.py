@@ -1166,7 +1166,10 @@ class CreateCustomFoodInput(BaseModel):
     public: bool = Field(
         default=False, description="Share publicly. Keep False for personal entries."
     )
-    response_format: str = Field(default="markdown", description="'markdown' or 'json'")
+    response_format: ResponseFormat = Field(
+        default=ResponseFormat.MARKDOWN,
+        description="Output format: 'markdown' for human-readable or 'json' for structured data",
+    )
 
 
 class DeleteCustomFoodInput(BaseModel):
@@ -1175,7 +1178,10 @@ class DeleteCustomFoodInput(BaseModel):
     model_config = ConfigDict(str_strip_whitespace=True)
 
     food_id: str = Field(..., description="Food id (from mfp_create_custom_food or mfp_list_own_foods)", min_length=1)
-    response_format: str = Field(default="markdown", description="'markdown' or 'json'")
+    response_format: ResponseFormat = Field(
+        default=ResponseFormat.MARKDOWN,
+        description="Output format: 'markdown' for human-readable or 'json' for structured data",
+    )
 
 
 class ListOwnFoodsInput(BaseModel):
@@ -1185,7 +1191,10 @@ class ListOwnFoodsInput(BaseModel):
 
     search: str = Field(default="", description="Optional substring filter on the food name")
     limit: int = Field(default=25, description="Max foods to return", gt=0, le=200)
-    response_format: str = Field(default="markdown", description="'markdown' or 'json'")
+    response_format: ResponseFormat = Field(
+        default=ResponseFormat.MARKDOWN,
+        description="Output format: 'markdown' for human-readable or 'json' for structured data",
+    )
 
 
 class RemoveFoodFromDiaryInput(BaseModel):
@@ -1351,7 +1360,7 @@ def select_serving_size(food: Dict[str, Any], unit: Optional[str] = None) -> Dic
 #
 # MFP exposes no custom-food create on the v2 OAuth API, but its own web client
 # does it with three plain HTTP calls, all cookie-authenticated. Since this
-# server already holds a logged-in cookie jar, it can call them directly , no
+# server already holds a logged-in cookie jar, it can call them directly — no
 # browser automation, no Chrome running.
 #
 #   GET  /api/auth/csrf                  -> { csrfToken }
@@ -1447,7 +1456,7 @@ def list_own_foods(client, search: str = "") -> List[Dict[str, Any]]:
     if r.status_code != 200:
         raise RuntimeError(
             f"Could not list own foods: HTTP {r.status_code}. "
-            "The stored session may have expired , run refresh_browser_cookies."
+            "The stored session may have expired — run refresh_browser_cookies."
         )
     return r.json() or []
 
@@ -1521,9 +1530,10 @@ def create_custom_food(client, spec: Dict[str, Any]) -> Dict[str, Any]:
 
     if r.status_code not in (200, 201):
         hint = "" if csrf else " (no CSRF token acquired)"
+        detail = _api_error_detail(r)
         raise RuntimeError(
             f"Failed to create custom food: HTTP {r.status_code}{hint}"
-            + (f" - {_api_error_detail(r)}" if _api_error_detail(r) else "")
+            + (f" - {detail}" if detail else "")
         )
 
     # MFP returns a bare list of the created food object(s); older docs/clients
@@ -1545,7 +1555,7 @@ def create_custom_food(client, spec: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def delete_custom_food(client, food_id: str) -> int:
-    """Delete a custom food by id. MFP has no update endpoint , recreate + delete."""
+    """Delete a custom food by id. MFP has no update endpoint — recreate + delete."""
     csrf = _get_csrf_token(client)
     r = client.session.delete(
         f"{MFP_WEB_BASE}/api/services/foods/{food_id}",
@@ -1553,9 +1563,10 @@ def delete_custom_food(client, food_id: str) -> int:
         timeout=30,
     )
     if r.status_code not in (200, 204):
+        detail = _api_error_detail(r)
         raise RuntimeError(
             f"Failed to delete custom food {food_id}: HTTP {r.status_code}"
-            + (f" - {_api_error_detail(r)}" if _api_error_detail(r) else "")
+            + (f" - {detail}" if detail else "")
         )
     logger.info(f"Deleted custom food {food_id}")
     return r.status_code
