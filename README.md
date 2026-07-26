@@ -10,6 +10,7 @@ A [Model Context Protocol (MCP)](https://modelcontextprotocol.io/) server that e
 | `mfp_search_food` | Read | Search the MyFitnessPal food database |
 | `mfp_get_food_details` | Read | Get detailed nutrition info for a food item |
 | `mfp_add_food_to_diary` | Write | Add a food item to your diary for a specific meal and date |
+| `mfp_remove_food_from_diary` | Write | Remove a logged entry from your diary |
 | `mfp_create_custom_food` | Write | Create a private custom food with a full nutrition panel |
 | `mfp_list_own_foods` | Read | List your own custom foods (private ones do not appear in search) |
 | `mfp_delete_custom_food` | Write | Delete one of your custom foods |
@@ -692,6 +693,10 @@ List your own custom foods, newest first. Private custom foods do not reliably a
 Delete one of your custom foods. Destructive and not recoverable; MyFitnessPal may refuse if the
 food is referenced by a logged diary entry.
 - `food_id` (required): Food id from `mfp_create_custom_food` or `mfp_list_own_foods`
+
+### mfp_remove_food_from_diary
+Remove a logged entry from your diary.
+- `entry_id` (required): Diary entry id (from `mfp_get_diary`)
 
 ### mfp_get_measurements
 Get body measurement history.
