@@ -69,74 +69,76 @@ def ensure_config_dir():
     CONFIG_DIR.chmod(0o700)
 
 
-def save_cookies(cookies: Dict[str, str]):
-    """
-    Save session cookies to file for persistence.
-    
-    Args:
-        cookies: Dictionary of cookie name -> value
-    """
+# Cookies are represented as records: [{"name", "value", "domain"}]. Carrying the
+# real per-cookie domain (rather than a flat name->value map) is required. MFP's
+# session/CSRF cookies — and ordinary-looking ones like `remember_me`,
+# `_mfp_session`, `consentUUID` — are host-only to www.myfitnesspal.com. Flattening
+# them to .myfitnesspal.com makes food search silently return an empty page, and
+# they can't be identified by name, so the source domain must be preserved.
+BLANKET_DOMAIN = ".myfitnesspal.com"
+
+Record = Dict[str, str]
+
+
+def _records_from_jar(cookiejar) -> List[Record]:
+    """Build cookie records from a http.cookiejar-style jar (e.g. browser_cookie3)."""
+    return [{"name": c.name, "value": c.value, "domain": c.domain} for c in cookiejar]
+
+
+def _records_from_dict(cookies: Dict[str, str], domain: str = BLANKET_DOMAIN) -> List[Record]:
+    """Build records from a bare name->value map (legacy sources have no domains)."""
+    return [{"name": n, "value": v, "domain": domain} for n, v in cookies.items()]
+
+
+def save_cookie_records(records: List[Record]):
+    """Persist cookie records to file."""
     ensure_config_dir()
-    cookie_data = {
-        "cookies": cookies,
-        "saved_at": datetime.now().isoformat(),
-    }
+    cookie_data = {"cookies": records, "saved_at": datetime.now().isoformat()}
     with open(COOKIES_FILE, "w") as f:
         json.dump(cookie_data, f, indent=2)
     # Session cookies grant full account access - restrict to owner only
     COOKIES_FILE.chmod(0o600)
-    logger.info(f"Saved session cookies to {COOKIES_FILE}")
+    logger.info(f"Saved {len(records)} session cookies to {COOKIES_FILE}")
 
 
-def load_cookies() -> Optional[Dict[str, str]]:
-    """
-    Load session cookies from file.
-    
-    Returns:
-        Dictionary of cookies if file exists and is valid, None otherwise
+def load_cookie_records() -> Optional[List[Record]]:
+    """Load cookie records from file, or None if missing/expired/invalid.
+
+    Also accepts the legacy `{name: value}` format, mapping it onto records with
+    the blanket domain so older cookies.json files keep working.
     """
     if not COOKIES_FILE.exists():
         return None
-    
     try:
         with open(COOKIES_FILE, "r") as f:
             cookie_data = json.load(f)
-        
-        # Check if cookies are less than 30 days old
         saved_at = datetime.fromisoformat(cookie_data.get("saved_at", "2000-01-01"))
         if datetime.now() - saved_at > timedelta(days=30):
             logger.info("Stored cookies are expired (>30 days old)")
             return None
-        
-        return cookie_data.get("cookies")
+        cookies = cookie_data.get("cookies")
+        if isinstance(cookies, dict):  # legacy name->value format
+            return _records_from_dict(cookies)
+        return cookies
     except Exception as e:
         logger.warning(f"Failed to load cookies: {e}")
         return None
 
 
-def dict_to_cookiejar(cookies_dict: Dict[str, str], domain: str = ".myfitnesspal.com") -> CookieJar:
-    """
-    Convert a dictionary of cookies to a CookieJar that can be used by myfitnesspal.Client.
-    
-    Args:
-        cookies_dict: Dictionary of cookie name -> value
-        domain: Domain for the cookies (default: .myfitnesspal.com)
-    
-    Returns:
-        CookieJar: A CookieJar object populated with the cookies
-    """
+def records_to_cookiejar(records: List[Record]) -> CookieJar:
+    """Build a CookieJar from cookie records, scoping each cookie to its real domain."""
     jar = CookieJar()
-    
-    for name, value in cookies_dict.items():
+    for rec in records:
+        domain = rec.get("domain") or BLANKET_DOMAIN
         cookie = Cookie(
             version=0,
-            name=name,
-            value=value,
+            name=rec["name"],
+            value=rec.get("value", ""),
             port=None,
             port_specified=False,
             domain=domain,
             domain_specified=True,
-            domain_initial_dot=domain.startswith('.'),
+            domain_initial_dot=domain.startswith("."),
             path="/",
             path_specified=True,
             secure=True,
@@ -148,7 +150,6 @@ def dict_to_cookiejar(cookies_dict: Dict[str, str], domain: str = ".myfitnesspal
             rfc2109=False,
         )
         jar.set_cookie(cookie)
-    
     return jar
 
 # ============================================================================
@@ -349,7 +350,7 @@ def _extract_chromium_cookies_macos(
     cookies_db_path: Path,
     aes_key: bytes,
     domain: str = "myfitnesspal.com",
-) -> Dict[str, str]:
+) -> List[Record]:
     """Read cookies for `domain` (and its subdomains) from a Chromium DB.
 
     The DB is snapshotted via the SQLite backup API so rows pending in the
@@ -379,7 +380,7 @@ def _extract_chromium_cookies_macos(
             os.unlink(tmp_path)
         except OSError:
             pass
-    cookies: Dict[str, str] = {}
+    records: List[Record] = []
     for name, plain, enc, host_key in rows:
         value = (
             plain if plain
@@ -387,28 +388,30 @@ def _extract_chromium_cookies_macos(
         )
         if value is None or "�" in value:
             continue
-        cookies[name] = value
-    return cookies
+        records.append({"name": name, "value": value, "domain": host_key})
+    return records
 
 
-def _has_real_mfp_session(cookies: Dict[str, str]) -> bool:
-    """True if the cookie set looks like an authenticated MFP session.
+def _has_real_mfp_session(cookie_names) -> bool:
+    """True if the cookie names include an authenticated MFP session marker.
 
-    A pre-auth response can include cookies with 'auth' in the name
-    (e.g. `__Host-next-auth.csrf-token`), so we look for the specific
-    session-token markers MFP actually uses.
+    Accepts any iterable of names (record names or legacy dict keys). A pre-auth
+    response can include cookies with 'auth' in the name (e.g.
+    `__Host-next-auth.csrf-token`), so we look for the specific session-token
+    markers MFP actually uses.
     """
     return any(
         "session-token" in name or name == "_mfp_session"
-        for name in cookies
+        for name in cookie_names
     )
 
 
 def _try_extract_from_chromium_browser(
     service: str,
-) -> Optional[Dict[str, str]]:
+) -> Optional[List[Record]]:
     """Extract cookies from one specific Chromium browser by Safe Storage
-    service name (e.g. 'Arc Safe Storage'). Returns None on any failure."""
+    service name (e.g. 'Arc Safe Storage'). Returns cookie records, or None on
+    any failure."""
     browser_name = service.replace(" Safe Storage", "").strip()
     relative_paths = _CHROMIUM_COOKIES_PATHS_MACOS.get(browser_name)
     if not relative_paths:
@@ -435,12 +438,12 @@ def _try_extract_from_chromium_browser(
 
 
 def try_chromium_browsers_for_session_cookies(
-) -> Optional[Tuple[str, Dict[str, str]]]:
+) -> Optional[Tuple[str, List[Record]]]:
     """Discover installed Chromium browsers (macOS only) and return the first
     one that has a valid MyFitnessPal session token.
 
-    Returns a (browser_name, cookies) tuple, or None if no browser yielded
-    a usable session.
+    Returns a (browser_name, records) tuple, or None if no browser yielded a
+    usable session.
     """
     if sys.platform != "darwin":
         return None
@@ -449,18 +452,18 @@ def try_chromium_browsers_for_session_cookies(
         logger.debug("No Chromium Safe Storage entries found in keychain")
         return None
     for service in services:
-        cookies = _try_extract_from_chromium_browser(service)
-        if not cookies:
+        records = _try_extract_from_chromium_browser(service)
+        if not records:
             continue
         browser_name = service.replace(" Safe Storage", "").strip()
-        if _has_real_mfp_session(cookies):
+        if _has_real_mfp_session(r["name"] for r in records):
             logger.info(
                 f"Found valid MyFitnessPal session in {browser_name} "
-                f"({len(cookies)} cookies)"
+                f"({len(records)} cookies)"
             )
-            return browser_name, cookies
+            return browser_name, records
         logger.debug(
-            f"{browser_name} had {len(cookies)} cookies but no session token"
+            f"{browser_name} had {len(records)} cookies but no session token"
         )
     return None
 
@@ -648,11 +651,11 @@ def get_mfp_client():
         logger.info("Attempting authentication with environment credentials")
 
         # First check if we have valid stored cookies from a previous credential auth
-        stored_cookies = load_cookies()
-        if stored_cookies:
+        stored_records = load_cookie_records()
+        if stored_records:
             logger.info("Found stored session cookies, testing validity...")
             try:
-                cookiejar = dict_to_cookiejar(stored_cookies)
+                cookiejar = records_to_cookiejar(stored_records)
                 client = myfitnesspal.Client(cookiejar=cookiejar)
                 # Test the connection
                 _ = client.get_date(date.today())
@@ -663,11 +666,11 @@ def get_mfp_client():
 
         # Authenticate with credentials and save cookies
         try:
-            cookies = authenticate_with_credentials(username, password)
-            save_cookies(cookies)
+            records = _records_from_dict(authenticate_with_credentials(username, password))
+            save_cookie_records(records)
 
             # Create client with the new cookies
-            cookiejar = dict_to_cookiejar(cookies)
+            cookiejar = records_to_cookiejar(records)
             client = myfitnesspal.Client(cookiejar=cookiejar)
             # Test the connection
             _ = client.get_date(date.today())
@@ -680,11 +683,11 @@ def get_mfp_client():
             # Fall through to other methods
 
     # Method 2: Try stored session cookies (without credential auth)
-    stored_cookies = load_cookies()
-    if stored_cookies:
+    stored_records = load_cookie_records()
+    if stored_records:
         logger.info("Attempting authentication with stored cookies")
         try:
-            cookiejar = dict_to_cookiejar(stored_cookies)
+            cookiejar = records_to_cookiejar(stored_records)
             client = myfitnesspal.Client(cookiejar=cookiejar)
             # Test the connection
             _ = client.get_date(date.today())
@@ -702,13 +705,13 @@ def get_mfp_client():
     try:
         result = try_chromium_browsers_for_session_cookies()
         if result:
-            browser_name, chromium_cookies = result
-            cookiejar = dict_to_cookiejar(chromium_cookies)
+            browser_name, records = result
+            cookiejar = records_to_cookiejar(records)
             client = myfitnesspal.Client(cookiejar=cookiejar)
             _ = client.get_date(date.today())
             # Only persist after we've verified it works, so a transient
             # failure can't poison cookies.json.
-            save_cookies(chromium_cookies)
+            save_cookie_records(records)
             logger.info(
                 f"Successfully authenticated via Chromium auto-discovery "
                 f"({browser_name})"
@@ -2591,14 +2594,14 @@ async def mfp_get_report(params: GetReportInput) -> str:
 # ============================================================================
 
 
-def _verify_cookies_and_format(cookies: Dict[str, str], source: str) -> str:
-    """Verify cookies via a live MFP round-trip, then persist on success.
+def _verify_records_and_format(records: List[Record], source: str) -> str:
+    """Verify cookie records via a live MFP round-trip, then persist on success.
 
     Persisting only after verification matches the auto-discovery path's
     anti-poisoning behavior — a stale/expired session can't clobber a
     previously good `cookies.json`.
     """
-    if not _has_real_mfp_session(cookies):
+    if not _has_real_mfp_session(r["name"] for r in records):
         return (
             f"No MyFitnessPal session token found in {source}. "
             "Make sure you are logged into myfitnesspal.com in that browser, "
@@ -2606,7 +2609,7 @@ def _verify_cookies_and_format(cookies: Dict[str, str], source: str) -> str:
         )
     try:
         import myfitnesspal
-        cookiejar = dict_to_cookiejar(cookies)
+        cookiejar = records_to_cookiejar(records)
         client = myfitnesspal.Client(cookiejar=cookiejar)
         _ = client.get_date(date.today())
     except Exception as e:
@@ -2615,9 +2618,9 @@ def _verify_cookies_and_format(cookies: Dict[str, str], source: str) -> str:
             f"{e}. The session may have expired — log in again and retry. "
             f"(cookies.json was NOT overwritten.)"
         )
-    save_cookies(cookies)
+    save_cookie_records(records)
     return (
-        f"Successfully extracted and verified {len(cookies)} cookies "
+        f"Successfully extracted and verified {len(records)} cookies "
         f"from {source}. Authentication is now working."
     )
 
@@ -2656,22 +2659,22 @@ def refresh_browser_cookies(browser: str = "auto") -> str:
                 "(macOS only — on Linux/Windows, pass 'chrome' or "
                 "'firefox' instead.)"
             )
-        browser_name, cookies = result
-        return _verify_cookies_and_format(cookies, browser_name)
+        browser_name, records = result
+        return _verify_records_and_format(records, browser_name)
 
     # Explicit Chromium browser
     if browser_key in _CHROMIUM_BROWSER_ALIASES:
         canonical = _CHROMIUM_BROWSER_ALIASES[browser_key]
         if sys.platform == "darwin":
             service_name = f"{canonical} Safe Storage"
-            cookies = _try_extract_from_chromium_browser(service_name)
-            if cookies is None:
+            records = _try_extract_from_chromium_browser(service_name)
+            if records is None:
                 return (
                     f"Could not read cookies from {canonical}. Make sure "
                     "the browser is installed and you have logged in at "
                     "least once."
                 )
-            return _verify_cookies_and_format(cookies, canonical)
+            return _verify_records_and_format(records, canonical)
         # Non-macOS: keychain-based path doesn't apply. browser_cookie3
         # handles chrome/chromium on Linux/Windows via their default
         # profile paths; other Chromium browsers aren't supported there.
@@ -2679,10 +2682,10 @@ def refresh_browser_cookies(browser: str = "auto") -> str:
             try:
                 import browser_cookie3
                 cj = browser_cookie3.chrome(domain_name=".myfitnesspal.com")
-                cookies = {c.name: c.value for c in cj}
+                records = _records_from_jar(cj)
             except Exception as e:
                 return f"Error extracting cookies from {browser_key}: {e}"
-            return _verify_cookies_and_format(cookies, browser_key)
+            return _verify_records_and_format(records, browser_key)
         return (
             f"{canonical} cookie extraction requires macOS (keychain-backed "
             f"Safe Storage). On this platform, use 'chrome' or 'firefox'."
@@ -2693,10 +2696,10 @@ def refresh_browser_cookies(browser: str = "auto") -> str:
         try:
             import browser_cookie3
             cj = browser_cookie3.firefox(domain_name=".myfitnesspal.com")
-            cookies = {c.name: c.value for c in cj}
+            records = _records_from_jar(cj)
         except Exception as e:
             return f"Error extracting cookies from firefox: {e}"
-        return _verify_cookies_and_format(cookies, "firefox")
+        return _verify_records_and_format(records, "firefox")
 
     valid_options = sorted({*_CHROMIUM_BROWSER_ALIASES, "firefox", "auto"})
     return (
