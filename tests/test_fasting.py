@@ -274,6 +274,55 @@ class TestCreateFastingEntry:
                 client, "2026-08-06T13:00:00Z", "2026-08-07T05:00:00Z"
             )
 
+    def test_content_type_is_application_json(self):
+        """MFP rejects the POST body without an application/json Content-Type
+        header. Dropping `_mfp_api_headers(json_body=True)` would keep the
+        rest of the suite green but break the live call."""
+        session = _FakeSession({
+            ("POST", "/v2/diary/fasting_entry"): _FakeResponse(
+                201, {"items": [{
+                    "id": "AAAA0000-1111-4222-8333-444455556666",
+                    "fast_started": "2026-08-06T13:00:00Z",
+                    "fast_ended": "2026-08-07T05:00:00Z",
+                }]}
+            )
+        })
+        client = _FakeClient(session)
+        server.create_fasting_entry(
+            client, "2026-08-06T13:00:00Z", "2026-08-07T05:00:00Z"
+        )
+        sent_headers = session.calls[0][2]
+        assert sent_headers.get("Content-Type") == "application/json"
+
+    def test_201_with_missing_items_raises_actionable_error(self):
+        """A well-formed 201 with a body that isn't `{items: [...]}` used
+        to bubble up as `KeyError: 'items'`; guard now surfaces the raw
+        body so we can debug MFP shape changes."""
+        session = _FakeSession({
+            ("POST", "/v2/diary/fasting_entry"): _FakeResponse(
+                201, {"unexpected": "shape"}
+            )
+        })
+        client = _FakeClient(session)
+        with pytest.raises(RuntimeError, match="unexpected body"):
+            server.create_fasting_entry(
+                client, "2026-08-06T13:00:00Z", "2026-08-07T05:00:00Z"
+            )
+
+    def test_201_with_empty_items_raises_actionable_error(self):
+        """Same guard: `items: []` used to raise `IndexError: list index
+        out of range` — now surfaces the body."""
+        session = _FakeSession({
+            ("POST", "/v2/diary/fasting_entry"): _FakeResponse(
+                201, {"items": []}
+            )
+        })
+        client = _FakeClient(session)
+        with pytest.raises(RuntimeError, match="unexpected body"):
+            server.create_fasting_entry(
+                client, "2026-08-06T13:00:00Z", "2026-08-07T05:00:00Z"
+            )
+
 
 class TestUpdateFastingEntry:
     def test_patches_id_scoped_url_and_sends_full_replacement_body(self):
@@ -310,6 +359,74 @@ class TestUpdateFastingEntry:
             server.update_fasting_entry(
                 client, entry_id, "2026-08-06T13:00:00Z", "2026-08-07T05:00:00Z"
             )
+
+    def test_content_type_is_application_json(self):
+        entry_id = "AAAA0000-1111-4222-8333-444455556666"
+        session = _FakeSession({
+            ("PATCH", f"/v2/diary/fasting_entry/{entry_id}"): _FakeResponse(204)
+        })
+        client = _FakeClient(session)
+        server.update_fasting_entry(
+            client, entry_id, "2026-08-06T13:00:00Z", "2026-08-07T05:00:00Z"
+        )
+        sent_headers = session.calls[0][2]
+        assert sent_headers.get("Content-Type") == "application/json"
+
+
+# --- Input model validation (Pydantic layer) --------------------------------
+
+
+class TestInputModelValidation:
+    """The Pydantic layer catches malformed ids before they hit `_build_
+    fasting_payload` and MFP. Whitespace, wrong length, non-hex all reject
+    up-front so users get a clear Pydantic error instead of an opaque
+    HTTP 400."""
+
+    _valid_uuid = "AAAA0000-1111-4222-8333-444455556666"
+    _valid_start = "2026-08-06T13:00:00Z"
+    _valid_end = "2026-08-07T05:00:00Z"
+
+    def test_log_fast_accepts_valid_uuid(self):
+        m = server.LogFastInput(
+            id=self._valid_uuid,
+            fast_started=self._valid_start,
+            fast_ended=self._valid_end,
+        )
+        assert m.id == self._valid_uuid
+
+    def test_log_fast_accepts_omitted_id(self):
+        m = server.LogFastInput(
+            fast_started=self._valid_start, fast_ended=self._valid_end,
+        )
+        assert m.id is None
+
+    @pytest.mark.parametrize("bad_id", [
+        "not-a-uuid",
+        "  AAAA0000-1111-4222-8333-444455556666  ",  # whitespace-padded
+        "AAAA0000-1111-4222-8333-44445555666",       # too short
+        "GGGG0000-1111-4222-8333-444455556666",      # non-hex chars
+        "",                                          # empty string
+        "   ",                                       # whitespace-only
+    ])
+    def test_log_fast_rejects_bad_ids(self, bad_id):
+        with pytest.raises(Exception):  # pydantic.ValidationError
+            server.LogFastInput(
+                id=bad_id,
+                fast_started=self._valid_start,
+                fast_ended=self._valid_end,
+            )
+
+    def test_update_fast_requires_valid_uuid(self):
+        with pytest.raises(Exception):
+            server.UpdateFastInput(
+                id="foo",
+                fast_started=self._valid_start,
+                fast_ended=self._valid_end,
+            )
+
+    def test_delete_fast_requires_valid_uuid(self):
+        with pytest.raises(Exception):
+            server.DeleteFastInput(id="foo")
 
 
 class TestDeleteFastingEntry:

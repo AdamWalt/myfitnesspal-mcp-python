@@ -2958,7 +2958,15 @@ def create_fasting_entry(
             f"Failed to log fast: HTTP {response.status_code} — "
             f"{_api_error_detail(response)}"
         )
-    entry = response.json()["items"][0]
+    # Guard against a well-formed 201 whose body doesn't match the
+    # captured schema — surface a clear error instead of KeyError /
+    # IndexError bubbling up as "Error logging fast: 'items'".
+    try:
+        entry = response.json()["items"][0]
+    except (ValueError, KeyError, IndexError, TypeError) as e:
+        raise RuntimeError(
+            f"MFP returned HTTP 201 with an unexpected body: {response.text[:200]} ({e})"
+        ) from None
     return {
         "id": entry["id"],
         "fast_started": entry["fast_started"],
@@ -3011,6 +3019,13 @@ def delete_fasting_entry(client, entry_id: str) -> Dict[str, Any]:
     return {"id": entry_id, "deleted": True, "status": response.status_code}
 
 
+# UUID pattern for fasting-entry ids. Any 8-4-4-4-12 hex is accepted (the
+# endpoint doesn't strictly require v4), but leading/trailing whitespace and
+# non-hex characters are rejected up-front — otherwise garbage ids hit MFP
+# and come back as opaque 400s.
+_FASTING_ID_PATTERN = r"^[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}$"
+
+
 class LogFastInput(BaseModel):
     """Input for `mfp_log_fast`."""
 
@@ -3029,9 +3044,10 @@ class LogFastInput(BaseModel):
     id: Optional[str] = Field(
         default=None,
         description=(
-            "Optional UUID for the new entry. Auto-generated (uppercase v4) "
-            "if omitted, matching MFP's iOS-app convention."
+            "Optional UUID (8-4-4-4-12 hex) for the new entry. Auto-generated "
+            "as an uppercase v4 UUID if omitted, matching MFP's iOS convention."
         ),
+        pattern=_FASTING_ID_PATTERN,
     )
     response_format: ResponseFormat = Field(default=ResponseFormat.JSON)
 
@@ -3041,7 +3057,10 @@ class UpdateFastInput(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    id: str = Field(description="UUID of the fasting entry to update.")
+    id: str = Field(
+        description="UUID (8-4-4-4-12 hex) of the fasting entry to update.",
+        pattern=_FASTING_ID_PATTERN,
+    )
     fast_started: str = Field(description="New start time (ISO 8601).")
     fast_ended: str = Field(
         description="New end time (ISO 8601). Must be strictly after fast_started."
@@ -3054,7 +3073,10 @@ class DeleteFastInput(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    id: str = Field(description="UUID of the fasting entry to delete.")
+    id: str = Field(
+        description="UUID (8-4-4-4-12 hex) of the fasting entry to delete.",
+        pattern=_FASTING_ID_PATTERN,
+    )
     response_format: ResponseFormat = Field(default=ResponseFormat.JSON)
 
 
