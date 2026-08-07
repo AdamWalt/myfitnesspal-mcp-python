@@ -216,48 +216,44 @@ def test_error_detail_prefers_structured_fields():
     assert server._api_error_detail(_FakeResponse(500, "not json at all")) == ""
 
 
-# --- water units + markdown ordering (regression, 2026-07-30) -------------
+# --- water passthrough + markdown ordering (regression, 2026-07-30) --------
 
 class _FakeDay:
     def __init__(self, water):
         self.water = water
 
 
-def test_water_is_not_converted_without_an_explicit_unit():
-    """MFP stores water in the account's own unit and never states which.
+def test_water_returns_raw_ml_from_mfp():
+    """day.water is already millilitres — the /food/water endpoint's field is
+    literally named `milliliters` (python-myfitnesspal client.py:769).
 
-    The old code did water_ml = raw * 236.588 unconditionally, turning an
-    8,737 ml day into 2,067 litres. No unit in -> no conversion out.
+    The old code did `water_ml = day.water * 236.588` unconditionally,
+    turning an 8,737 ml day into 2,067 litres. This test would have caught
+    that: water_ml must equal the raw value with no scaling.
     """
-    data = server._water_payload(_FakeDay(8737.0), "2026-07-29", None)
-    assert data["water_logged"] == 8737.0
-    assert "water_ml" not in data
-    assert "unknown" in data["unit"]
+    data = server._water_payload(_FakeDay(8737.0), "2026-07-30")
+    assert data == {"date": "2026-07-30", "water_ml": 8737.0}
 
 
-def test_water_reports_no_goal_because_mfp_has_none():
-    """day.goals carries only calories/carbs/fat/protein/sodium/sugar.
+def test_water_payload_has_no_extra_fields():
+    """Response schema is strictly {date, water_ml}.
 
-    Verified against a live account, so a water_goal field would always be
-    null. Better absent than permanently empty.
+    No `water_cups` (that was the mislabel bug). No `water_goal` — MFP's
+    `day.goals` carries only calories, carbohydrates, fat, protein, sodium
+    and sugar (verified against a live account), so the field would be
+    permanently null.
     """
-    data = server._water_payload(_FakeDay(3000.0), "2026-07-30", None)
-    assert "water_goal" not in data
-    assert "percent_of_goal" not in data
-
-
-def test_water_converts_only_when_unit_is_stated():
-    for unit, expected in (("ml", 3000.0), ("cups", 709764.0), ("fl_oz", 88720.5)):
-        data = server._water_payload(_FakeDay(3000.0), "2026-07-30", unit)
-        assert data["water_ml"] == expected, unit
-        assert data["unit"] == unit
+    data = server._water_payload(_FakeDay(3000.0), "2026-07-30")
+    assert set(data.keys()) == {"date", "water_ml"}
 
 
 def test_markdown_puts_scalars_before_nested_sections():
     """A top-level scalar after a '### section' reads as part of that section.
 
-    The diary's top-level `water` rendered under `### daily_goals`, which is
-    how the water ACTUAL got misread as the water GOAL.
+    The diary's top-level `water` rendered under `### daily_goals`, which
+    is how the water ACTUAL got misread as the water GOAL. This test
+    pins the ordering so a scalar cannot be visually absorbed into a
+    preceding section header.
     """
     out = server.format_response(
         {"date": "2026-07-30", "daily_goals": {"water": 3000.0}, "water": 2500.0},
