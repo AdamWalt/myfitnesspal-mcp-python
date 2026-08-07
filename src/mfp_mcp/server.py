@@ -2852,6 +2852,316 @@ async def mfp_delete_custom_food(params: DeleteCustomFoodInput) -> str:
         return f"Error deleting custom food: {str(e)}"
 
 
+# ============================================================================
+# Fasting (Intermittent) — write-only CRUD
+# ============================================================================
+#
+# MyFitnessPal's fasting feature lives at /v2/diary/fasting_entry. It supports
+# POST (create), PATCH (update), and DELETE — but NOT GET. There is no public
+# read/list endpoint: the mobile app hydrates its Fasting History screen via a
+# delta-sync channel (mobile-sync-api.myfitnesspal.com/v2.1/sync) that requires
+# a pre-issued sync_token, is scoped to the mobile OAuth client, and rejects
+# the web-session bearer we authenticate with. See the README for details.
+#
+# Reads therefore stay in the MFP app; the MCP owns writes.
+#
+# Schema (matches what the iOS app sends, verified 2026-08-07):
+#     {
+#       "items": [
+#         {
+#           "type": "fasting_entry",
+#           "id": "UPPERCASE-UUID",
+#           "fast_started": "YYYY-MM-DDTHH:MM:SSZ",
+#           "fast_ended":   "YYYY-MM-DDTHH:MM:SSZ"
+#         }
+#       ]
+#     }
+
+
+_FASTING_ENDPOINT = f"{MFP_API_BASE}/v2/diary/fasting_entry"
+
+
+def _normalize_fasting_timestamp(ts: str) -> str:
+    """Normalize an ISO 8601 timestamp to MFP's form: `YYYY-MM-DDTHH:MM:SSZ` (UTC).
+
+    Accepts naive strings (assumed UTC) and timezone-aware strings (converted
+    to UTC). Raises ValueError on anything that doesn't parse as ISO 8601.
+    """
+    from datetime import datetime, timezone
+    # `datetime.fromisoformat` in Python 3.10 doesn't understand a trailing
+    # `Z`; swap it for `+00:00` first.
+    try:
+        parsed = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+    except ValueError as e:
+        raise ValueError(
+            f"Not an ISO 8601 timestamp: {ts!r} ({e})"
+        ) from None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    else:
+        parsed = parsed.astimezone(timezone.utc)
+    return parsed.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _generate_fasting_id() -> str:
+    """Fresh uppercase UUIDv4 — matches the format the iOS app uses."""
+    import uuid
+    return str(uuid.uuid4()).upper()
+
+
+def _build_fasting_payload(
+    entry_id: str, fast_started: str, fast_ended: str
+) -> Dict[str, Any]:
+    """Build the request body for POST/PATCH /v2/diary/fasting_entry.
+
+    Both timestamps are normalized to UTC ISO 8601 with a trailing `Z`, matching
+    the shape observed on the wire. Raises ValueError on invalid input:
+    missing id, unparseable timestamps, or end <= start.
+    """
+    if not entry_id:
+        raise ValueError("entry_id must be a non-empty string")
+    started = _normalize_fasting_timestamp(fast_started)
+    ended = _normalize_fasting_timestamp(fast_ended)
+    if ended <= started:
+        raise ValueError(
+            f"fast_ended ({ended}) must be strictly after fast_started ({started})"
+        )
+    return {
+        "items": [
+            {
+                "type": "fasting_entry",
+                "id": entry_id,
+                "fast_started": started,
+                "fast_ended": ended,
+            }
+        ]
+    }
+
+
+def create_fasting_entry(
+    client,
+    fast_started: str,
+    fast_ended: str,
+    entry_id: Optional[str] = None,
+) -> Dict[str, Any]:
+    """POST a new fasting entry. Returns the created record (with id + timestamps)."""
+    entry_id = entry_id or _generate_fasting_id()
+    payload = _build_fasting_payload(entry_id, fast_started, fast_ended)
+    response = client.session.post(
+        _FASTING_ENDPOINT,
+        headers=_mfp_api_headers(client, json_body=True),
+        data=json.dumps(payload),
+        timeout=30,
+    )
+    if response.status_code != 201:
+        raise RuntimeError(
+            f"Failed to log fast: HTTP {response.status_code} — "
+            f"{_api_error_detail(response)}"
+        )
+    entry = response.json()["items"][0]
+    return {
+        "id": entry["id"],
+        "fast_started": entry["fast_started"],
+        "fast_ended": entry["fast_ended"],
+        "created_at": entry.get("created_at"),
+        "status": response.status_code,
+    }
+
+
+def update_fasting_entry(
+    client, entry_id: str, fast_started: str, fast_ended: str
+) -> Dict[str, Any]:
+    """PATCH an existing fasting entry. MFP's PATCH is a full replacement of
+    the two time fields — both must be sent, matching the iOS app's behavior."""
+    payload = _build_fasting_payload(entry_id, fast_started, fast_ended)
+    response = client.session.patch(
+        f"{_FASTING_ENDPOINT}/{entry_id}",
+        headers=_mfp_api_headers(client, json_body=True),
+        data=json.dumps(payload),
+        timeout=30,
+    )
+    if response.status_code != 204:
+        raise RuntimeError(
+            f"Failed to update fast: HTTP {response.status_code} — "
+            f"{_api_error_detail(response)}"
+        )
+    item = payload["items"][0]
+    return {
+        "id": entry_id,
+        "fast_started": item["fast_started"],
+        "fast_ended": item["fast_ended"],
+        "status": response.status_code,
+    }
+
+
+def delete_fasting_entry(client, entry_id: str) -> Dict[str, Any]:
+    """DELETE a fasting entry by id."""
+    if not entry_id:
+        raise ValueError("entry_id must be a non-empty string")
+    response = client.session.delete(
+        f"{_FASTING_ENDPOINT}/{entry_id}",
+        headers=_mfp_api_headers(client),
+        timeout=30,
+    )
+    if response.status_code != 204:
+        raise RuntimeError(
+            f"Failed to delete fast: HTTP {response.status_code} — "
+            f"{_api_error_detail(response)}"
+        )
+    return {"id": entry_id, "deleted": True, "status": response.status_code}
+
+
+class LogFastInput(BaseModel):
+    """Input for `mfp_log_fast`."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    fast_started: str = Field(
+        description=(
+            "Fast start time as ISO 8601 (e.g. '2026-08-06T13:00:00Z'). Naive "
+            "timestamps are assumed UTC; timezone-aware ones are converted "
+            "to UTC."
+        ),
+    )
+    fast_ended: str = Field(
+        description="Fast end time, same format. Must be strictly after fast_started.",
+    )
+    id: Optional[str] = Field(
+        default=None,
+        description=(
+            "Optional UUID for the new entry. Auto-generated (uppercase v4) "
+            "if omitted, matching MFP's iOS-app convention."
+        ),
+    )
+    response_format: ResponseFormat = Field(default=ResponseFormat.JSON)
+
+
+class UpdateFastInput(BaseModel):
+    """Input for `mfp_update_fast`."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    id: str = Field(description="UUID of the fasting entry to update.")
+    fast_started: str = Field(description="New start time (ISO 8601).")
+    fast_ended: str = Field(
+        description="New end time (ISO 8601). Must be strictly after fast_started."
+    )
+    response_format: ResponseFormat = Field(default=ResponseFormat.JSON)
+
+
+class DeleteFastInput(BaseModel):
+    """Input for `mfp_delete_fast`."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    id: str = Field(description="UUID of the fasting entry to delete.")
+    response_format: ResponseFormat = Field(default=ResponseFormat.JSON)
+
+
+@mcp.tool(
+    name="mfp_log_fast",
+    annotations={
+        "title": "Log Intermittent Fast",
+        "readOnlyHint": False,
+        "destructiveHint": False,
+        "idempotentHint": False,
+        "openWorldHint": True,
+    },
+)
+async def mfp_log_fast(params: LogFastInput) -> str:
+    """
+    Log a completed intermittent fasting window in MyFitnessPal.
+
+    Creates a new entry with the given start and end times. If `id` is
+    omitted, a fresh uppercase UUIDv4 is generated (matches how the iOS
+    app self-assigns ids). The returned `id` is what `mfp_update_fast` and
+    `mfp_delete_fast` accept — save it if you plan to modify the entry
+    later.
+
+    Args:
+        params: LogFastInput (fast_started, fast_ended, id?, response_format)
+
+    Returns:
+        str: The created entry with id, timestamps, created_at, and status
+    """
+    try:
+        client = get_mfp_client()
+        result = create_fasting_entry(
+            client, params.fast_started, params.fast_ended, params.id
+        )
+        return format_response(result, params.response_format, "Fast Logged")
+    except Exception as e:
+        return f"Error logging fast: {str(e)}"
+
+
+@mcp.tool(
+    name="mfp_update_fast",
+    annotations={
+        "title": "Update Fasting Entry",
+        "readOnlyHint": False,
+        "destructiveHint": False,
+        "idempotentHint": True,
+        "openWorldHint": True,
+    },
+)
+async def mfp_update_fast(params: UpdateFastInput) -> str:
+    """
+    Update an existing fasting entry's start and end times.
+
+    MFP's PATCH is a full replacement of the two time fields — both must be
+    supplied even if only one is changing.
+
+    The MCP cannot list fasts (MFP exposes no read endpoint); the `id` must
+    come from a prior `mfp_log_fast` call or be captured from the MFP app.
+
+    Args:
+        params: UpdateFastInput (id, fast_started, fast_ended, response_format)
+
+    Returns:
+        str: The updated entry (id, timestamps, status)
+    """
+    try:
+        client = get_mfp_client()
+        result = update_fasting_entry(
+            client, params.id, params.fast_started, params.fast_ended
+        )
+        return format_response(result, params.response_format, "Fast Updated")
+    except Exception as e:
+        return f"Error updating fast: {str(e)}"
+
+
+@mcp.tool(
+    name="mfp_delete_fast",
+    annotations={
+        "title": "Delete Fasting Entry",
+        "readOnlyHint": False,
+        "destructiveHint": True,
+        "idempotentHint": True,
+        "openWorldHint": True,
+    },
+)
+async def mfp_delete_fast(params: DeleteFastInput) -> str:
+    """
+    Delete a fasting entry by id.
+
+    Destructive and not recoverable. The `id` must come from a prior
+    `mfp_log_fast` call or be captured from the MFP app — the MCP cannot
+    list existing fasts because MFP exposes no read endpoint.
+
+    Args:
+        params: DeleteFastInput (id, response_format)
+
+    Returns:
+        str: Confirmation with the deleted id and HTTP status
+    """
+    try:
+        client = get_mfp_client()
+        result = delete_fasting_entry(client, params.id)
+        return format_response(result, params.response_format, "Fast Deleted")
+    except Exception as e:
+        return f"Error deleting fast: {str(e)}"
+
+
 def main():
     """Run the MCP server."""
     mcp.run()
