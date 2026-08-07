@@ -21,6 +21,9 @@ A [Model Context Protocol (MCP)](https://modelcontextprotocol.io/) server that e
 | `mfp_set_goals` | Write | Update daily nutrition goals |
 | `mfp_get_water` | Read | Get water intake for a date |
 | `mfp_set_water` | Write | Log water intake for a date |
+| `mfp_log_fast` | Write | Log a completed intermittent fasting window (start + end) |
+| `mfp_update_fast` | Write | Update the start/end times of an existing fasting entry |
+| `mfp_delete_fast` | Write | Delete a fasting entry by id |
 | `mfp_get_report` | Read | Get nutrition reports over a date range |
 | `refresh_browser_cookies` | Utility | Extract and save session cookies from browser |
 
@@ -41,6 +44,35 @@ That interface is undocumented and was determined by observing the web client. I
 but MyFitnessPal can change it without notice. They have already done so once: this server
 originally posted to `/food/diary/{user}/add`, which now returns 404, leaving food logging
 broken. If logging starts failing, that is the most likely cause.
+
+## How fasting works (write-only)
+
+**Fasting tools** (`mfp_log_fast`, `mfp_update_fast`, `mfp_delete_fast`) POST / PATCH /
+DELETE against `/v2/diary/fasting_entry` on the same v2 JSON API. Payloads match the
+shape captured from the iOS app:
+
+```json
+{"items": [{
+  "type": "fasting_entry",
+  "id": "UPPERCASE-UUID",
+  "fast_started": "2026-08-06T13:00:00Z",
+  "fast_ended":   "2026-08-07T05:00:00Z"
+}]}
+```
+
+Ids are client-generated UUIDv4s in uppercase (the iOS convention). The MCP auto-generates
+one when you omit `id` from `mfp_log_fast`; save the returned id if you plan to update or
+delete the entry.
+
+**There is no read endpoint.** MFP exposes no GET for fasting entries — `GET /v2/diary/fasting_entry`
+returns `405 Method Not Allowed`. The mobile app populates its Fasting History screen via a
+delta-sync channel (`mobile-sync-api.myfitnesspal.com/v2.1/sync`) that requires a pre-issued
+sync token, is scoped to the mobile OAuth client, and rejects the web-session bearer this
+server authenticates with. You'll continue to read fasting history in the MFP app itself
+until Under Armour publishes something.
+
+The write tools are still useful for automating log-entry (e.g. inferring fasts from your
+Garmin sleep window + first-meal timestamp) or correcting entries programmatically.
 
 ## Prerequisites
 
