@@ -36,7 +36,10 @@ classifiers = [
     "Topic :: Scientific/Engineering :: Medical Science Apps.",
 ]
 dependencies = [
-    "mcp>=1.0.0",
+    # mcp 2.0.0 (released 2026-07-28) removed `mcp.server.fastmcp`, which
+    # server.py imports as its FastMCP base class. Pin below 2.0 until the
+    # server is ported to the new API.
+    "mcp>=1.0.0,<2.0.0",
     "myfitnesspal>=2.0.0",
     "pydantic>=2.0.0",
     "httpx>=0.24.0",
