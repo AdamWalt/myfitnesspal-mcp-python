@@ -857,6 +857,14 @@ def format_response(data: Any, format_type: ResponseFormat, title: str = "") -> 
         lines.append(f"## {title}\n")
 
     if isinstance(data, dict):
+        # Scalars FIRST, then nested sections. A top-level scalar emitted after
+        # a "### section" is visually absorbed into that section: the diary's
+        # top-level `water` rendered directly below `### daily_goals`, which
+        # reads as the water GOAL rather than the amount actually logged.
+        # (Real misread, 2026-07-30.) Ordering keeps every scalar unambiguous.
+        for key, value in data.items():
+            if not isinstance(value, (dict, list)):
+                lines.append(f"- **{key}**: {value}")
         for key, value in data.items():
             if isinstance(value, dict):
                 lines.append(f"### {key}")
@@ -872,8 +880,6 @@ def format_response(data: Any, format_type: ResponseFormat, title: str = "") -> 
                                 lines.append(f"  - {k}: {v}")
                     else:
                         lines.append(f"- {item}")
-            else:
-                lines.append(f"- **{key}**: {value}")
     else:
         lines.append(str(data))
 
@@ -1053,6 +1059,17 @@ class GetWaterInput(BaseModel):
         default=None,
         description="Date in YYYY-MM-DD format. Defaults to today if not specified.",
         pattern=r"^\d{4}-\d{2}-\d{2}$",
+    )
+    assume_unit: Optional[str] = Field(
+        default=None,
+        description=(
+            "Optional: the water unit configured on the MyFitnessPal account "
+            "('ml', 'fl_oz' or 'cups'). MyFitnessPal stores water in whatever "
+            "unit the account is set to and does NOT expose which one via the "
+            "API, so no conversion is done unless you state the unit here. "
+            "Supplying it adds a converted `water_ml` to the response."
+        ),
+        pattern=r"^(ml|fl_oz|cups)$",
     )
 
 
@@ -2254,6 +2271,41 @@ async def mfp_set_goals(params: SetGoalsInput) -> str:
         return f"Error setting goals: {str(e)}"
 
 
+# WATER UNITS (fixed 2026-07-30). mfp_get_water used to report
+# water_cups=<raw> and water_ml=<raw>*236.588 unconditionally. On an account
+# configured in millilitres that turned an 8,737 ml day into "2,067,069 ml"
+# (2,067 litres) and mislabelled the raw figure as cups. MyFitnessPal stores
+# water in whatever unit the account is set to and does NOT expose the choice
+# through the API (probed: /v2/users*?fields[]=unit_preferences -> 404; the
+# diary HTML carries no unit label on the water row). Same class of bug as
+# carbs/country_code: a unit the API does not state must never be assumed.
+# So: return the raw value and convert ONLY when the caller states the unit.
+#
+# No water goal is returned: `day.goals` carries only calories, carbohydrates,
+# fat, protein, sodium and sugar (verified against a live account), so a
+# `water_goal` field would be permanently null. The account's water goal is
+# visible in the MyFitnessPal app and is in the same unit as this value, which
+# is the practical way to identify the unit.
+_WATER_TO_ML = {"ml": 1.0, "fl_oz": 29.5735, "cups": 236.588}
+
+
+def _water_payload(day, date_str: str, assume_unit: Optional[str]) -> Dict[str, Any]:
+    """Build the mfp_get_water response. Pure: no network, no client."""
+    data: Dict[str, Any] = {
+        "date": date_str,
+        "water_logged": day.water,
+        "unit": (
+            assume_unit
+            or "unknown (account-configured: ml, fl oz or cups; MyFitnessPal "
+               "does not expose this via the API, and day.goals has no water "
+               "key. Compare against the water goal shown in the MFP app.)"
+        ),
+    }
+    if assume_unit:
+        data["water_ml"] = round(day.water * _WATER_TO_ML[assume_unit], 1)
+    return data
+
+
 @mcp.tool(
     name="mfp_get_water",
     annotations={
@@ -2268,27 +2320,27 @@ async def mfp_get_water(params: GetWaterInput) -> str:
     """
     Get water intake for a specific date.
 
-    Returns the number of cups/glasses of water logged for the day.
+    Returns the raw amount MyFitnessPal has stored, IN THE ACCOUNT'S OWN WATER
+    UNIT. MyFitnessPal lets each account pick ml / fl oz / cups and does not
+    expose the choice through this API, so the value is deliberately NOT
+    converted. Compare `water_logged` against `water_goal` (same unit) to
+    interpret it, or pass `assume_unit` to get an explicit `water_ml`.
 
     Args:
         params: GetWaterInput containing:
             - date (str, optional): Date in YYYY-MM-DD format, defaults to today
+            - assume_unit (str, optional): 'ml' | 'fl_oz' | 'cups'
 
     Returns:
-        str: Water intake amount for the specified date
+        str: Water logged, the day's water goal, and the unit caveat
     """
     try:
         client = get_mfp_client()
         target_date = parse_date(params.date)
         day = client.get_date(target_date)
-
-        data = {
-            "date": str(target_date),
-            "water_cups": day.water,
-            "water_ml": day.water * 236.588,  # Convert cups to ml
-        }
-
-        return json.dumps(data, indent=2)
+        return json.dumps(
+            _water_payload(day, str(target_date), params.assume_unit), indent=2
+        )
 
     except Exception as e:
         return f"Error getting water intake: {str(e)}"

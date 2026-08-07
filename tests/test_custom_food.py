@@ -214,3 +214,54 @@ def test_error_detail_prefers_structured_fields():
     assert server._api_error_detail(resp) == "Request payload does not contain any food objects"
     assert server._api_error_detail(_FakeResponse(400, {"error": "bad-request"})) == "bad-request"
     assert server._api_error_detail(_FakeResponse(500, "not json at all")) == ""
+
+
+# --- water units + markdown ordering (regression, 2026-07-30) -------------
+
+class _FakeDay:
+    def __init__(self, water):
+        self.water = water
+
+
+def test_water_is_not_converted_without_an_explicit_unit():
+    """MFP stores water in the account's own unit and never states which.
+
+    The old code did water_ml = raw * 236.588 unconditionally, turning an
+    8,737 ml day into 2,067 litres. No unit in -> no conversion out.
+    """
+    data = server._water_payload(_FakeDay(8737.0), "2026-07-29", None)
+    assert data["water_logged"] == 8737.0
+    assert "water_ml" not in data
+    assert "unknown" in data["unit"]
+
+
+def test_water_reports_no_goal_because_mfp_has_none():
+    """day.goals carries only calories/carbs/fat/protein/sodium/sugar.
+
+    Verified against a live account, so a water_goal field would always be
+    null. Better absent than permanently empty.
+    """
+    data = server._water_payload(_FakeDay(3000.0), "2026-07-30", None)
+    assert "water_goal" not in data
+    assert "percent_of_goal" not in data
+
+
+def test_water_converts_only_when_unit_is_stated():
+    for unit, expected in (("ml", 3000.0), ("cups", 709764.0), ("fl_oz", 88720.5)):
+        data = server._water_payload(_FakeDay(3000.0), "2026-07-30", unit)
+        assert data["water_ml"] == expected, unit
+        assert data["unit"] == unit
+
+
+def test_markdown_puts_scalars_before_nested_sections():
+    """A top-level scalar after a '### section' reads as part of that section.
+
+    The diary's top-level `water` rendered under `### daily_goals`, which is
+    how the water ACTUAL got misread as the water GOAL.
+    """
+    out = server.format_response(
+        {"date": "2026-07-30", "daily_goals": {"water": 3000.0}, "water": 2500.0},
+        server.ResponseFormat.MARKDOWN,
+    )
+    lines = [l for l in out.splitlines() if l.strip()]
+    assert lines.index("- **water**: 2500.0") < lines.index("### daily_goals")
