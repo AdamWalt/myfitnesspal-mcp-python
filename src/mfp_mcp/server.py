@@ -1060,18 +1060,6 @@ class GetWaterInput(BaseModel):
         description="Date in YYYY-MM-DD format. Defaults to today if not specified.",
         pattern=r"^\d{4}-\d{2}-\d{2}$",
     )
-    assume_unit: Optional[str] = Field(
-        default=None,
-        description=(
-            "Optional: the water unit configured on the MyFitnessPal account "
-            "('ml', 'fl_oz' or 'cups'). MyFitnessPal stores water in whatever "
-            "unit the account is set to and does NOT expose which one via the "
-            "API, so no conversion is done unless you state the unit here. "
-            "Supplying it adds a converted `water_ml` to the response."
-        ),
-        pattern=r"^(ml|fl_oz|cups)$",
-    )
-
 
 class GetReportInput(BaseModel):
     """Input model for getting nutrition reports."""
@@ -2271,39 +2259,25 @@ async def mfp_set_goals(params: SetGoalsInput) -> str:
         return f"Error setting goals: {str(e)}"
 
 
-# WATER UNITS (fixed 2026-07-30). mfp_get_water used to report
-# water_cups=<raw> and water_ml=<raw>*236.588 unconditionally. On an account
-# configured in millilitres that turned an 8,737 ml day into "2,067,069 ml"
-# (2,067 litres) and mislabelled the raw figure as cups. MyFitnessPal stores
-# water in whatever unit the account is set to and does NOT expose the choice
-# through the API (probed: /v2/users*?fields[]=unit_preferences -> 404; the
-# diary HTML carries no unit label on the water row). Same class of bug as
-# carbs/country_code: a unit the API does not state must never be assumed.
-# So: return the raw value and convert ONLY when the caller states the unit.
+# WATER — always millilitres.
 #
-# No water goal is returned: `day.goals` carries only calories, carbohydrates,
-# fat, protein, sodium and sugar (verified against a live account), so a
-# `water_goal` field would be permanently null. The account's water goal is
-# visible in the MyFitnessPal app and is in the same unit as this value, which
-# is the practical way to identify the unit.
-_WATER_TO_ML = {"ml": 1.0, "fl_oz": 29.5735, "cups": 236.588}
-
-
-def _water_payload(day, date_str: str, assume_unit: Optional[str]) -> Dict[str, Any]:
+# python-myfitnesspal's `_get_water` (myfitnesspal/client.py:769) calls the
+# `/food/water` endpoint and reads `result.json()["item"]["milliliters"]`
+# directly, so `day.water` is unambiguously ml regardless of the account's
+# display unit. The old code returned `water_cups = day.water` and
+# `water_ml = day.water * 236.588` — a double bug: the raw ml value was
+# mislabelled as cups, and the "converted" ml was raw_ml * 236.588. On a
+# millilitre account that turned an 8,737 ml day into 2,067 litres.
+#
+# Fix: return the ml value under its correct name. That's the whole story.
+#
+# No `water_goal` is included: `day.goals` carries only calories,
+# carbohydrates, fat, protein, sodium and sugar (verified against a live
+# account and against python-myfitnesspal's `_get_goals`). MFP's water goal
+# lives elsewhere and isn't exposed through this client path.
+def _water_payload(day, date_str: str) -> Dict[str, Any]:
     """Build the mfp_get_water response. Pure: no network, no client."""
-    data: Dict[str, Any] = {
-        "date": date_str,
-        "water_logged": day.water,
-        "unit": (
-            assume_unit
-            or "unknown (account-configured: ml, fl oz or cups; MyFitnessPal "
-               "does not expose this via the API, and day.goals has no water "
-               "key. Compare against the water goal shown in the MFP app.)"
-        ),
-    }
-    if assume_unit:
-        data["water_ml"] = round(day.water * _WATER_TO_ML[assume_unit], 1)
-    return data
+    return {"date": date_str, "water_ml": day.water}
 
 
 @mcp.tool(
@@ -2318,29 +2292,25 @@ def _water_payload(day, date_str: str, assume_unit: Optional[str]) -> Dict[str, 
 )
 async def mfp_get_water(params: GetWaterInput) -> str:
     """
-    Get water intake for a specific date.
+    Get water intake for a specific date, in millilitres.
 
-    Returns the raw amount MyFitnessPal has stored, IN THE ACCOUNT'S OWN WATER
-    UNIT. MyFitnessPal lets each account pick ml / fl oz / cups and does not
-    expose the choice through this API, so the value is deliberately NOT
-    converted. Compare `water_logged` against `water_goal` (same unit) to
-    interpret it, or pass `assume_unit` to get an explicit `water_ml`.
+    MyFitnessPal's `/food/water` endpoint returns the amount in a field
+    literally named `milliliters` (see python-myfitnesspal's `_get_water`),
+    so this value is always ml regardless of what unit the account's UI is
+    configured to display.
 
     Args:
         params: GetWaterInput containing:
             - date (str, optional): Date in YYYY-MM-DD format, defaults to today
-            - assume_unit (str, optional): 'ml' | 'fl_oz' | 'cups'
 
     Returns:
-        str: Water logged, the day's water goal, and the unit caveat
+        str: JSON with `date` and `water_ml`
     """
     try:
         client = get_mfp_client()
         target_date = parse_date(params.date)
         day = client.get_date(target_date)
-        return json.dumps(
-            _water_payload(day, str(target_date), params.assume_unit), indent=2
-        )
+        return json.dumps(_water_payload(day, str(target_date)), indent=2)
 
     except Exception as e:
         return f"Error getting water intake: {str(e)}"
