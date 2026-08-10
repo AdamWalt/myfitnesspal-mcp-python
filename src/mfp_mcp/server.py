@@ -857,6 +857,14 @@ def format_response(data: Any, format_type: ResponseFormat, title: str = "") -> 
         lines.append(f"## {title}\n")
 
     if isinstance(data, dict):
+        # Scalars FIRST, then nested sections. A top-level scalar emitted after
+        # a "### section" is visually absorbed into that section: the diary's
+        # top-level `water` rendered directly below `### daily_goals`, which
+        # reads as the water GOAL rather than the amount actually logged.
+        # (Real misread, 2026-07-30.) Ordering keeps every scalar unambiguous.
+        for key, value in data.items():
+            if not isinstance(value, (dict, list)):
+                lines.append(f"- **{key}**: {value}")
         for key, value in data.items():
             if isinstance(value, dict):
                 lines.append(f"### {key}")
@@ -872,8 +880,6 @@ def format_response(data: Any, format_type: ResponseFormat, title: str = "") -> 
                                 lines.append(f"  - {k}: {v}")
                     else:
                         lines.append(f"- {item}")
-            else:
-                lines.append(f"- **{key}**: {value}")
     else:
         lines.append(str(data))
 
@@ -1054,7 +1060,6 @@ class GetWaterInput(BaseModel):
         description="Date in YYYY-MM-DD format. Defaults to today if not specified.",
         pattern=r"^\d{4}-\d{2}-\d{2}$",
     )
-
 
 class GetReportInput(BaseModel):
     """Input model for getting nutrition reports."""
@@ -2254,6 +2259,27 @@ async def mfp_set_goals(params: SetGoalsInput) -> str:
         return f"Error setting goals: {str(e)}"
 
 
+# WATER — always millilitres.
+#
+# python-myfitnesspal's `_get_water` (myfitnesspal/client.py:769) calls the
+# `/food/water` endpoint and reads `result.json()["item"]["milliliters"]`
+# directly, so `day.water` is unambiguously ml regardless of the account's
+# display unit. The old code returned `water_cups = day.water` and
+# `water_ml = day.water * 236.588` — a double bug: the raw ml value was
+# mislabelled as cups, and the "converted" ml was raw_ml * 236.588. On a
+# millilitre account that turned an 8,737 ml day into 2,067 litres.
+#
+# Fix: return the ml value under its correct name. That's the whole story.
+#
+# No `water_goal` is included: `day.goals` carries only calories,
+# carbohydrates, fat, protein, sodium and sugar (verified against a live
+# account and against python-myfitnesspal's `_get_goals`). MFP's water goal
+# lives elsewhere and isn't exposed through this client path.
+def _water_payload(day, date_str: str) -> Dict[str, Any]:
+    """Build the mfp_get_water response. Pure: no network, no client."""
+    return {"date": date_str, "water_ml": day.water}
+
+
 @mcp.tool(
     name="mfp_get_water",
     annotations={
@@ -2266,29 +2292,25 @@ async def mfp_set_goals(params: SetGoalsInput) -> str:
 )
 async def mfp_get_water(params: GetWaterInput) -> str:
     """
-    Get water intake for a specific date.
+    Get water intake for a specific date, in millilitres.
 
-    Returns the number of cups/glasses of water logged for the day.
+    MyFitnessPal's `/food/water` endpoint returns the amount in a field
+    literally named `milliliters` (see python-myfitnesspal's `_get_water`),
+    so this value is always ml regardless of what unit the account's UI is
+    configured to display.
 
     Args:
         params: GetWaterInput containing:
             - date (str, optional): Date in YYYY-MM-DD format, defaults to today
 
     Returns:
-        str: Water intake amount for the specified date
+        str: JSON with `date` and `water_ml`
     """
     try:
         client = get_mfp_client()
         target_date = parse_date(params.date)
         day = client.get_date(target_date)
-
-        data = {
-            "date": str(target_date),
-            "water_cups": day.water,
-            "water_ml": day.water * 236.588,  # Convert cups to ml
-        }
-
-        return json.dumps(data, indent=2)
+        return json.dumps(_water_payload(day, str(target_date)), indent=2)
 
     except Exception as e:
         return f"Error getting water intake: {str(e)}"
