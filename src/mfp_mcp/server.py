@@ -22,7 +22,8 @@ import sqlite3
 import subprocess
 import sys
 import tempfile
-from datetime import date, datetime, timedelta
+import uuid
+from datetime import date, datetime, timedelta, timezone
 from http.cookiejar import CookieJar, Cookie
 from pathlib import Path
 from typing import Optional, Dict, Any, List, Tuple
@@ -2887,7 +2888,6 @@ def _normalize_fasting_timestamp(ts: str) -> str:
     Accepts naive strings (assumed UTC) and timezone-aware strings (converted
     to UTC). Raises ValueError on anything that doesn't parse as ISO 8601.
     """
-    from datetime import datetime, timezone
     # `datetime.fromisoformat` in Python 3.10 doesn't understand a trailing
     # `Z`; swap it for `+00:00` first.
     try:
@@ -2905,7 +2905,6 @@ def _normalize_fasting_timestamp(ts: str) -> str:
 
 def _generate_fasting_id() -> str:
     """Fresh uppercase UUIDv4 — matches the format the iOS app uses."""
-    import uuid
     return str(uuid.uuid4()).upper()
 
 
