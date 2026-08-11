@@ -2058,7 +2058,37 @@ async def mfp_get_measurements(params: GetMeasurementsInput) -> str:
         else:
             start = end - timedelta(days=30)
 
-        measurements = client.get_measurements(params.measurement, start, end)
+        # client.get_measurements() scrapes a "dehydratedState" key that no
+        # longer exists on the (now client-rendered) page - KeyErrors every
+        # call. The v2 endpoint below works, but its begin_date/end_date/type
+        # params don't actually filter server-side, so we filter here.
+        response = client.session.get(
+            f"{MFP_API_BASE}/v2/measurements",
+            params={
+                "type": params.measurement,
+                "begin_date": start.strftime("%Y-%m-%d"),
+                "end_date": end.strftime("%Y-%m-%d"),
+            },
+            headers=_mfp_api_headers(client),
+            timeout=30,
+        )
+        if response.status_code != 200:
+            raise RuntimeError(
+                f"Could not fetch measurements: HTTP {response.status_code}"
+            )
+
+        wanted_type = params.measurement.strip().lower()
+        measurements: OrderedDict[str, float] = OrderedDict(
+            sorted(
+                (
+                    (item["date"], float(item["value"]))
+                    for item in response.json().get("items", [])
+                    if item.get("type", "").strip().lower() == wanted_type
+                    and start <= parse_date(item["date"]) <= end
+                ),
+                key=lambda pair: pair[0],
+            )
+        )
 
         data = {
             "measurement_type": params.measurement,
