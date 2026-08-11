@@ -86,3 +86,42 @@ class TestSelectServingSize:
     def test_raises_when_serving_sizes_key_is_absent(self):
         with pytest.raises(RuntimeError, match="no serving sizes"):
             server.select_serving_size({"id": "123"})
+
+
+class TestSelectServingSizeGramAmbiguity:
+    """Regression test: a food listing both a "100 g" pack (value=100) and a
+    per-gram entry (value=1) under the same unit must pick the value=1 one,
+    or unit="g", quantity=10 silently logs 1000g instead of 10g."""
+
+    @pytest.fixture
+    def food_with_ambiguous_gram_units(self):
+        return {
+            "id": "195598859879997",
+            "version": "195598859879997",
+            "description": "Lidl chicken slice",
+            "serving_sizes": [
+                {
+                    "id": "32177514293237",
+                    "value": 100.0,
+                    "unit": "g",
+                    "nutrition_multiplier": 1.0,
+                    "gram_weight": 1.0,
+                    "index": 0,
+                },
+                {
+                    "id": "32727270107125",
+                    "value": 1.0,
+                    "unit": "g",
+                    "nutrition_multiplier": 0.01,
+                    "gram_weight": 0.01,
+                    "index": 1,
+                },
+            ],
+        }
+
+    def test_prefers_the_per_unit_gram_entry_over_the_bundled_pack(
+        self, food_with_ambiguous_gram_units
+    ):
+        chosen = server.select_serving_size(food_with_ambiguous_gram_units, "g")
+        assert chosen["value"] == 1.0
+        assert chosen["nutrition_multiplier"] == 0.01
