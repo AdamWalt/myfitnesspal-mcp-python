@@ -1693,9 +1693,30 @@ def list_diary_entries(client, target_date: date) -> List[Dict[str, str]]:
     return entries
 
 
+def remove_diary_entry_v2(client, entry_id: str) -> None:
+    """
+    Delete a food diary entry by the UUID the v2 diary API assigned it
+    (what `add_food_to_diary` returns - a different id space than the
+    legacy numeric `food_entry_id` used by `remove_food_entry`).
+    """
+    response = client.session.delete(
+        f"{MFP_API_BASE}/v2/diary/{entry_id}",
+        headers=_mfp_api_headers(client),
+        timeout=30,
+    )
+    if response.status_code in (200, 204):
+        logger.info(f"Removed diary entry {entry_id}")
+        return
+    raise RuntimeError(
+        f"Remove failed for entry {entry_id}: HTTP {response.status_code}"
+    )
+
+
 def remove_food_entry(client, entry_id: str) -> None:
     """
-    Delete a food diary entry by its food_entry_id.
+    Delete a food diary entry by its legacy numeric food_entry_id, as
+    returned by `list_diary_entries` (see `remove_diary_entry_v2` for the
+    v2 UUID case).
 
     Uses the legacy /food/remove/{id} endpoint with X-CSRF-Token from
     the diary page meta tag.
@@ -2411,8 +2432,9 @@ async def mfp_remove_food_from_diary(params: RemoveFoodFromDiaryInput) -> str:
 
     Two modes:
 
-    1. By entry_id (precise): delete exactly the entry whose
-       food_entry_id matches. Use this when you already know the ID.
+    1. By entry_id (precise): delete exactly the entry whose id matches -
+       this is the UUID `mfp_add_food_to_diary` returned when you logged it.
+       Use this when you already know the ID.
 
     2. By name_contains (fuzzy): list the day's entries, find ones whose
        name contains the given substring (case-insensitive), optionally
@@ -2420,7 +2442,8 @@ async def mfp_remove_food_from_diary(params: RemoveFoodFromDiaryInput) -> str:
 
     Args:
         params: RemoveFoodFromDiaryInput with one of:
-            - entry_id: exact food_entry_id to delete
+            - entry_id: the entry's UUID, as returned by
+              mfp_add_food_to_diary (NOT a food_entry_id from the diary page)
             - name_contains: substring match against entry names
             - meal: restrict matching to one meal
             - max_matches: safety cap for fuzzy matches (default 1)
@@ -2433,9 +2456,9 @@ async def mfp_remove_food_from_diary(params: RemoveFoodFromDiaryInput) -> str:
         client = get_mfp_client()
         target_date = parse_date(params.date)
 
-        # Mode 1: delete a single entry by ID
+        # Mode 1: delete a single entry by its v2 UUID (what add returns)
         if params.entry_id:
-            remove_food_entry(client, params.entry_id)
+            remove_diary_entry_v2(client, params.entry_id)
             return json.dumps({
                 "success": True,
                 "removed": [{"entry_id": params.entry_id}],
