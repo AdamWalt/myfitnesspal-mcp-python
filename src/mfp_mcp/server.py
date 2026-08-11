@@ -1758,65 +1758,65 @@ def remove_food_entry(client, entry_id: str) -> None:
 def set_water_intake(client, target_date: date, cups: float) -> None:
     """
     Set water intake for a specific date.
-    
+
+    The diary page is now a client-rendered (Next.js) page with no
+    server-rendered <form> for water, so there's no per-form authenticity
+    token to scrape the way the old measurements/food forms worked. The
+    live site's own `food/diary/water-*.js` bundle does a plain jQuery
+    `$.post("/food/water", {milliliters, date})`, authenticated the same
+    way every other jQuery-rails AJAX call on the site is: the global
+    `X-CSRF-Token` header sourced from the page's `<meta name="csrf-token">`
+    tag, not a body field. Confirmed by probing the live endpoint directly
+    (2026-08-11): POSTing to `food/water` (no username, no `/diary/`
+    prefix) with `milliliters`/`date` form fields plus that header returns
+    the updated `{"item": {"date", "milliliters"}}` and persists.
+
     Args:
         client: Authenticated myfitnesspal.Client instance
         target_date: Date to set water intake
         cups: Number of cups of water
-    
+
     Raises:
         RuntimeError: If the operation fails
     """
+    import re
     from urllib import parse
-    
+
     try:
-        # Get the diary page for the target date to extract CSRF token
         date_str = target_date.strftime("%Y-%m-%d")
-        diary_url = parse.urljoin(
-            client.BASE_URL_SECURE,
-            f"food/diary/{client.effective_username}?date={date_str}"
+
+        # Any logged-in page carries the same site-wide CSRF meta tag; the
+        # diary page is as good as any and lets us reuse the existing
+        # cookie-authenticated session.
+        diary_url = parse.urljoin(client.BASE_URL_SECURE, "food/diary")
+        page = client.session.get(diary_url, timeout=30)
+        page.raise_for_status()
+
+        csrf_match = re.search(
+            r'<meta name="csrf-token" content="([^"]+)"', page.text
         )
-        
-        # Use the library's method to get the document
-        document = client._get_document_for_url(diary_url)
-        
-        # Extract authenticity token
-        authenticity_token = document.xpath(
-            "(//input[@name='authenticity_token']/@value)[1]"
-        )
-        if not authenticity_token:
-            raise RuntimeError("Could not find authenticity token on diary page")
-        authenticity_token = authenticity_token[0]
-        
-        # Build the URL for setting water
-        # MyFitnessPal uses /food/diary/{username}/water endpoint
-        water_url = parse.urljoin(
-            client.BASE_URL_SECURE,
-            f"food/diary/{client.effective_username}/water"
-        )
-        
-        # Prepare the data for the POST request
-        post_data = {
-            "authenticity_token": authenticity_token,
-            "date": date_str,
-            "water": str(cups),
-        }
-        
-        # Set water intake
+        if not csrf_match:
+            raise RuntimeError("Could not find csrf-token meta tag on diary page")
+        csrf_token = csrf_match.group(1)
+
+        water_url = parse.urljoin(client.BASE_URL_SECURE, "food/water")
         headers = {
-            "Referer": diary_url,
-            "Content-Type": "application/x-www-form-urlencoded",
+            "X-CSRF-Token": csrf_token,
             "X-Requested-With": "XMLHttpRequest",
+            "Referer": diary_url,
         }
-        
-        response = client.session.post(water_url, data=post_data, headers=headers)
+        milliliters = round(cups * 236.588, 2)
+
+        response = client.session.post(
+            water_url,
+            data={"milliliters": milliliters, "date": date_str},
+            headers=headers,
+            timeout=30,
+        )
         response.raise_for_status()
-        
-        if response.status_code != 200:
-            raise RuntimeError(f"Failed to set water: HTTP {response.status_code}")
-        
+
         logger.info(f"Successfully set water intake to {cups} cups for {target_date}")
-        
+
     except Exception as e:
         # Don't expose internal error details to avoid leaking sensitive information
         error_msg = str(e)
