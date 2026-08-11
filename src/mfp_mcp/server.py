@@ -1341,11 +1341,16 @@ def select_serving_size(food: Dict[str, Any], unit: Optional[str] = None) -> Dic
     chosen = serving_sizes[0]
     if unit:
         wanted = unit.strip().lower()
-        for size in serving_sizes:
-            size_unit = str(size.get("unit", "")).lower()
-            if size_unit == wanted or wanted in size_unit:
-                chosen = size
-                break
+        exact = [s for s in serving_sizes if str(s.get("unit", "")).lower() == wanted]
+        substring = [
+            s for s in serving_sizes if wanted in str(s.get("unit", "")).lower()
+        ]
+        candidates = exact or substring
+        if candidates:
+            # Some foods list the same unit twice (e.g. a "100 g" pack
+            # alongside a per-gram entry) - prefer value=1.0 so quantity
+            # means a literal count of `unit`, not a count of packs.
+            chosen = next((c for c in candidates if c.get("value") == 1.0), candidates[0])
         else:
             logger.warning(
                 f"Unit {unit!r} not found for food {food.get('id')}; "
