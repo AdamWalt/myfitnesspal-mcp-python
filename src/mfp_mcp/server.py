@@ -1979,39 +1979,42 @@ async def mfp_get_food_details(params: GetFoodDetailsInput) -> str:
     """
     try:
         client = get_mfp_client()
-        item = client.get_food_item_details(params.mfp_id)
+        # client.get_food_item_details() scrapes a now-client-rendered page
+        # and raises on nearly every food; get_food_v2 is the reliable path.
+        food = get_food_v2(client, params.mfp_id)
+        nutrition = food.get("nutritional_contents", {}) or {}
+        energy = nutrition.get("energy") or {}
 
         data = {
             "mfp_id": params.mfp_id,
-            "description": getattr(item, "description", "N/A"),
-            "brand_name": getattr(item, "brand_name", None),
-            "verified": getattr(item, "verified", False),
-            "calories": getattr(item, "calories", None),
+            "description": food.get("description", "N/A"),
+            "brand_name": food.get("brand_name") or None,
+            "verified": food.get("verified", False),
+            "calories": energy.get("value"),
+            # nutrition values below are per this many grams of the food
+            "nutrition_basis_grams": nutrition.get("grams"),
             "nutrition": {
-                "protein": getattr(item, "protein", None),
-                "carbohydrates": getattr(item, "carbohydrates", None),
-                "fat": getattr(item, "fat", None),
-                "fiber": getattr(item, "fiber", None),
-                "sugar": getattr(item, "sugar", None),
-                "sodium": getattr(item, "sodium", None),
-                "cholesterol": getattr(item, "cholesterol", None),
-                "saturated_fat": getattr(item, "saturated_fat", None),
-                "polyunsaturated_fat": getattr(item, "polyunsaturated_fat", None),
-                "monounsaturated_fat": getattr(item, "monounsaturated_fat", None),
-                "trans_fat": getattr(item, "trans_fat", None),
-                "potassium": getattr(item, "potassium", None),
-                "vitamin_a": getattr(item, "vitamin_a", None),
-                "vitamin_c": getattr(item, "vitamin_c", None),
-                "calcium": getattr(item, "calcium", None),
-                "iron": getattr(item, "iron", None),
+                "protein": nutrition.get("protein"),
+                "carbohydrates": nutrition.get("carbohydrates"),
+                "fat": nutrition.get("fat"),
+                "fiber": nutrition.get("fiber"),
+                "sugar": nutrition.get("sugar"),
+                "sodium": nutrition.get("sodium"),
+                "cholesterol": nutrition.get("cholesterol"),
+                "saturated_fat": nutrition.get("saturated_fat"),
+                "polyunsaturated_fat": nutrition.get("polyunsaturated_fat"),
+                "monounsaturated_fat": nutrition.get("monounsaturated_fat"),
+                "trans_fat": nutrition.get("trans_fat"),
+                "potassium": nutrition.get("potassium"),
+                "vitamin_a": nutrition.get("vitamin_a"),
+                "vitamin_c": nutrition.get("vitamin_c"),
+                "calcium": nutrition.get("calcium"),
+                "iron": nutrition.get("iron"),
             },
-            "servings": [],
+            "servings": [
+                f"{s['value']} {s['unit']}" for s in food.get("serving_sizes", [])
+            ],
         }
-
-        # Get serving sizes if available
-        if hasattr(item, "servings"):
-            for serving in item.servings:
-                data["servings"].append(str(serving))
 
         return format_response(data, params.response_format, "Food Item Details")
 
@@ -2390,10 +2393,8 @@ async def mfp_add_food_to_diary(params: AddFoodToDiaryInput) -> str:
             unit=params.unit,
         )
 
-        # Get food details for confirmation
         try:
-            food_item = client.get_food_item_details(params.mfp_id)
-            food_name = getattr(food_item, "description", "Unknown Food")
+            food_name = get_food_v2(client, params.mfp_id).get("description", "Food item")
         except Exception:
             food_name = "Food item"
 
