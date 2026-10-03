@@ -638,6 +638,11 @@ def get_mfp_client():
         RuntimeError: If all authentication methods fail
     """
     import myfitnesspal
+    import requests as _requests
+    import cloudscraper as _cloudscraper
+    # cloudscraper alters TLS fingerprints in a way that triggers MFP's
+    # Cloudflare 403. Plain requests works fine with the browser session cookies.
+    _cloudscraper.create_scraper = lambda **kw: _requests.Session()
 
     last_error = None
 
@@ -1108,9 +1113,19 @@ class AddFoodToDiaryInput(BaseModel):
     )
     quantity: float = Field(
         default=1.0,
-        description="Quantity/servings (e.g., 1.5 for 1.5 servings)",
+        description=(
+            "Quantity to log. Interpretation depends on the food's serving unit:\n"
+            "- For gram-based foods (serving unit = 'g', 'gramo', etc.), pass the actual "
+            "weight in grams (e.g. 120 for 120 g of salmon, 200 for 200 g of mango).\n"
+            "- For serving-based foods, pass the number of servings (e.g. 1.5).\n"
+            "- For placeholder / meal-plan entries not yet consumed, pass a small value "
+            "such as 0.1 or 1 so the item appears in the diary with near-zero calories "
+            "and can be updated with the real weight after the meal.\n"
+            "Minimum: any positive value (> 0). Maximum: 10 000 (covers the largest "
+            "realistic single-food gram weight)."
+        ),
         gt=0,
-        le=100,
+        le=10000,
     )
     unit: Optional[str] = Field(
         default=None,
@@ -2398,7 +2413,10 @@ async def mfp_add_food_to_diary(params: AddFoodToDiaryInput) -> str:
             - mfp_id (str): MyFitnessPal food item ID (from mfp_search_food)
             - meal (str): Meal name - 'Breakfast', 'Lunch', 'Dinner', or 'Snacks' (default: 'Breakfast')
             - date (str, optional): Date in YYYY-MM-DD format, defaults to today
-            - quantity (float): Number of servings (default: 1.0)
+            - quantity (float): For gram-based foods pass the actual weight in grams (e.g. 120
+              for 120 g); for serving-based foods pass the number of servings (e.g. 1.5).
+              Use 0.1 or 1 as a placeholder for meals not yet consumed — update to the real
+              weight after eating. Range: (0, 10 000].
             - unit (str, optional): Unit/serving size (e.g., '1 cup', '100g')
 
     Returns:
