@@ -1067,6 +1067,27 @@ class GetWaterInput(BaseModel):
         pattern=r"^\d{4}-\d{2}-\d{2}$",
     )
 
+
+class GetStepsInput(BaseModel):
+    """Input model for getting daily step counts."""
+
+    model_config = ConfigDict(str_strip_whitespace=True)
+
+    start_date: Optional[str] = Field(
+        default=None,
+        description="Start date in YYYY-MM-DD format. Defaults to 6 days before end_date (7 days total).",
+        pattern=r"^\d{4}-\d{2}-\d{2}$",
+    )
+    end_date: Optional[str] = Field(
+        default=None,
+        description="End date in YYYY-MM-DD format. Defaults to today.",
+        pattern=r"^\d{4}-\d{2}-\d{2}$",
+    )
+    response_format: ResponseFormat = Field(
+        default=ResponseFormat.MARKDOWN,
+        description="Output format: 'markdown' for human-readable or 'json' for structured data",
+    )
+
 class GetReportInput(BaseModel):
     """Input model for getting nutrition reports."""
 
@@ -2389,6 +2410,126 @@ async def mfp_get_water(params: GetWaterInput) -> str:
 
     except Exception as e:
         return f"Error getting water intake: {str(e)}"
+
+
+# Step counts synced from Apple Health / Google Fit / device integrations land
+# in the v2 diary as `steps_aggregate` items, one per source per day:
+#   {"type": "steps_aggregate", "date": "2026-10-16", "steps": 3241,
+#    "energy": {"unit": "kilojoules", "value": 48}, "primary": true}
+# The endpoint only honours `entry_date`; from/to range params are silently
+# ignored (verified 2026-10-17), so a range costs one request per day.
+MAX_STEPS_RANGE_DAYS = 31
+
+
+def _primary_steps(items: List[Dict[str, Any]]) -> Optional[int]:
+    """Pick the day's step count, preferring the source MFP marks primary."""
+    aggregates = [i for i in items if i.get("type") == "steps_aggregate"]
+    if not aggregates:
+        return None
+    chosen = next((i for i in aggregates if i.get("primary")), aggregates[0])
+    return chosen.get("steps")
+
+
+def get_steps_range(client, start: date, end: date) -> List[Dict[str, Any]]:
+    """
+    Fetch daily step totals for each date from start to end inclusive.
+
+    Days with no synced step data get `steps: None` so callers can tell
+    "no data" apart from a genuine zero.
+
+    Raises:
+        RuntimeError: If any day's request fails
+    """
+    days = []
+    current = start
+    while current <= end:
+        date_str = current.strftime("%Y-%m-%d")
+        response = client.session.get(
+            f"{MFP_API_BASE}/v2/diary",
+            params={"entry_date": date_str, "types": "steps_aggregate"},
+            headers=_mfp_api_headers(client),
+            timeout=30,
+        )
+        if response.status_code != 200:
+            raise RuntimeError(
+                f"Could not fetch steps for {date_str}: HTTP {response.status_code}"
+            )
+        days.append({
+            "date": date_str,
+            "steps": _primary_steps(response.json().get("items") or []),
+        })
+        current += timedelta(days=1)
+    return days
+
+
+@mcp.tool(
+    name="mfp_get_steps",
+    annotations={
+        "title": "Get Daily Steps",
+        "readOnlyHint": True,
+        "destructiveHint": False,
+        "idempotentHint": True,
+        "openWorldHint": True,
+    },
+)
+async def mfp_get_steps(params: GetStepsInput) -> str:
+    """
+    Get daily step counts synced into MyFitnessPal (e.g. from Apple Health).
+
+    Returns one entry per day in the range. Days with no synced data have
+    `steps: null`. Ranges are limited to 31 days per call.
+
+    Args:
+        params: GetStepsInput containing:
+            - start_date (str, optional): Defaults to 6 days before end_date
+            - end_date (str, optional): Defaults to today
+            - response_format (str): 'markdown' or 'json'
+
+    Returns:
+        str: Daily step counts with a total/average summary
+    """
+    try:
+        end = parse_date(params.end_date)
+        if params.start_date:
+            start = parse_date(params.start_date)
+        else:
+            start = end - timedelta(days=6)
+
+        if start > end:
+            raise ValueError("start_date must be on or before end_date")
+        span = (end - start).days + 1
+        if span > MAX_STEPS_RANGE_DAYS:
+            raise ValueError(
+                f"Range is {span} days; the maximum is {MAX_STEPS_RANGE_DAYS}. "
+                "Split it into smaller calls."
+            )
+
+        client = get_mfp_client()
+        days = get_steps_range(client, start, end)
+
+        counts = [d["steps"] for d in days if d["steps"] is not None]
+        data: Dict[str, Any] = {
+            "start_date": str(start),
+            "end_date": str(end),
+            "days": days,
+            "summary": {
+                "days_with_data": len(counts),
+                "total": sum(counts),
+                "average": round(sum(counts) / len(counts)) if counts else None,
+            },
+        }
+
+        if params.response_format == ResponseFormat.MARKDOWN:
+            # format_response renders lists of dicts poorly; show date: steps.
+            data["days"] = {
+                d["date"]: d["steps"] if d["steps"] is not None else "no data"
+                for d in days
+            }
+
+        return format_response(data, params.response_format, "Daily Steps")
+
+    except Exception as e:
+        return f"Error getting steps: {str(e)}"
 
 
 @mcp.tool(
