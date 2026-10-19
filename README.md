@@ -21,6 +21,7 @@ A [Model Context Protocol (MCP)](https://modelcontextprotocol.io/) server that e
 | `mfp_set_goals` | Write | Update daily nutrition goals |
 | `mfp_get_water` | Read | Get water intake for a date |
 | `mfp_set_water` | Write | Log water intake for a date |
+| `mfp_get_steps` | Read | Get daily step counts synced from Apple Health / devices |
 | `mfp_log_fast` | Write | Log a completed intermittent fasting window (start + end) |
 | `mfp_update_fast` | Write | Update the start/end times of an existing fasting entry |
 | `mfp_delete_fast` | Write | Delete a fasting entry by id |
@@ -767,6 +768,14 @@ Get water intake for a date.
 Log water intake for a date.
 - `cups` (required): Number of cups of water (e.g., 2.5 for 2.5 cups). Note: MyFitnessPal uses cups as the unit (1 cup = ~237ml)
 - `date` (optional): YYYY-MM-DD format (default: today)
+
+### mfp_get_steps
+Get daily step counts synced into MyFitnessPal (Apple Health, Google Fit, connected devices). Days with no synced data return `steps: null`.
+- `start_date` (optional): YYYY-MM-DD (default 6 days before end_date)
+- `end_date` (optional): YYYY-MM-DD (default today)
+- `response_format`: "markdown" or "json"
+
+Maximum 31 days per call (MFP's API returns one day per request).
 
 ### mfp_get_report
 Get nutrition report over a date range.
