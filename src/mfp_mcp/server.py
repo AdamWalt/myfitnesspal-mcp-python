@@ -14,6 +14,7 @@ Authentication Methods (in order of priority):
 4. browser_cookie3 fallback (legacy Chrome/Firefox paths on any OS)
 """
 
+import asyncio
 import hashlib
 import json
 import logging
@@ -2505,7 +2506,9 @@ async def mfp_get_steps(params: GetStepsInput) -> str:
             )
 
         client = get_mfp_client()
-        days = get_steps_range(client, start, end)
+        # One blocking HTTP request per day; run off the event loop so other
+        # MCP tools and cancellation can proceed while we fetch the range.
+        days = await asyncio.to_thread(get_steps_range, client, start, end)
 
         counts = [d["steps"] for d in days if d["steps"] is not None]
         data: Dict[str, Any] = {
