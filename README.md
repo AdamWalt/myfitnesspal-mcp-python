@@ -7,6 +7,7 @@ A [Model Context Protocol (MCP)](https://modelcontextprotocol.io/) server that e
 | Tool | Type | Description |
 |------|------|-------------|
 | `mfp_get_diary` | Read | Get food diary entries for any date |
+| `mfp_get_food_entries` | Read | List a day's individual food entries with the time each was eaten |
 | `mfp_search_food` | Read | Search the MyFitnessPal food database |
 | `mfp_get_food_details` | Read | Get detailed nutrition info for a food item |
 | `mfp_add_food_to_diary` | Write | Add a food item to your diary for a specific meal and date |
@@ -408,6 +409,7 @@ Once configured, you can interact with your MyFitnessPal data through Claude:
 "Show me what I ate today"
 "Get my food diary for 2026-01-05"
 "What meals did I log yesterday?"
+"What time did I have my first and last food today?"
 ```
 
 ### Logging and Correcting Food
@@ -661,6 +663,22 @@ pip install -e .
 Get food diary for a specific date.
 - `date` (optional): YYYY-MM-DD format, defaults to today
 - `response_format`: "markdown" or "json"
+
+### mfp_get_food_entries
+List a day's individual food entries, one record per logged food, with the times MyFitnessPal stores for each.
+- `date` (optional): YYYY-MM-DD format, defaults to today
+- `response_format`: "markdown" or "json"
+
+Each entry has `id`, `meal`, `name`, `brand`, `quantity`, `unit`, `energy`, `energy_unit`, macros, and four time fields:
+
+| Field | Example | Meaning |
+|-------|---------|---------|
+| `consumed_at` | `15:45:00` | Time of day chosen in the app. No time zone. |
+| `logged_at` | `2026-01-15T14:45:28+00:00` | When the entry was logged, in UTC |
+| `logged_at_offset` | `+01:00` | UTC offset of the device that logged it |
+| `created_at` | `2026-01-15T14:45:29Z` | When MyFitnessPal created the entry, in UTC |
+
+`consumed_at`, `logged_at` and `logged_at_offset` can all be `null`: MyFitnessPal does not store a time for every entry. `created_at` is always set but is not a reliable substitute for the eating time.
 
 ### mfp_search_food
 Search the MyFitnessPal food database.
