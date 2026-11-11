@@ -1089,6 +1089,23 @@ class GetStepsInput(BaseModel):
         description="Output format: 'markdown' for human-readable or 'json' for structured data",
     )
 
+
+class GetFoodEntriesInput(BaseModel):
+    """Input model for listing a day's food entries with their times."""
+
+    model_config = ConfigDict(str_strip_whitespace=True)
+
+    date: Optional[str] = Field(
+        default=None,
+        description="Date in YYYY-MM-DD format. Defaults to today if not specified.",
+        pattern=r"^\d{4}-\d{2}-\d{2}$",
+    )
+    response_format: ResponseFormat = Field(
+        default=ResponseFormat.MARKDOWN,
+        description="Output format: 'markdown' for human-readable or 'json' for structured data",
+    )
+
+
 class GetReportInput(BaseModel):
     """Input model for getting nutrition reports."""
 
@@ -2533,6 +2550,160 @@ async def mfp_get_steps(params: GetStepsInput) -> str:
 
     except Exception as e:
         return f"Error getting steps: {str(e)}"
+
+
+# Each logged food is a `food_entry` item in the v2 diary, and carries the
+# times the mobile app's timeline shows (shape captured live 2026-11-11):
+#   consumed_at       "15:45:00"                   time of day picked in the app, no zone
+#   logged_at         "2026-01-15T14:45:28+00:00"  when the entry was logged, UTC
+#   logged_at_offset  "+01:00"                     the logging device's UTC offset
+#   created_at        "2026-01-15T14:45:29Z"       server-side creation, always set
+# The first three are null together on some entries (9 of 57 on the capture
+# day). The app still shows a time for those, but it is not derivable from
+# this payload: created_at matched the app for one such entry and was over
+# two hours later for another, so the fields are passed through as-is and
+# never substituted for each other.
+_ENTRY_NUTRIENTS = ("carbohydrates", "fat", "protein", "sodium", "sugar")
+
+
+def _round_or_none(value: Optional[float]) -> Optional[float]:
+    return round(value, 1) if value is not None else None
+
+
+def _food_entry_summary(item: Dict[str, Any]) -> Dict[str, Any]:
+    """Flatten one v2 `food_entry` item. Pure: no network, no client."""
+    food = item.get("food") or {}
+    serving = item.get("serving_size") or {}
+    nutrition = item.get("nutritional_contents") or {}
+    energy = nutrition.get("energy") or {}
+
+    servings = item.get("servings")
+    quantity = servings
+    if servings is not None and serving.get("value") is not None:
+        quantity = round(servings * serving["value"], 2)
+
+    summary: Dict[str, Any] = {
+        "id": item.get("id"),
+        "meal": item.get("meal_name"),
+        "name": food.get("description"),
+        "brand": food.get("brand_name"),
+        "quantity": quantity,
+        "unit": serving.get("unit"),
+        "consumed_at": item.get("consumed_at"),
+        "logged_at": item.get("logged_at"),
+        "logged_at_offset": item.get("logged_at_offset"),
+        "created_at": item.get("created_at"),
+        # Entry-level nutrition is already the total for the logged amount.
+        "energy": _round_or_none(energy.get("value")),
+        "energy_unit": energy.get("unit"),
+    }
+    for nutrient in _ENTRY_NUTRIENTS:
+        summary[nutrient] = _round_or_none(nutrition.get(nutrient))
+    return summary
+
+
+def get_food_entries(client, target_date: date) -> List[Dict[str, Any]]:
+    """
+    Fetch one day's food entries from the v2 diary, in the API's order.
+
+    Raises:
+        RuntimeError: If the request fails
+    """
+    date_str = target_date.strftime("%Y-%m-%d")
+    response = client.session.get(
+        f"{MFP_API_BASE}/v2/diary",
+        params={"entry_date": date_str, "types": "food_entry"},
+        headers=_mfp_api_headers(client),
+        timeout=30,
+    )
+    if response.status_code != 200:
+        detail = _api_error_detail(response)
+        raise RuntimeError(
+            f"Could not fetch food entries for {date_str}: HTTP {response.status_code}"
+            + (f" - {detail}" if detail else "")
+        )
+    return [
+        _food_entry_summary(item)
+        for item in response.json().get("items") or []
+        if item.get("type") == "food_entry" and not item.get("deleted")
+    ]
+
+
+def _food_entries_markdown(date_str: str, entries: List[Dict[str, Any]]) -> str:
+    """One line per entry, grouped by meal. Pure."""
+    lines = [f"## Food Entries for {date_str}\n", f"- **count**: {len(entries)}"]
+    by_meal: Dict[str, List[Dict[str, Any]]] = {}
+    for entry in entries:
+        by_meal.setdefault(entry["meal"] or "Unknown meal", []).append(entry)
+    for meal, meal_entries in by_meal.items():
+        lines.append(f"### {meal}")
+        for e in meal_entries:
+            time_label = (e["consumed_at"] or "")[:5] or "no time"
+            # A bare unit with no number ("g") is meaningless, so the amount
+            # clause needs the quantity; the unit alone is dropped.
+            amount = (
+                " ".join(str(p) for p in (e["quantity"], e["unit"]) if p is not None)
+                if e["quantity"] is not None
+                else ""
+            )
+            energy = " ".join(str(p) for p in (e["energy"], e["energy_unit"]) if p is not None)
+            lines.append(
+                f"- {time_label} - {e['name'] or 'Unknown food'}"
+                + (f", {amount}" if amount else "")
+                + (f" - {energy}" if energy else "")
+                + f" (id: {e['id']})"
+            )
+    return "\n".join(lines)
+
+
+@mcp.tool(
+    name="mfp_get_food_entries",
+    annotations={
+        "title": "Get Food Entries with Times",
+        "readOnlyHint": True,
+        "destructiveHint": False,
+        "idempotentHint": True,
+        "openWorldHint": True,
+    },
+)
+async def mfp_get_food_entries(params: GetFoodEntriesInput) -> str:
+    """
+    List a day's individual food entries with the time each was eaten.
+
+    Unlike mfp_get_diary, which reports meals and totals, this returns one
+    record per logged food with the times MyFitnessPal stores for it:
+
+    - consumed_at: time of day chosen in the app ("15:45:00"), no time zone
+    - logged_at / logged_at_offset: when it was logged (UTC) and the logging
+      device's UTC offset
+    - created_at: when MyFitnessPal created the entry (UTC)
+
+    consumed_at, logged_at and logged_at_offset can all be null: MyFitnessPal
+    does not store a time for every entry. created_at is not a reliable
+    stand-in for the eating time.
+
+    Args:
+        params: GetFoodEntriesInput containing:
+            - date (str, optional): Date in YYYY-MM-DD format, defaults to today
+            - response_format (str): 'markdown' or 'json'
+
+    Returns:
+        str: Each entry's id, meal, name, amount, energy, macros and times
+    """
+    try:
+        target_date = parse_date(params.date)
+        client = get_mfp_client()
+        entries = await asyncio.to_thread(get_food_entries, client, target_date)
+
+        if params.response_format == ResponseFormat.MARKDOWN:
+            return _food_entries_markdown(str(target_date), entries)
+        return json.dumps(
+            {"date": str(target_date), "count": len(entries), "entries": entries},
+            indent=2,
+        )
+
+    except Exception as e:
+        return f"Error getting food entries: {str(e)}"
 
 
 @mcp.tool(
