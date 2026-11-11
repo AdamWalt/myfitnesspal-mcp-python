@@ -228,6 +228,20 @@ class TestGetFoodEntriesTool:
         )
         assert snacks[1].startswith("- no time - Banana")
 
+    def test_markdown_handles_null_name_and_null_quantity(self, monkeypatch):
+        """A food with no description shows a placeholder, not literal None;
+        a null quantity drops the amount clause rather than printing ', g'."""
+        client = _FakeClient([
+            _entry(
+                food={"description": None, "brand_name": None},
+                servings=None,
+            ),
+        ])
+        line = self._run(monkeypatch, client, date="2026-01-15").splitlines()[-1]
+        assert "Unknown food" in line
+        assert "None" not in line
+        assert ", g" not in line
+
     def test_http_failure_is_reported_as_an_error_string(self, monkeypatch):
         result = self._run(monkeypatch, _FakeClient(status_code=500, body={}))
         assert result.startswith("Error getting food entries")

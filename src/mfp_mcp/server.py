@@ -2639,10 +2639,16 @@ def _food_entries_markdown(date_str: str, entries: List[Dict[str, Any]]) -> str:
         lines.append(f"### {meal}")
         for e in meal_entries:
             time_label = (e["consumed_at"] or "")[:5] or "no time"
-            amount = " ".join(str(p) for p in (e["quantity"], e["unit"]) if p is not None)
+            # A bare unit with no number ("g") is meaningless, so the amount
+            # clause needs the quantity; the unit alone is dropped.
+            amount = (
+                " ".join(str(p) for p in (e["quantity"], e["unit"]) if p is not None)
+                if e["quantity"] is not None
+                else ""
+            )
             energy = " ".join(str(p) for p in (e["energy"], e["energy_unit"]) if p is not None)
             lines.append(
-                f"- {time_label} - {e['name']}"
+                f"- {time_label} - {e['name'] or 'Unknown food'}"
                 + (f", {amount}" if amount else "")
                 + (f" - {energy}" if energy else "")
                 + f" (id: {e['id']})"
