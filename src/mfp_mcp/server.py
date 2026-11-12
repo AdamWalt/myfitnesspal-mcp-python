@@ -1160,6 +1160,42 @@ class AddFoodToDiaryInput(BaseModel):
     )
 
 
+class QuickAddInput(BaseModel):
+    """Input model for a Quick Add (raw calories/macros, no food lookup)."""
+
+    model_config = ConfigDict(str_strip_whitespace=True)
+
+    calories: int = Field(..., description="Calories to log (kcal).", ge=1, le=10000)
+    carbohydrates: Optional[int] = Field(
+        default=None, description="Carbohydrates in grams (optional).", ge=0, le=2000
+    )
+    protein: Optional[int] = Field(
+        default=None, description="Protein in grams (optional).", ge=0, le=2000
+    )
+    fat: Optional[int] = Field(
+        default=None, description="Fat in grams (optional).", ge=0, le=2000
+    )
+    meal: str = Field(
+        default="Breakfast",
+        description=(
+            "Meal to log under, matched case-insensitively to one of the account's "
+            "configured meals (see mfp_list_meals). An unmatched name is rejected, "
+            "not silently misfiled."
+        ),
+    )
+    date: Optional[str] = Field(
+        default=None,
+        description="Date in YYYY-MM-DD format. Defaults to today if not specified.",
+        pattern=r"^\d{4}-\d{2}-\d{2}$",
+    )
+    name: str = Field(
+        default="Quick Add",
+        description="Label shown for the entry (defaults to 'Quick Add').",
+        min_length=1,
+        max_length=100,
+    )
+
+
 class CreateCustomFoodInput(BaseModel):
     """Input model for creating a private custom food."""
 
@@ -1752,6 +1788,75 @@ def add_food_to_diary(
         logger.warning("Entry created but MyFitnessPal returned no entry id")
         entry_id = None
     return entry_id, meal_name
+
+
+def quick_add_to_diary(
+    client,
+    *,
+    calories: int,
+    meal: str,
+    target_date: date,
+    carbohydrates: Optional[int] = None,
+    protein: Optional[int] = None,
+    fat: Optional[int] = None,
+    name: str = "Quick Add",
+) -> Tuple[Optional[str], str]:
+    """
+    Log raw calories/macros with no food lookup ("Quick Add"), mirroring the app.
+
+    MyFitnessPal has no clean JSON endpoint for a Quick Add (the app writes it
+    through a legacy binary sync channel), but a Quick Add is really just a diary
+    entry backed by a one-off food. So this creates a private food whose single
+    serving equals the given macros, logs one serving to the meal, then deletes
+    that backing food so it does not clutter the user's food list. The diary
+    entry keeps its own nutrition and survives the deletion — exactly how
+    MyFitnessPal's own Quick Add works (its backing food is flagged deleted).
+
+    Returns:
+        (entry id or None if MFP returned none, the resolved account meal name)
+
+    Raises:
+        RuntimeError: If the food cannot be created or the entry cannot be logged.
+    """
+    spec: Dict[str, Any] = {
+        "description": name,
+        "calories": calories,
+        "serving_amount": 1,
+        "serving_unit": "serving",
+        "country_code": "NL",
+    }
+    if carbohydrates is not None:
+        spec["carbs"] = carbohydrates
+    if protein is not None:
+        spec["protein"] = protein
+    if fat is not None:
+        spec["fat"] = fat
+
+    created = create_custom_food(client, spec)
+    food_id = created.get("id")
+    if not food_id:
+        raise RuntimeError("Quick Add food was created but MyFitnessPal returned no id")
+
+    try:
+        entry_id, resolved_meal = add_food_to_diary(
+            client, mfp_id=str(food_id), meal=meal, target_date=target_date, quantity=1.0
+        )
+    except Exception:
+        # Don't leave an orphan food behind if logging failed.
+        try:
+            delete_custom_food(client, str(food_id))
+        except Exception:
+            pass
+        raise
+
+    # Make the backing food a throwaway. The diary entry keeps its own nutrition
+    # and remains, so a failed delete here is non-fatal (it just leaves a food).
+    try:
+        delete_custom_food(client, str(food_id))
+    except Exception as e:
+        logger.warning(f"Quick Add logged but backing food {food_id} not removed: {e}")
+
+    return entry_id, resolved_meal
 
 
 def list_diary_entries(client, target_date: date) -> List[Dict[str, str]]:
@@ -2666,6 +2771,73 @@ async def mfp_add_food_to_diary(params: AddFoodToDiaryInput) -> str:
         
     except Exception as e:
         return f"Error adding food to diary: {str(e)}"
+
+
+@mcp.tool(
+    name="mfp_quick_add",
+    annotations={
+        "title": "Quick Add Calories",
+        "readOnlyHint": False,
+        "destructiveHint": False,
+        "idempotentHint": False,
+        "openWorldHint": True,
+    },
+)
+async def mfp_quick_add(params: QuickAddInput) -> str:
+    """
+    Quick Add raw calories (and optional carbs/protein/fat) with no food lookup.
+
+    Mirrors MyFitnessPal's "Quick Add": use it to log an energy/macro total
+    directly when you don't have (or don't need) a specific food — e.g. a rough
+    restaurant meal, or a ride fuel total. The entry is logged under the given
+    meal for the given date; only `calories` is required.
+
+    Args:
+        params: QuickAddInput containing:
+            - calories (int): calories to log (required)
+            - carbohydrates / protein / fat (int, optional): grams
+            - meal (str): meal to log under (see mfp_list_meals); default Breakfast
+            - date (str, optional): YYYY-MM-DD, defaults to today
+            - name (str): label for the entry (default 'Quick Add')
+
+    Returns:
+        str: Confirmation with the entry id, resolved meal, and what was logged
+    """
+    try:
+        client = get_mfp_client()
+        target_date = parse_date(params.date)
+
+        entry_id, resolved_meal = await asyncio.to_thread(
+            quick_add_to_diary,
+            client,
+            calories=params.calories,
+            meal=params.meal,
+            target_date=target_date,
+            carbohydrates=params.carbohydrates,
+            protein=params.protein,
+            fat=params.fat,
+            name=params.name,
+        )
+
+        return json.dumps(
+            {
+                "success": True,
+                "message": f"Quick-added {params.calories} cal to {resolved_meal}",
+                "entry_id": entry_id,
+                "date": str(target_date),
+                "meal": resolved_meal,
+                "logged": {
+                    "calories": params.calories,
+                    "carbohydrates": params.carbohydrates,
+                    "protein": params.protein,
+                    "fat": params.fat,
+                },
+            },
+            indent=2,
+        )
+
+    except Exception as e:
+        return f"Error quick-adding: {str(e)}"
 
 
 class ListMealsInput(BaseModel):
