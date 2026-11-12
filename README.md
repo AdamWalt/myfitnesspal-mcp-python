@@ -85,7 +85,7 @@ Garmin sleep window + first-meal timestamp) or correcting entries programmatical
 - **pip 21.3+** (for pyproject.toml support; upgrade with `pip install --upgrade pip`)
 - **MyFitnessPal account**
 - **One of the following for authentication:**
-  - **Recommended (macOS):** any Chromium-based browser (Arc, Chrome, Edge,
+  - **Recommended (macOS):** any Chromium-based browser (Arc, Dia, Chrome, Edge,
     Brave, Vivaldi, Opera, ...) with an active MyFitnessPal login session —
     the MCP auto-discovers the session on next call
   - Firefox with an active MyFitnessPal login session (via the
@@ -100,7 +100,7 @@ This MCP supports multiple authentication methods:
 
 | Method | Setup | Persistence |
 |--------|-------|-------------|
-| **Chromium browser auto-discovery (macOS, recommended)** | Log into myfitnesspal.com in any Chromium-based browser (Arc, Chrome, Edge, Brave, Vivaldi, Opera, ...). The MCP auto-detects installed browsers via the macOS keychain and uses whichever one is logged in. | Until browser session expires (cached for 30 days in `~/.mfp_mcp/cookies.json`) |
+| **Chromium browser auto-discovery (macOS, recommended)** | Log into myfitnesspal.com in any Chromium-based browser (Arc, Dia, Chrome, Edge, Brave, Vivaldi, Opera, ...). The MCP auto-detects installed browsers via the macOS keychain and uses whichever one is logged in. | Until browser session expires (cached for 30 days in `~/.mfp_mcp/cookies.json`) |
 | **Encrypted credentials (legacy)** | Add encrypted `MFP_USERNAME` and `MFP_PASSWORD` to Claude Desktop config; set `MFP_SECRET_KEY` outside the config (for example via shell env or OS keychain) | Form login no longer works against MFP's NextAuth backend — only useful if cached cookies are still valid |
 | **Plain credentials (legacy)** | Add `MFP_USERNAME` and `MFP_PASSWORD` to Claude Desktop config | Same as above — form login flow is deprecated |
 | **Browser cookies (browser_cookie3 fallback)** | Log into myfitnesspal.com in Chrome or Firefox via the default profile paths | Until browser session expires |
@@ -343,7 +343,7 @@ server scans the macOS keychain for `<Browser> Safe Storage` entries to find
 every installed Chromium-based browser, then tries each one's cookies
 database until it finds a valid MyFitnessPal session token.
 
-This works out of the box with Arc, Chrome, Edge, Brave, Vivaldi, Opera,
+This works out of the box with Arc, Dia, Chrome, Edge, Brave, Vivaldi, Opera,
 Chromium, and any other Chromium-derived browser. You only need to be
 logged into [myfitnesspal.com](https://www.myfitnesspal.com) in one of
 them.
@@ -587,10 +587,10 @@ pip install -e .
 
 **Solutions**:
 1. **Easiest (macOS)**: Log into [myfitnesspal.com](https://www.myfitnesspal.com)
-   in any Chromium-based browser (Arc, Chrome, Edge, Brave, ...). The MCP
+   in any Chromium-based browser (Arc, Dia, Chrome, Edge, Brave, ...). The MCP
    will auto-discover the session on the next call.
 2. **Force a refresh**: Call the `refresh_browser_cookies` tool — `auto`
-   scans every browser, or pass a specific name (`arc`, `chrome`, `edge`,
+   scans every browser, or pass a specific name (`arc`, `dia`, `chrome`, `edge`,
    `brave`, `vivaldi`, `opera`, `firefox`).
 3. **If using credentials**: Double-check your MFP_USERNAME and MFP_PASSWORD
    in the config. Note that the legacy form-login flow no longer works

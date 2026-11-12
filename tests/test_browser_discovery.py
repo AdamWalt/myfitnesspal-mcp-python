@@ -17,7 +17,8 @@ from mfp_mcp import server  # noqa: E402
 def test_dia_is_mapped_with_expected_paths():
     paths = server._CHROMIUM_COOKIES_PATHS_MACOS["Dia"]
     # New Chromium layout (Network/) is tried before the legacy location.
-    assert paths[0].endswith("Network/Cookies")
+    # Pin the full path so a wrong prefix can't pass via the legacy fallback.
+    assert paths[0] == "Dia/User Data/Default/Network/Cookies"
     assert "Dia/User Data/Default/Cookies" in paths
 
 

@@ -611,7 +611,7 @@ def authenticate_with_credentials(username: str, password: str) -> Dict[str, str
                 "Login appeared to fail — response contained no session token. "
                 "MyFitnessPal's form login flow does not work against the "
                 "current NextAuth backend. Log into myfitnesspal.com in any "
-                "Chromium-based browser (Arc, Chrome, Edge, Brave, ...) and "
+                "Chromium-based browser (Arc, Dia, Chrome, Edge, Brave, ...) and "
                 "the MCP will pick up the session automatically."
             )
                 
@@ -630,7 +630,7 @@ def get_mfp_client():
        a. First tries previously-cached cookies for this user.
        b. Then falls back to form login (only useful on legacy accounts).
     2. Stored session cookies (~/.mfp_mcp/cookies.json)
-    3. Chromium-based browser cookies (macOS): auto-discovers Arc, Chrome,
+    3. Chromium-based browser cookies (macOS): auto-discovers Arc, Dia, Chrome,
        Edge, Brave, Vivaldi, Opera, or any other installed Chromium browser
        via the keychain's "Safe Storage" entries.
     4. `browser_cookie3` default fallback (legacy Chrome/Firefox paths).
