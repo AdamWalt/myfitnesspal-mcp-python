@@ -57,7 +57,6 @@ COOKIES_FILE = CONFIG_DIR / "cookies.json"
 # endpoint (/food/diary/{user}/add) was removed by MFP and now returns 404.
 MFP_API_BASE = "https://api.myfitnesspal.com"
 MFP_CLIENT_ID = "mfp-main-js"
-VALID_MEALS = ("Breakfast", "Lunch", "Dinner", "Snacks")
 
 
 # ============================================================================
@@ -1126,7 +1125,13 @@ class AddFoodToDiaryInput(BaseModel):
     )
     meal: str = Field(
         default="Breakfast",
-        description="Meal name (e.g., 'Breakfast', 'Lunch', 'Dinner', 'Snacks')",
+        description=(
+            "Meal to log under, matched case-insensitively to one of the account's "
+            "configured meals. The defaults are Breakfast/Lunch/Dinner/Snacks, but "
+            "accounts can rename them (localized) or add custom meals — call "
+            "mfp_list_meals to see this account's meals. An unmatched name is rejected, "
+            "not silently misfiled."
+        ),
     )
     date: Optional[str] = Field(
         default=None,
@@ -1620,6 +1625,38 @@ def delete_custom_food(client, food_id: str) -> int:
     return r.status_code
 
 
+def get_meal_names(client, target_date: Optional[date] = None) -> List[str]:
+    """Return the account's configured meal names, in diary order.
+
+    MFP exposes no v2 endpoint for the meal list, so the diary page is the only
+    source (the same one mfp_get_diary reads). It reads a single day — the
+    configured meals are account-level and identical across days. Names come
+    back as MFP stores them (e.g. 'breakfast', plus any custom meals such as
+    'during ride').
+    """
+    day = client.get_date(target_date or date.today())
+    return [meal.name for meal in day.meals]
+
+
+def _resolve_meal(meal: str, meal_names: List[str]) -> str:
+    """Match `meal` to one of the account's configured meals (case-insensitive)
+    and return the account's own spelling.
+
+    MFP's diary POST silently files an unrecognized meal_name under a default
+    meal (observed: the first one) instead of erroring, so entries get mis-logged
+    on accounts with renamed/localized/custom meals. We refuse a non-match and
+    name the valid options rather than let that happen.
+    """
+    wanted = (meal or "").strip().lower()
+    for name in meal_names:
+        if name.lower() == wanted:
+            return name
+    raise RuntimeError(
+        f"Meal {meal!r} is not one of this account's meals "
+        f"({', '.join(meal_names)}). Use mfp_list_meals to list them."
+    )
+
+
 def add_food_to_diary(
     client, mfp_id: str, meal: str, target_date: date, quantity: float = 1.0, unit: Optional[str] = None
 ) -> Optional[str]:
@@ -1643,11 +1680,7 @@ def add_food_to_diary(
     food = get_food_v2(client, mfp_id)
     serving_size = select_serving_size(food, unit)
 
-    meal_name = meal.strip().capitalize()
-    if meal_name not in VALID_MEALS:
-        raise RuntimeError(
-            f"Invalid meal {meal!r}. Expected one of: {', '.join(VALID_MEALS)}"
-        )
+    meal_name = _resolve_meal(meal, get_meal_names(client, target_date))
 
     entry = {
         "type": "food_entry",
@@ -2569,13 +2602,11 @@ async def mfp_add_food_to_diary(params: AddFoodToDiaryInput) -> str:
     try:
         client = get_mfp_client()
         target_date = parse_date(params.date)
-        
-        # Normalize meal name (capitalize first letter)
-        meal = params.meal.strip().capitalize()
-        if meal.lower() == "snack":
-            meal = "Snacks"
-        
-        # Add food to diary
+
+        # The meal is matched against the account's configured meals inside
+        # add_food_to_diary (case-insensitive), so pass it through as given.
+        meal = params.meal
+
         entry_id = add_food_to_diary(
             client=client,
             mfp_id=params.mfp_id,
@@ -2607,6 +2638,53 @@ async def mfp_add_food_to_diary(params: AddFoodToDiaryInput) -> str:
         
     except Exception as e:
         return f"Error adding food to diary: {str(e)}"
+
+
+class ListMealsInput(BaseModel):
+    """Input for `mfp_list_meals`."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    response_format: ResponseFormat = Field(
+        default=ResponseFormat.MARKDOWN,
+        description="Output format: 'markdown' (default) or 'json'.",
+    )
+
+
+@mcp.tool(
+    name="mfp_list_meals",
+    annotations={
+        "title": "List Configured Meals",
+        "readOnlyHint": True,
+        "destructiveHint": False,
+        "idempotentHint": True,
+        "openWorldHint": True,
+    },
+)
+async def mfp_list_meals(params: ListMealsInput) -> str:
+    """
+    List this account's configured meal names.
+
+    These are the values mfp_add_food_to_diary accepts for `meal`. The defaults
+    are Breakfast/Lunch/Dinner/Snacks, but an account may have renamed them
+    (localized) or added custom meals (e.g. 'supplements', 'during ride'). Pass
+    one of these names (case-insensitive) when logging, so entries aren't
+    rejected or silently misfiled under the wrong meal.
+
+    Args:
+        params: ListMealsInput (response_format)
+
+    Returns:
+        str: The account's meal names, in diary order
+    """
+    try:
+        client = get_mfp_client()
+        names = await asyncio.to_thread(get_meal_names, client, None)
+        if params.response_format == ResponseFormat.MARKDOWN:
+            return "## Meals\n" + "\n".join(f"- {n}" for n in names)
+        return json.dumps({"meals": names}, indent=2)
+    except Exception as e:
+        return f"Error listing meals: {str(e)}"
 
 
 @mcp.tool(

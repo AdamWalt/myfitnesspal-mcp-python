@@ -10,6 +10,7 @@ A [Model Context Protocol (MCP)](https://modelcontextprotocol.io/) server that e
 | `mfp_search_food` | Read | Search the MyFitnessPal food database |
 | `mfp_get_food_details` | Read | Get detailed nutrition info for a food item |
 | `mfp_add_food_to_diary` | Write | Add a food item to your diary for a specific meal and date |
+| `mfp_list_meals` | Read | List the account's configured meal names (incl. renamed/custom) for use with `mfp_add_food_to_diary` |
 | `mfp_remove_food_from_diary` | Write | Remove a logged entry from your diary |
 | `mfp_create_custom_food` | Write | Create a private custom food with a full nutrition panel |
 | `mfp_list_own_foods` | Read | List your own custom foods (private ones do not appear in search) |
