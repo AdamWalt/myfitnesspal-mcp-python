@@ -1943,28 +1943,51 @@ async def mfp_get_diary(params: GetDiaryInput) -> str:
 # the request and parse the energy cell unit-aware instead. We also skip the
 # per-result detail fetch the library's FoodItem.serving triggers — search is for
 # discovery; mfp_get_food_details carries full nutrition and serving sizes.
-_SEARCH_ENERGY_RE = re.compile(r"([\d.,]+)\s*(kilojoules?|kj|calories?|kcal|cal)?", re.I)
+# The energy token is unit-anchored so it is found wherever it sits in the
+# comma-separated info line, and the number may carry a thousands separator —
+# otherwise splitting the line on "," first would turn "3,500 kilojoules" into
+# "500" (kJ values routinely exceed 1000). Observed live: MFP currently renders
+# "1380 calories" with no separator, but kJ accounts aren't testable here, so we
+# tolerate both forms.
+_SEARCH_ENERGY_RE = re.compile(
+    r"([\d,]+(?:\.\d+)?)\s*(kilojoules?|kj|calories?|kcal|cal)\b", re.I
+)
 
 
 def _parse_search_energy(text: Optional[str]) -> Tuple[Optional[float], Optional[str]]:
-    """Parse a search result's energy cell, e.g. '233 calories' or '649 kilojoules'.
+    """Return (value, unit) for the energy in a search info line, e.g.
+    '…, 1 serving, 1,380 calories' -> (1380.0, 'calories').
 
-    Returns (value, unit) with unit normalized to 'calories' or 'kilojoules'. A
-    bare number is assumed calories (MFP's default label). (None, None) when no
-    number is present. Never raises on an unexpected unit — that is the #25 bug.
+    Scans the whole line and takes the last unit-tagged number (energy follows
+    brand/serving), so it never truncates a 4-digit value or raises on the unit
+    (the #25 crash). (None, None) when no unit-tagged number is present.
     """
     if not text:
         return None, None
-    match = _SEARCH_ENERGY_RE.search(text)
-    if not match:
+    matches = _SEARCH_ENERGY_RE.findall(text)
+    if not matches:
         return None, None
+    number, unit = matches[-1]
     try:
-        value = float(match.group(1).replace(",", ""))
+        value = float(number.replace(",", ""))
     except ValueError:
         return None, None
-    raw_unit = (match.group(2) or "").lower()
-    unit = "kilojoules" if raw_unit.startswith("kilojoule") or raw_unit == "kj" else "calories"
-    return value, unit
+    u = unit.lower()
+    return value, ("kilojoules" if u.startswith("kilojoule") or u == "kj" else "calories")
+
+
+def _parse_search_brand(text: Optional[str]) -> str:
+    """Brand from a search info line '<brand…>, <serving>, <energy>'. The energy
+    token is stripped first so a thousands separator in it can't shift the
+    comma-separated fields. Returns '' when there is only a serving + energy."""
+    if not text:
+        return ""
+    head = text
+    for match in _SEARCH_ENERGY_RE.finditer(text):
+        head = text[: match.start()]  # keep trimming to the last energy token
+    parts = [p.strip() for p in head.split(",") if p.strip()]
+    # The last remaining field is the serving; the brand is everything before it.
+    return " ".join(parts[:-1]).strip() if len(parts) >= 2 else ""
 
 
 def search_food(client, query: str, limit: int) -> List[Dict[str, Any]]:
@@ -1995,32 +2018,30 @@ def search_food(client, query: str, limit: int) -> List[Dict[str, Any]]:
         },
         timeout=30,
     )
-    content = response.content.decode("utf-8", errors="replace")
-    if response.status_code != 200 or "Matching Foods:" not in content:
+    # A 200 with no matches is an empty result set, not an error -> return [].
+    if response.status_code != 200:
         raise RuntimeError(f"Food search request failed: HTTP {response.status_code}")
 
-    document = lxml.html.document_fromstring(content)
+    document = lxml.html.document_fromstring(response.content.decode("utf-8", errors="replace"))
     results: List[Dict[str, Any]] = []
     for item in document.xpath("//li[@class='matched-food']"):
         anchors = item.xpath(".//div[@class='search-title-container']/a")
         if not anchors:
             continue
         anchor = anchors[0]
-        brand = ""
-        energy, energy_unit = None, None
         info = item.xpath(".//p[@class='search-nutritional-info']")
-        if info and info[0].text:
-            parts = [p.strip() for p in info[0].text.strip().split(",")]
-            if len(parts) >= 3:
-                brand = " ".join(parts[0:-2]).strip()
-            energy, energy_unit = _parse_search_energy(parts[-1])
+        info_text = (info[0].text or "").strip() if info else ""
+        energy, energy_unit = _parse_search_energy(info_text)
         results.append({
             "mfp_id": anchor.get("data-external-id"),
             "name": (anchor.text or "").strip(),
-            "brand": brand,
+            "brand": _parse_search_brand(info_text),
             "energy": energy,
             "energy_unit": energy_unit,
-            "verified": bool(item.xpath(".//div[contains(@class, 'verified')]")),
+            # whole-word 'verified' so a 'unverified' class can't false-positive
+            "verified": bool(item.xpath(
+                ".//div[contains(concat(' ', normalize-space(@class), ' '), ' verified ')]"
+            )),
         })
         if len(results) >= limit:
             break

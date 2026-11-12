@@ -78,8 +78,12 @@ class TestParseEnergy:
         ("649 kilojoules", (649.0, "kilojoules")),
         ("649 kJ", (649.0, "kilojoules")),
         ("105 kcal", (105.0, "calories")),
-        ("1,234 calories", (1234.0, "calories")),
-        ("88", (88.0, "calories")),          # bare number -> calories
+        # full info line: energy is the last unit-tagged number, not the serving
+        ("Generic, 1 medium, 95 calories", (95.0, "calories")),
+        # thousands separator must not truncate (4-digit kJ is routine)
+        ("Brand, 1 serving, 1,380 calories", (1380.0, "calories")),
+        ("Sanitarium, 2 biscuits, 3,500 kilojoules", (3500.0, "kilojoules")),
+        ("88", (None, None)),          # no unit -> not an energy value (e.g. a serving number)
         ("", (None, None)),
         (None, (None, None)),
         ("no numbers here", (None, None)),
@@ -120,8 +124,13 @@ class TestSearchFood:
         with pytest.raises(RuntimeError, match="CSRF token"):
             server.search_food(client, "x", limit=10)
 
-    def test_no_matching_foods_raises(self):
-        client = _client(results_html=b"<html><body>Something else</body></html>")
+    def test_no_results_returns_empty_list(self):
+        # A 200 with no matched-food items is an empty search, not an error.
+        client = _client(results_html=b"<html><body>No matches found</body></html>")
+        assert server.search_food(client, "x", limit=10) == []
+
+    def test_post_non_200_raises(self):
+        client = _client(results_status=500)
         with pytest.raises(RuntimeError, match="search request failed"):
             server.search_food(client, "x", limit=10)
 
@@ -129,6 +138,19 @@ class TestSearchFood:
         client = _client(form_status=500)
         with pytest.raises(RuntimeError, match="food-search page"):
             server.search_food(client, "x", limit=10)
+
+    def test_four_digit_kilojoules_not_truncated(self):
+        html = (
+            "<html><body>Matching Foods:<ul>"
+            '<li class="matched-food">'
+            '  <div class="search-title-container"><a data-external-id="999">Lamington</a></div>'
+            '  <p class="search-nutritional-info">Sara Lee, 1 serving, 3,500 kilojoules</p>'
+            "</li></ul></body></html>"
+        ).encode()
+        results = server.search_food(_client(results_html=html), "x", limit=10)
+        assert results[0]["energy"] == 3500.0  # not 500
+        assert results[0]["energy_unit"] == "kilojoules"
+        assert results[0]["brand"] == "Sara Lee"
 
 
 class TestSearchTool:
