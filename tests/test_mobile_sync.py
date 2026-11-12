@@ -7,6 +7,7 @@ captured 2026-11-12.
 """
 from __future__ import annotations
 
+import asyncio
 import base64
 import hashlib
 import hmac
@@ -20,6 +21,7 @@ import pytest
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from mfp_mcp import mobile_sync as ms  # noqa: E402
+from mfp_mcp import server  # noqa: E402
 
 
 # --------------------------------------------------------------------------- #
@@ -327,3 +329,112 @@ class TestShaping:
         assert "- **total on account**: 10" in md
         assert "→ (ongoing)" in md
         assert "(12.0h)" in md
+
+
+class TestFilterEdgeCases:
+    def test_startless_entry_kept_when_no_filter_and_sorted_last(self):
+        fasts = [
+            ms.summarize_fast({"id": "has", "fast_started": "2026-01-02T10:00:00Z",
+                               "fast_ended": "2026-01-02T18:00:00Z"}),
+            ms.summarize_fast({"id": "none", "fast_started": None, "fast_ended": None}),
+        ]
+        out = ms.filter_and_sort(fasts)
+        assert [f["id"] for f in out] == ["has", "none"]  # present, start-less last
+
+    def test_startless_entry_dropped_when_a_date_filter_is_set(self):
+        fasts = [ms.summarize_fast({"id": "none", "fast_started": None, "fast_ended": None})]
+        assert ms.filter_and_sort(fasts, start=date(2026, 1, 1)) == []
+
+    def test_naive_timestamp_is_bucketed_as_utc(self):
+        # Offset-less, just after UTC midnight -> must stay on that UTC date,
+        # not shift to the host's local date.
+        f = ms.summarize_fast({"id": "a", "fast_started": "2026-03-10T00:30:00", "fast_ended": None})
+        assert len(ms.filter_and_sort([f], start=date(2026, 3, 10), end=date(2026, 3, 10))) == 1
+
+
+class TestFetchAllFastsHardening:
+    def test_deleted_tombstone_removes_a_prior_entry(self):
+        pages = [
+            FakeResp(200, {"items": [_fast_item("x", "2026-01-01T10:00:00Z", "2026-01-01T18:00:00Z")]},
+                     headers={"next-import-token": "t1"}),
+            FakeResp(200, {"items": [_fast_item("x", "2026-01-01T10:00:00Z", None, action="deleted")]},
+                     headers={"next-sync-token": "S"}),
+        ]
+        seq = iter(pages)
+        s = FakeSession().on("GET", "/v2.1/import", lambda url, kw: next(seq))
+        fasts, _ = ms.fetch_all_fasts("tok", session=s)
+        assert fasts == []  # created on page 1, deleted on page 2 -> gone
+
+    def test_stops_at_max_pages_without_sync_token(self):
+        s = FakeSession().on("GET", "/v2.1/import",
+                             lambda url, kw: FakeResp(200, {"items": []},
+                                                      headers={"next-import-token": "always"}))
+        fasts, sync = ms.fetch_all_fasts("tok", session=s, max_pages=3)
+        assert sync is None
+        assert len(s.calls) == 3  # bounded, no infinite loop
+
+
+class TestGetFastsTool:
+    """Covers the server.mfp_get_fasts orchestration, incl. 401 -> refresh -> retry."""
+
+    def _patch(self, monkeypatch, raw, fail_first=False):
+        monkeypatch.setattr(ms, "_new_session", lambda: None)
+        state = {"token_force": [], "fetch_calls": 0}
+
+        def fake_token(force_refresh=False, session=None):
+            state["token_force"].append(force_refresh)
+            return "TKN"
+
+        def fake_fetch(token, session=None):
+            state["fetch_calls"] += 1
+            if fail_first and state["fetch_calls"] == 1:
+                raise ms.Unauthorized("expired")
+            return list(raw), "SYNC"
+
+        monkeypatch.setattr(ms, "get_mobile_access_token", fake_token)
+        monkeypatch.setattr(ms, "fetch_all_fasts", fake_fetch)
+        return state
+
+    def test_retries_once_on_unauthorized_then_succeeds(self, monkeypatch):
+        raw = [_fast_item("a", "2026-01-01T10:00:00Z", "2026-01-01T18:00:00Z")["data"]]
+        state = self._patch(monkeypatch, raw, fail_first=True)
+        out = asyncio.run(server.mfp_get_fasts(server.GetFastsInput(response_format="json")))
+        d = json.loads(out)
+        assert d["count"] == 1 and d["total"] == 1
+        assert state["fetch_calls"] == 2
+        assert state["token_force"] == [False, True]  # the retry forced a refresh
+
+    def test_limit_slices_and_total_is_unfiltered_count(self, monkeypatch):
+        raw = [_fast_item(str(i), f"2026-01-0{i}T10:00:00Z", f"2026-01-0{i}T18:00:00Z")["data"]
+               for i in (1, 2, 3)]
+        self._patch(monkeypatch, raw)
+        out = asyncio.run(server.mfp_get_fasts(server.GetFastsInput(limit=2, response_format="json")))
+        d = json.loads(out)
+        assert d["count"] == 2 and d["total"] == 3
+        assert [f["id"] for f in d["fasts"]] == ["3", "2"]  # newest first
+
+    def test_markdown_branch(self, monkeypatch):
+        raw = [_fast_item("a", "2026-01-01T10:00:00Z", "2026-01-01T18:00:00Z")["data"]]
+        self._patch(monkeypatch, raw)
+        out = asyncio.run(server.mfp_get_fasts(server.GetFastsInput()))
+        assert out.startswith("## Fasting Entries")
+
+    def test_date_filter_applied(self, monkeypatch):
+        raw = [_fast_item(str(i), f"2026-01-0{i}T10:00:00Z", f"2026-01-0{i}T18:00:00Z")["data"]
+               for i in (1, 2, 3)]
+        self._patch(monkeypatch, raw)
+        out = asyncio.run(server.mfp_get_fasts(
+            server.GetFastsInput(start_date="2026-01-02", end_date="2026-01-02",
+                                 response_format="json")))
+        d = json.loads(out)
+        assert [f["id"] for f in d["fasts"]] == ["2"] and d["total"] == 3
+
+    def test_auth_error_is_surfaced_as_string(self, monkeypatch):
+        monkeypatch.setattr(ms, "_new_session", lambda: None)
+
+        def boom(**kw):
+            raise ms.MobileAuthError("no creds configured")
+
+        monkeypatch.setattr(ms, "get_mobile_access_token", boom)
+        out = asyncio.run(server.mfp_get_fasts(server.GetFastsInput()))
+        assert out.startswith("Error getting fasts") and "no creds configured" in out

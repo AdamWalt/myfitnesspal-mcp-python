@@ -3321,7 +3321,10 @@ class GetFastsInput(BaseModel):
         ge=1,
         description="Maximum number of entries to return (most recent first).",
     )
-    response_format: ResponseFormat = Field(default=ResponseFormat.MARKDOWN)
+    response_format: ResponseFormat = Field(
+        default=ResponseFormat.MARKDOWN,
+        description="Output format: 'markdown' (default) or 'json'.",
+    )
 
 
 @mcp.tool(
@@ -3467,12 +3470,13 @@ async def mfp_get_fasts(params: GetFastsInput) -> str:
         from mfp_mcp import mobile_sync
 
         def _work() -> List[Dict[str, Any]]:
-            token = mobile_sync.get_mobile_access_token()
+            session = mobile_sync._new_session()
+            token = mobile_sync.get_mobile_access_token(session=session)
             try:
-                raw, _sync = mobile_sync.fetch_all_fasts(token)
+                raw, _sync = mobile_sync.fetch_all_fasts(token, session=session)
             except mobile_sync.Unauthorized:
-                token = mobile_sync.get_mobile_access_token(force_refresh=True)
-                raw, _sync = mobile_sync.fetch_all_fasts(token)
+                token = mobile_sync.get_mobile_access_token(force_refresh=True, session=session)
+                raw, _sync = mobile_sync.fetch_all_fasts(token, session=session)
             return raw
 
         raw = await asyncio.to_thread(_work)

@@ -47,6 +47,10 @@ dependencies = [
     "pint>=0.22",
     "keyring>=24.0.0",
     "cryptography>=41.0.0",
+    # mobile_sync.py (fasting reads) talks to the mobile API over requests;
+    # the rest of the server already uses requests via the myfitnesspal session,
+    # but declare it explicitly rather than relying on that transitive edge.
+    "requests>=2.28.0",
 ]
 
 [project.optional-dependencies]

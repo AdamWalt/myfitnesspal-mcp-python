@@ -211,7 +211,10 @@ def client_credentials_token(session, client_id: str, client_secret: str) -> str
     )
     if r.status_code != 200:
         raise MobileAuthError(f"client_credentials grant failed: HTTP {r.status_code} {_detail(r)}")
-    return r.json()["access_token"]
+    token = r.json().get("access_token")
+    if not token:
+        raise MobileAuthError("client_credentials response did not include an access_token")
+    return token
 
 
 def authorize(session, client_id: str, client_secret: str, credentials_jwt: str) -> str:
@@ -257,6 +260,8 @@ def exchange_code(session, client_id: str, client_secret: str, app_token: str, c
     if r.status_code != 200:
         raise MobileAuthError(f"code exchange failed: HTTP {r.status_code} {_detail(r)}")
     j = r.json()
+    if not j.get("access_token"):
+        raise MobileAuthError("code exchange response did not include an access_token")
     return j["access_token"], j.get("refresh_token"), j.get("expires_in")
 
 
@@ -274,6 +279,8 @@ def refresh_access_token(session, client_id: str, client_secret: str, refresh_to
     if r.status_code != 200:
         raise MobileAuthError(f"token refresh failed: HTTP {r.status_code} {_detail(r)}")
     j = r.json()
+    if not j.get("access_token"):
+        raise MobileAuthError("token refresh response did not include an access_token")
     # Refresh tokens may rotate; keep the new one if provided.
     return j["access_token"], j.get("refresh_token") or refresh_token, j.get("expires_in")
 
@@ -377,11 +384,19 @@ def fetch_all_fasts(access_token: str, session=None, max_pages: int = 500
             raise RuntimeError(f"Fasting import failed: HTTP {r.status_code} {_detail(r)}")
 
         for item in r.json().get("items") or []:
-            if item.get("type") != "fasting_entry" or item.get("action") == "deleted":
+            if item.get("type") != "fasting_entry":
                 continue
             data = item.get("data") or {}
-            if data.get("id"):
-                by_id[data["id"]] = data
+            fid = data.get("id") or item.get("id")
+            if item.get("action") == "deleted":
+                # A tombstone removes a previously-accumulated entry. The import
+                # snapshot shouldn't mix states, but the endpoint is cursor-paged
+                # like the delta stream, so honour deletes rather than skip them.
+                if fid:
+                    by_id.pop(fid, None)
+                continue
+            if fid:
+                by_id[fid] = data
         pages += 1
 
         headers = r.headers
@@ -389,6 +404,12 @@ def fetch_all_fasts(access_token: str, session=None, max_pages: int = 500
         import_token = headers.get("next-import-token")
         if sync_token or not import_token:
             break
+    else:
+        # Exhausted max_pages without a terminating next-sync-token.
+        logger.warning(
+            "Fasting import stopped at max_pages=%d without completing; "
+            "returned data may be incomplete.", max_pages
+        )
 
     return list(by_id.values()), sync_token
 
@@ -400,9 +421,14 @@ def _parse_iso(ts: Optional[str]) -> Optional[datetime]:
     if not ts:
         return None
     try:
-        return datetime.fromisoformat(ts.replace("Z", "+00:00"))
+        dt = datetime.fromisoformat(ts.replace("Z", "+00:00"))
     except ValueError:
         return None
+    # A timestamp with no offset is treated as UTC, so date bucketing and
+    # duration math never silently depend on the host's local timezone.
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt
 
 
 def summarize_fast(data: Dict[str, Any]) -> Dict[str, Any]:
@@ -422,14 +448,23 @@ def summarize_fast(data: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
+_EPOCH = datetime.min.replace(tzinfo=timezone.utc)
+
+
 def filter_and_sort(fasts: List[Dict[str, Any]],
                     start: Optional[date] = None,
                     end: Optional[date] = None) -> List[Dict[str, Any]]:
-    """Filter by the UTC date of ``fast_started`` (inclusive) and sort newest first."""
+    """Filter by the UTC date of ``fast_started`` (inclusive) and sort newest first.
+
+    An entry with a missing/unparseable ``fast_started`` is kept when no date
+    filter is requested (and sorted last), so the returned count never silently
+    disagrees with the total; it is excluded only when a start/end bound is
+    given, since it cannot be placed on the timeline.
+    """
     def keep(f: Dict[str, Any]) -> bool:
         dt = _parse_iso(f.get("fast_started"))
         if dt is None:
-            return False
+            return start is None and end is None
         d = dt.astimezone(timezone.utc).date()
         if start and d < start:
             return False
@@ -438,7 +473,7 @@ def filter_and_sort(fasts: List[Dict[str, Any]],
         return True
 
     out = [f for f in fasts if keep(f)]
-    out.sort(key=lambda f: f.get("fast_started") or "", reverse=True)
+    out.sort(key=lambda f: _parse_iso(f.get("fast_started")) or _EPOCH, reverse=True)
     return out
 
 
