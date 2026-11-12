@@ -8,7 +8,7 @@ water intake, and food search.
 Authentication Methods (in order of priority):
 1. Environment variables: MFP_USERNAME and MFP_PASSWORD
 2. Stored session cookies: ~/.mfp_mcp/cookies.json
-3. Chromium-based browser cookies (macOS): Arc, Chrome, Edge, Brave, Vivaldi,
+3. Chromium-based browser cookies (macOS): Arc, Dia, Chrome, Edge, Brave, Vivaldi,
    Opera, and any other installed Chromium browser detected via the keychain
    "Safe Storage" entry.
 4. browser_cookie3 fallback (legacy Chrome/Firefox paths on any OS)
@@ -157,7 +157,7 @@ def dict_to_cookiejar(cookies_dict: Dict[str, str], domain: str = ".myfitnesspal
 # Chromium Browser Cookie Extraction (macOS)
 # ============================================================================
 #
-# Chromium-based browsers (Arc, Chrome, Edge, Brave, Vivaldi, Opera, ...)
+# Chromium-based browsers (Arc, Dia, Chrome, Edge, Brave, Vivaldi, Opera, ...)
 # store cookies in a SQLite database with each value encrypted using
 # AES-128-CBC. The encryption key is derived from a per-browser password
 # stored in the macOS Keychain under a service name like
@@ -174,6 +174,8 @@ def dict_to_cookiejar(cookies_dict: Dict[str, str], domain: str = ".myfitnesspal
 _CHROMIUM_COOKIES_PATHS_MACOS: Dict[str, List[str]] = {
     "Arc":            ["Arc/User Data/Default/Network/Cookies",
                        "Arc/User Data/Default/Cookies"],
+    "Dia":            ["Dia/User Data/Default/Network/Cookies",
+                       "Dia/User Data/Default/Cookies"],
     "Chrome":         ["Google/Chrome/Default/Network/Cookies",
                        "Google/Chrome/Default/Cookies"],
     "Chromium":       ["Chromium/Default/Network/Cookies",
@@ -192,6 +194,7 @@ _CHROMIUM_COOKIES_PATHS_MACOS: Dict[str, List[str]] = {
 # mapped to the canonical "Safe Storage" service prefix.
 _CHROMIUM_BROWSER_ALIASES: Dict[str, str] = {
     "arc": "Arc",
+    "dia": "Dia",
     "chrome": "Chrome",
     "chromium": "Chromium",
     "edge": "Microsoft Edge",
@@ -608,7 +611,7 @@ def authenticate_with_credentials(username: str, password: str) -> Dict[str, str
                 "Login appeared to fail — response contained no session token. "
                 "MyFitnessPal's form login flow does not work against the "
                 "current NextAuth backend. Log into myfitnesspal.com in any "
-                "Chromium-based browser (Arc, Chrome, Edge, Brave, ...) and "
+                "Chromium-based browser (Arc, Dia, Chrome, Edge, Brave, ...) and "
                 "the MCP will pick up the session automatically."
             )
                 
@@ -627,7 +630,7 @@ def get_mfp_client():
        a. First tries previously-cached cookies for this user.
        b. Then falls back to form login (only useful on legacy accounts).
     2. Stored session cookies (~/.mfp_mcp/cookies.json)
-    3. Chromium-based browser cookies (macOS): auto-discovers Arc, Chrome,
+    3. Chromium-based browser cookies (macOS): auto-discovers Arc, Dia, Chrome,
        Edge, Brave, Vivaldi, Opera, or any other installed Chromium browser
        via the keychain's "Safe Storage" entries.
     4. `browser_cookie3` default fallback (legacy Chrome/Firefox paths).
@@ -740,7 +743,7 @@ def get_mfp_client():
             f"All authentication methods failed. Last error: {str(last_error)}\n\n"
             "Please try one of these solutions:\n"
             "1. Log into myfitnesspal.com in any Chromium-based browser "
-            "(Arc, Chrome, Edge, Brave, Vivaldi, Opera, ...) — the MCP will "
+            "(Arc, Dia, Chrome, Edge, Brave, Vivaldi, Opera, ...) — the MCP will "
             "auto-discover the session on macOS.\n"
             "2. Set MFP_USERNAME and MFP_PASSWORD in Claude Desktop config "
             "(legacy form-login flow; rarely works against the current "
@@ -2878,7 +2881,7 @@ def refresh_browser_cookies(browser: str = "auto") -> str:
     Args:
         browser: Source to extract cookies from. Options:
                  - 'auto' (default): scan every installed Chromium-based
-                   browser on macOS (Arc, Chrome, Edge, Brave, Vivaldi,
+                   browser on macOS (Arc, Dia, Chrome, Edge, Brave, Vivaldi,
                    Opera, ...) and use the first one with a valid session.
                  - 'arc', 'chrome', 'chromium', 'edge', 'brave', 'vivaldi',
                    'opera': force a specific Chromium browser (macOS).
@@ -2896,7 +2899,7 @@ def refresh_browser_cookies(browser: str = "auto") -> str:
             return (
                 "Auto-discovery did not find a Chromium browser with a "
                 "valid MyFitnessPal session. Log into myfitnesspal.com in "
-                "Arc, Chrome, Edge, Brave, Vivaldi, or Opera, then retry. "
+                "Arc, Dia, Chrome, Edge, Brave, Vivaldi, or Opera, then retry. "
                 "(macOS only — on Linux/Windows, pass 'chrome' or "
                 "'firefox' instead.)"
             )
