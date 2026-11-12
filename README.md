@@ -17,8 +17,8 @@ A [Model Context Protocol (MCP)](https://modelcontextprotocol.io/) server that e
 | `mfp_get_measurements` | Read | Get weight/body measurement history |
 | `mfp_set_measurement` | Write | Log a new weight or body measurement |
 | `mfp_get_exercises` | Read | Get logged exercises (cardio & strength) |
-| `mfp_get_goals` | Read | Get daily nutrition goals |
-| `mfp_set_goals` | Write | Update daily nutrition goals |
+| `mfp_get_goals` | Read | Get nutrition goals (per-day with `all_days`) |
+| `mfp_set_goals` | Write | Update nutrition goals (whole week or a single day) |
 | `mfp_get_water` | Read | Get water intake for a date |
 | `mfp_set_water` | Write | Log water intake for a date |
 | `mfp_get_steps` | Read | Get daily step counts synced from Apple Health / devices |
@@ -749,16 +749,18 @@ Get exercise log for a date.
 - `response_format`: "markdown" or "json"
 
 ### mfp_get_goals
-Get daily nutrition goals.
+Get nutrition goals. By default returns the goal that applies on `date` (MyFitnessPal resolves the weekday for you).
 - `date` (optional): YYYY-MM-DD (default today)
+- `all_days` (optional): when true, return the full weekly breakdown — all 7 weekdays plus the default goal — for accounts that set different goals per day (Premium)
 - `response_format`: "markdown" or "json"
 
 ### mfp_set_goals
-Update nutrition goals.
+Update nutrition goals. Read-modify-write: only the nutrients you pass change; the micronutrient targets, the exercise split, and (when setting one day) the other six days are all preserved.
 - `calories` (optional): Daily calorie goal
 - `protein` (optional): Daily protein in grams
 - `carbohydrates` (optional): Daily carbs in grams
 - `fat` (optional): Daily fat in grams
+- `day` (optional): weekday to update (e.g. `monday`), for Premium accounts with different goals per day. Omit to set every day of the week (and the default) to the same values.
 
 ### mfp_get_water
 Get water intake for a date.
