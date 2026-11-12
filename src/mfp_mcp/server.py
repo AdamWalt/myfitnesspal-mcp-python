@@ -2315,6 +2315,11 @@ async def mfp_get_exercises(params: GetExercisesInput) -> str:
 # Server-computed fields, dropped before POST so the server recomputes them.
 _GOAL_SERVER_FIELDS = ("valid_to", "default_group_id", "updated_at")
 
+# MyFitnessPal stores energy in the account's unit. The `calories` input is
+# always kcal, so convert when the stored goal is in kilojoules. 1 kcal = 4.184
+# kJ (the factor MyFitnessPal's own web client uses).
+_KJ_PER_KCAL = 4.184
+
 
 def fetch_nutrient_goals(client, on_date: Optional[date] = None) -> Dict[str, Any]:
     """
@@ -2347,12 +2352,16 @@ def fetch_nutrient_goals(client, on_date: Optional[date] = None) -> Dict[str, An
 def _apply_one_goal(goal: Dict[str, Any], overrides: Dict[str, int]) -> None:
     """Mutate a single goal dict in place with the provided nutrient values.
 
-    Only the keys present in `overrides` are touched; `calories` maps to the
-    nested energy.value and keeps the stored energy unit.
+    Only the keys present in `overrides` are touched. `calories` (always kcal)
+    maps to the nested energy.value, converted to kilojoules when the stored
+    goal is in kJ so the account's unit is preserved.
     """
     if "calories" in overrides:
         energy = goal.setdefault("energy", {})
-        energy["value"] = overrides["calories"]
+        value: float = overrides["calories"]
+        if energy.get("unit") == "kilojoules":
+            value = round(value * _KJ_PER_KCAL)
+        energy["value"] = value
         energy.setdefault("unit", "calories")
     for key in ("protein", "carbohydrates", "fat"):
         if key in overrides:
@@ -2380,6 +2389,12 @@ def build_nutrient_goals_payload(
         RuntimeError: If `day` is given but absent from the weekly goals.
     """
     item = copy.deepcopy(current)
+    if not item.get("daily_goals") and not item.get("default_goal"):
+        # A full-replace POST of an empty item would wipe every goal; never
+        # write one. The live API always returns a populated item.
+        raise RuntimeError(
+            "Current goal set is empty; refusing to write (would clear all goals)."
+        )
     for field in _GOAL_SERVER_FIELDS:
         item.pop(field, None)
     for g in item.get("daily_goals", []):
@@ -2461,6 +2476,45 @@ def goal_week_summary(item: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
+def _fmt_num(n: Any) -> str:
+    """Drop a trailing .0 so whole numbers read cleanly (2359.0 -> 2359)."""
+    if isinstance(n, float) and n.is_integer():
+        return str(int(n))
+    return str(n)
+
+
+def _goal_row_line(row: Dict[str, Any]) -> str:
+    """One compact human line for a goal row (day or default). Pure."""
+    cal = row.get("calories")
+    unit = row.get("energy_unit") or "cal"
+    parts = [f"{_fmt_num(cal)} {unit}" if cal is not None else "no energy"]
+    macros = " / ".join(
+        f"{_fmt_num(row.get(k))}{abbr}"
+        for k, abbr in (("carbohydrates", "C"), ("protein", "P"), ("fat", "F"))
+        if row.get(k) is not None
+    )
+    if macros:
+        parts.append(macros + " g")
+    extras = ", ".join(
+        f"{label} {_fmt_num(row.get(k))}"
+        for k, label in (("sodium", "Na"), ("sugar", "sugar"), ("fiber", "fiber"))
+        if row.get(k) is not None
+    )
+    line = ", ".join(parts)
+    return f"{line} ({extras})" if extras else line
+
+
+def _goals_week_markdown(date_str: str, summary: Dict[str, Any]) -> str:
+    """Render the weekly goal summary as readable markdown (one line per day)."""
+    lines = ["## Weekly Nutrition Goals\n", f"- **date**: {date_str}"]
+    if summary.get("valid_from"):
+        lines.append(f"- **valid_from**: {summary['valid_from']}")
+    lines.append(f"- **default**: {_goal_row_line(summary['default'])}")
+    for day, row in summary["days"].items():
+        lines.append(f"- **{day}**: {_goal_row_line(row)}")
+    return "\n".join(lines)
+
+
 @mcp.tool(
     name="mfp_get_goals",
     annotations={
@@ -2494,8 +2548,10 @@ async def mfp_get_goals(params: GetGoalsInput) -> str:
 
         if params.all_days:
             item = await asyncio.to_thread(fetch_nutrient_goals, client, target_date)
-            data = {"date": str(target_date), **goal_week_summary(item)}
-            return format_response(data, params.response_format, "Weekly Nutrition Goals")
+            summary = goal_week_summary(item)
+            if params.response_format == ResponseFormat.MARKDOWN:
+                return _goals_week_markdown(str(target_date), summary)
+            return json.dumps({"date": str(target_date), **summary}, indent=2)
 
         day = client.get_date(target_date)
         data = {"date": str(target_date), "goals": day.goals}

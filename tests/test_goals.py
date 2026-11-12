@@ -95,15 +95,21 @@ class TestApplyOneGoal:
         server._apply_one_goal(g, {"calories": 2000})
         assert g["energy"] == {"value": 2000, "unit": "calories"}
 
-    def test_calories_preserves_existing_unit(self):
+    def test_calories_converted_when_goal_is_kilojoules(self):
+        # `calories` is always kcal; a kJ account keeps its unit, value converted.
         g = {"energy": {"value": 1, "unit": "kilojoules"}}
-        server._apply_one_goal(g, {"calories": 9872})
-        assert g["energy"] == {"value": 9872, "unit": "kilojoules"}
+        server._apply_one_goal(g, {"calories": 2000})
+        assert g["energy"] == {"value": round(2000 * 4.184), "unit": "kilojoules"}
 
     def test_only_provided_macros_change(self):
         g = {"carbohydrates": 100, "protein": 100, "fat": 100}
         server._apply_one_goal(g, {"protein": 200})
         assert g == {"carbohydrates": 100, "protein": 200, "fat": 100}
+
+    def test_zero_is_written_not_skipped(self):
+        g = {"protein": 150}
+        server._apply_one_goal(g, {"protein": 0})
+        assert g == {"protein": 0}
 
 
 class TestBuildPayload:
@@ -154,6 +160,27 @@ class TestBuildPayload:
         with pytest.raises(RuntimeError, match="No monday entry"):
             server.build_nutrient_goals_payload(item, day="monday", overrides={"calories": 2500})
 
+    def test_flat_preserves_default_micros(self):
+        item = server.build_nutrient_goals_payload(
+            current_item(), day=None, overrides={"calories": 2500}
+        )["item"]
+        assert item["default_goal"]["sodium"] == 2300
+        assert item["default_goal"]["fiber"] == 38
+        assert item["default_goal"]["energy"]["value"] == 2500
+
+    def test_per_day_zero_is_written(self):
+        item = server.build_nutrient_goals_payload(
+            current_item(), day="monday", overrides={"protein": 0}
+        )["item"]
+        assert _day(item, "monday")["protein"] == 0
+        assert _day(item, "tuesday")["protein"] == 182  # other days untouched
+
+    def test_empty_goal_set_refused(self):
+        with pytest.raises(RuntimeError, match="refusing to write"):
+            server.build_nutrient_goals_payload(
+                {"daily_goals": []}, day=None, overrides={"calories": 2500}
+            )
+
 
 class _Resp:
     def __init__(self, status, body):
@@ -172,10 +199,12 @@ class _GoalsClient:
 
     def __init__(self, get_body, get_status=200, post_status=200, post_body=None):
         self.posted = None
+        self.get_params = None
         outer = self
 
         class _Session:
             def get(self, url, params=None, headers=None, timeout=None):
+                outer.get_params = params
                 return _Resp(get_status, get_body)
 
             def post(self, url, headers=None, data=None, timeout=None):
@@ -203,6 +232,11 @@ class TestFetchNutrientGoals:
         with pytest.raises(RuntimeError, match="Could not fetch nutrient goals"):
             server.fetch_nutrient_goals(c)
 
+    def test_sends_date_param(self):
+        c = _GoalsClient({"items": [current_item()]})
+        server.fetch_nutrient_goals(c, datetime.date(2026, 3, 9))
+        assert c.get_params == {"date": "2026-03-09"}
+
 
 class TestSetNutrientGoals:
     def test_reads_modifies_and_posts(self):
@@ -224,6 +258,12 @@ class TestSetNutrientGoals:
         )
         with pytest.raises(RuntimeError, match="Failed to update nutrition goals"):
             server.set_nutrient_goals(c, day=None, overrides={"calories": 2500})
+
+    def test_reread_fallback_when_post_omits_item(self):
+        # If the POST response has no "item", fall back to a fresh GET.
+        c = _GoalsClient({"items": [current_item()]}, post_body={})
+        saved = server.set_nutrient_goals(c, day="monday", overrides={"calories": 3000})
+        assert saved["valid_from"] == "2026-11-01"  # came from the re-read GET
 
 
 class TestGoalWeekSummary:
@@ -285,3 +325,14 @@ class TestGetGoalsTool:
         )
         assert out["default"]["calories"] == 2359
         assert out["days"]["sunday"]["calories"] == 2799
+
+    def test_all_days_markdown_is_readable(self, monkeypatch):
+        monkeypatch.setattr(server, "get_mfp_client", lambda: object())
+        monkeypatch.setattr(
+            server, "fetch_nutrient_goals", lambda client, on_date=None: current_item()
+        )
+        out = asyncio.run(server.mfp_get_goals(server.GetGoalsInput(all_days=True)))
+        assert out.startswith("## Weekly Nutrition Goals")
+        assert "- **monday**:" in out and "- **sunday**:" in out
+        assert "{" not in out  # no raw Python dict repr leaks through
+        assert "2799" in out  # sunday's calories rendered
