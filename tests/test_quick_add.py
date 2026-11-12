@@ -34,6 +34,9 @@ def _patch(
         return {"id": food_id, "status": 200, "description": spec["description"]}
 
     def fake_add(client, mfp_id, meal, target_date, quantity=1.0, unit=None):
+        # Enforce create -> log -> delete ordering: the backing food must still
+        # exist when we log against it (a live read-back would 404 otherwise).
+        assert rec["deleted"] == [], "backing food deleted before the entry was logged"
         if add_exc:
             raise add_exc
         rec["add"] = {"mfp_id": mfp_id, "meal": meal, "quantity": quantity}
@@ -71,6 +74,13 @@ class TestQuickAddToDiary:
         assert s["country_code"] == "NL" and s["description"] == "Quick Add"
         assert rec["add"] == {"mfp_id": "F1", "meal": "during ride", "quantity": 1.0}
         assert rec["deleted"] == ["F1"]  # backing food made a throwaway
+
+    def test_custom_name_flows_to_description(self, monkeypatch):
+        rec = _patch(monkeypatch)
+        server.quick_add_to_diary(
+            object(), calories=150, meal="snacks", target_date=date(2026, 1, 1), name="Ride gel"
+        )
+        assert rec["spec"]["description"] == "Ride gel"
 
     def test_only_calories_omits_macro_keys(self, monkeypatch):
         rec = _patch(monkeypatch)
@@ -122,6 +132,25 @@ class TestQuickAddTool:
         assert out["success"] is True
         assert out["entry_id"] == "E9" and out["meal"] == "during ride"
         assert out["logged"] == {"calories": 337, "carbohydrates": 41, "protein": 23, "fat": 9}
+
+    def test_date_flows_through_to_helper_and_response(self, monkeypatch):
+        monkeypatch.setattr(server, "get_mfp_client", lambda: object())
+        seen = {}
+
+        def capture(client, **kw):
+            seen.update(kw)
+            return ("E2", kw["meal"])
+
+        monkeypatch.setattr(server, "quick_add_to_diary", capture)
+        out = json.loads(
+            asyncio.run(
+                server.mfp_quick_add(
+                    server.QuickAddInput(calories=100, meal="snacks", date="2026-03-09")
+                )
+            )
+        )
+        assert out["date"] == "2026-03-09"
+        assert seen["target_date"] == date(2026, 3, 9)
 
     def test_calories_is_required(self):
         with pytest.raises(ValidationError):

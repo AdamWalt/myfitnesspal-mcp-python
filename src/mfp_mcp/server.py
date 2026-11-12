@@ -1835,6 +1835,11 @@ def quick_add_to_diary(
     created = create_custom_food(client, spec)
     food_id = created.get("id")
     if not food_id:
+        # Rare: MFP returned success but no parseable id. The food may exist
+        # server-side, but with no id there is nothing to DELETE and no safe way
+        # to find it (matching by description could remove a real food of the
+        # same name), so we surface the error rather than guess. create_custom_food
+        # returns an id on every observed success, so this should not happen.
         raise RuntimeError("Quick Add food was created but MyFitnessPal returned no id")
 
     try:
