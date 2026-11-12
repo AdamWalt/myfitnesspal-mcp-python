@@ -3079,13 +3079,14 @@ async def mfp_delete_custom_food(params: DeleteCustomFoodInput) -> str:
 # ============================================================================
 #
 # MyFitnessPal's fasting feature lives at /v2/diary/fasting_entry. It supports
-# POST (create), PATCH (update), and DELETE — but NOT GET. There is no public
-# read/list endpoint: the mobile app hydrates its Fasting History screen via a
-# delta-sync channel (mobile-sync-api.myfitnesspal.com/v2.1/sync) that requires
-# a pre-issued sync_token, is scoped to the mobile OAuth client, and rejects
-# the web-session bearer we authenticate with. See the README for details.
+# POST (create), PATCH (update), and DELETE — but NOT GET. The web v2 API has
+# no fasting read/list endpoint.
 #
-# Reads therefore stay in the MFP app; the MCP owns writes.
+# Writes go here, on the web session. Reads come from the mobile sync service
+# instead: the iOS app hydrates its Fasting History from
+# mobile-sync-api.myfitnesspal.com, which only accepts a token minted for the
+# mobile OAuth client (the web-session bearer is rejected, HTTP 401). That read
+# path lives in mobile_sync.py and backs mfp_get_fasts; see the README.
 #
 # Schema (matches what the iOS app sends, verified 2026-08-07):
 #     {
@@ -3300,6 +3301,32 @@ class DeleteFastInput(BaseModel):
     response_format: ResponseFormat = Field(default=ResponseFormat.JSON)
 
 
+class GetFastsInput(BaseModel):
+    """Input for `mfp_get_fasts`."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    start_date: Optional[str] = Field(
+        default=None,
+        description="Only include fasts whose start date (UTC) is on or after this YYYY-MM-DD.",
+        pattern=r"^\d{4}-\d{2}-\d{2}$",
+    )
+    end_date: Optional[str] = Field(
+        default=None,
+        description="Only include fasts whose start date (UTC) is on or before this YYYY-MM-DD.",
+        pattern=r"^\d{4}-\d{2}-\d{2}$",
+    )
+    limit: Optional[int] = Field(
+        default=None,
+        ge=1,
+        description="Maximum number of entries to return (most recent first).",
+    )
+    response_format: ResponseFormat = Field(
+        default=ResponseFormat.MARKDOWN,
+        description="Output format: 'markdown' (default) or 'json'.",
+    )
+
+
 @mcp.tool(
     name="mfp_log_fast",
     annotations={
@@ -3402,6 +3429,73 @@ async def mfp_delete_fast(params: DeleteFastInput) -> str:
         return format_response(result, params.response_format, "Fast Deleted")
     except Exception as e:
         return f"Error deleting fast: {str(e)}"
+
+
+@mcp.tool(
+    name="mfp_get_fasts",
+    annotations={
+        "title": "Get Fasting History",
+        "readOnlyHint": True,
+        "destructiveHint": False,
+        "idempotentHint": True,
+        "openWorldHint": True,
+    },
+)
+async def mfp_get_fasts(params: GetFastsInput) -> str:
+    """
+    List intermittent-fasting entries with their start and end times.
+
+    This is the read counterpart to mfp_log_fast / mfp_update_fast /
+    mfp_delete_fast. MyFitnessPal's web API has no fasting read endpoint, so
+    this reads from the mobile sync service, which needs a MOBILE OAuth token
+    distinct from the web/cookie session the other tools use. Configuration:
+
+    - MFP_MOBILE_CLIENT_ID / MFP_MOBILE_CLIENT_SECRET (environment or the
+      'mfp-mcp' keychain) — the mobile app's client credentials.
+    - MFP_USERNAME / MFP_PASSWORD — needed ONCE to bootstrap; the resulting
+      refresh token is stored in the keychain and the password is not kept.
+
+    Each entry reports fast_started / fast_ended (UTC ISO 8601), whether it is
+    ongoing (no end set), the duration in hours, and its id. Results are newest
+    first and can be narrowed with start_date / end_date (by UTC start date)
+    and limit.
+
+    Args:
+        params: GetFastsInput (start_date?, end_date?, limit?, response_format)
+
+    Returns:
+        str: The matching fasts, plus the account total when a filter narrows them
+    """
+    try:
+        from mfp_mcp import mobile_sync
+
+        def _work() -> List[Dict[str, Any]]:
+            session = mobile_sync._new_session()
+            token = mobile_sync.get_mobile_access_token(session=session)
+            try:
+                raw, _sync = mobile_sync.fetch_all_fasts(token, session=session)
+            except mobile_sync.Unauthorized:
+                token = mobile_sync.get_mobile_access_token(force_refresh=True, session=session)
+                raw, _sync = mobile_sync.fetch_all_fasts(token, session=session)
+            return raw
+
+        raw = await asyncio.to_thread(_work)
+        all_fasts = [mobile_sync.summarize_fast(d) for d in raw]
+        total = len(all_fasts)
+
+        start = date.fromisoformat(params.start_date) if params.start_date else None
+        end = date.fromisoformat(params.end_date) if params.end_date else None
+        fasts = mobile_sync.filter_and_sort(all_fasts, start, end)
+        if params.limit:
+            fasts = fasts[: params.limit]
+
+        if params.response_format == ResponseFormat.MARKDOWN:
+            return mobile_sync.fasts_markdown(fasts, total=total)
+        return json.dumps(
+            {"count": len(fasts), "total": total, "fasts": fasts}, indent=2
+        )
+    except Exception as e:
+        return f"Error getting fasts: {str(e)}"
 
 
 def main():

@@ -25,6 +25,7 @@ A [Model Context Protocol (MCP)](https://modelcontextprotocol.io/) server that e
 | `mfp_log_fast` | Write | Log a completed intermittent fasting window (start + end) |
 | `mfp_update_fast` | Write | Update the start/end times of an existing fasting entry |
 | `mfp_delete_fast` | Write | Delete a fasting entry by id |
+| `mfp_get_fasts` | Read | List fasting history (start/end times, durations, ongoing) — needs mobile auth |
 | `mfp_get_report` | Read | Get nutrition reports over a date range |
 | `refresh_browser_cookies` | Utility | Extract and save session cookies from browser |
 
@@ -46,11 +47,11 @@ but MyFitnessPal can change it without notice. They have already done so once: t
 originally posted to `/food/diary/{user}/add`, which now returns 404, leaving food logging
 broken. If logging starts failing, that is the most likely cause.
 
-## How fasting works (write-only)
+## How fasting works (read + write)
 
-**Fasting tools** (`mfp_log_fast`, `mfp_update_fast`, `mfp_delete_fast`) POST / PATCH /
-DELETE against `/v2/diary/fasting_entry` on the same v2 JSON API. Payloads match the
-shape captured from the iOS app:
+**Writes** (`mfp_log_fast`, `mfp_update_fast`, `mfp_delete_fast`) POST / PATCH / DELETE
+against `/v2/diary/fasting_entry` on the v2 JSON API, using the same web session as the
+other tools. Payloads match the shape captured from the iOS app:
 
 ```json
 {"items": [{
@@ -65,15 +66,36 @@ Ids are client-generated UUIDv4s in uppercase (the iOS convention). The MCP auto
 one when you omit `id` from `mfp_log_fast`; save the returned id if you plan to update or
 delete the entry.
 
-**There is no read endpoint.** MFP exposes no GET for fasting entries — `GET /v2/diary/fasting_entry`
-returns `405 Method Not Allowed`. The mobile app populates its Fasting History screen via a
-delta-sync channel (`mobile-sync-api.myfitnesspal.com/v2.1/sync`) that requires a pre-issued
-sync token, is scoped to the mobile OAuth client, and rejects the web-session bearer this
-server authenticates with. You'll continue to read fasting history in the MFP app itself
-until Under Armour publishes something.
+**Reads** (`mfp_get_fasts`) come from a different source. The v2 web API has no fasting read
+endpoint (`GET /v2/diary/fasting_entry` → `405`), so this reads the app's own backend:
+`GET mobile-sync-api.myfitnesspal.com/v2.1/import?filter[]=fasting_entry` returns the full
+history, paged on the `next-import-token` response header. That host only accepts a token
+minted for the **mobile** OAuth client — the web-session bearer the write tools use is
+rejected there (`401`) — so `mfp_get_fasts` performs a separate mobile login. It is the only
+tool that needs the mobile credentials below; everything else keeps using the web session.
 
-The write tools are still useful for automating log-entry (e.g. inferring fasts from your
-Garmin sleep window + first-meal timestamp) or correcting entries programmatically.
+### Enabling fasting reads (mobile auth)
+
+`mfp_get_fasts` needs the MyFitnessPal **mobile app's** OAuth client credentials. This server
+does **not** ship them — provide your own:
+
+- Set `MFP_MOBILE_CLIENT_ID` and `MFP_MOBILE_CLIENT_SECRET` as environment variables, or store
+  them in the OS keychain (service `mfp-mcp`, accounts `MFP_MOBILE_CLIENT_ID` /
+  `MFP_MOBILE_CLIENT_SECRET`).
+
+Then bootstrap a session once, with `MFP_USERNAME` / `MFP_PASSWORD` available (env, or you'll
+be prompted):
+
+```bash
+python scripts/mfp_mobile_login.py
+```
+
+This performs the mobile OAuth login and stores only the resulting **refresh token** in the
+keychain (`MFP_MOBILE_REFRESH_TOKEN`); your password is never persisted. Afterwards
+`mfp_get_fasts` refreshes the access token on its own — no password needed again.
+
+The write tools remain useful without any of this (e.g. inferring fasts from your Garmin
+sleep window + first-meal timestamp, or correcting entries programmatically).
 
 ## Prerequisites
 
@@ -500,10 +522,12 @@ myfitnesspal-mcp-python/
 ├── pyproject.toml          # Python package configuration
 ├── README.md               # This file
 ├── scripts/
-│   └── store-key.ts        # One-time key management CLI
+│   ├── store-key.ts        # One-time key management CLI
+│   └── mfp_mobile_login.py # One-time mobile-auth bootstrap (fasting reads)
 └── src/
     └── mfp_mcp/
         ├── __init__.py     # Package initialization
+        ├── mobile_sync.py  # Mobile OAuth + fasting-history reader
         └── server.py       # MCP server implementation
 ```
 
