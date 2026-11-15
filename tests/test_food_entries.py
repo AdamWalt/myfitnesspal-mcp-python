@@ -34,6 +34,7 @@ def _entry(**overrides):
             "carbohydrates": 17.274699653625486,
             "fat": 0.21307999572753908,
             "protein": 0.5631399887084961,
+            "fiber": 1.9786000251770018,
             "sodium": 0.761,
             "sugar": 9.3,
         },
@@ -132,6 +133,11 @@ class TestFoodEntrySummary:
         assert summary["carbohydrates"] == 17.3
         assert summary["fat"] == 0.2
         assert summary["protein"] == 0.6
+
+    def test_fiber_is_included_like_the_other_nutrients(self):
+        """Fiber is a first-class nutrient elsewhere (mfp_create_custom_food)."""
+        assert server._food_entry_summary(_entry())["fiber"] == 2.0
+        assert server._food_entry_summary(_entry(nutritional_contents={}))["fiber"] is None
 
     def test_energy_unit_is_reported_not_assumed(self):
         """The v2 diary also emits kilojoules (see steps_aggregate), so the

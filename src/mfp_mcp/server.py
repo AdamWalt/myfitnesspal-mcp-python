@@ -2563,7 +2563,7 @@ async def mfp_get_steps(params: GetStepsInput) -> str:
 # this payload: created_at matched the app for one such entry and was over
 # two hours later for another, so the fields are passed through as-is and
 # never substituted for each other.
-_ENTRY_NUTRIENTS = ("carbohydrates", "fat", "protein", "sodium", "sugar")
+_ENTRY_NUTRIENTS = ("carbohydrates", "fat", "protein", "fiber", "sodium", "sugar")
 
 
 def _round_or_none(value: Optional[float]) -> Optional[float]:

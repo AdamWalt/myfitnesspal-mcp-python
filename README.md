@@ -669,7 +669,7 @@ List a day's individual food entries, one record per logged food, with the times
 - `date` (optional): YYYY-MM-DD format, defaults to today
 - `response_format`: "markdown" or "json"
 
-Each entry has `id`, `meal`, `name`, `brand`, `quantity`, `unit`, `energy`, `energy_unit`, macros, and four time fields:
+Each entry has `id`, `meal`, `name`, `brand`, `quantity`, `unit`, `energy`, `energy_unit`, macros (plus `fiber`, `sodium`, `sugar`), and four time fields. The `id` is the entry's v2 diary id: pass it as `entry_id` to `mfp_remove_food_from_diary` to delete exactly that entry.
 
 | Field | Example | Meaning |
 |-------|---------|---------|
