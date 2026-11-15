@@ -95,6 +95,12 @@ class TestApplyOneGoal:
         server._apply_one_goal(g, {"calories": 2000})
         assert g["energy"] == {"value": 2000, "unit": "calories"}
 
+    def test_calories_on_a_goal_whose_energy_is_null(self):
+        g = {"energy": None, "protein": 100}
+        server._apply_one_goal(g, {"calories": 2000})
+        assert g["energy"] == {"value": 2000, "unit": "calories"}
+        assert g["protein"] == 100  # no old energy to scale from
+
     def test_calories_converted_when_goal_is_kilojoules(self):
         # `calories` is always kcal; a kJ account keeps its unit, value converted.
         g = {"energy": {"value": 1, "unit": "kilojoules"}}
@@ -160,6 +166,9 @@ class TestBuildPayload:
         ) == (272, 193, 71)
         assert mon["sodium"] == 2300 and mon["potassium"] == 3500
         assert mon["exercise_carbohydrates_percentage"] == 43
+        # The default goal is rescaled with the days, not left at the old split.
+        default = item["default_goal"]
+        assert (default["carbohydrates"], default["protein"], default["fat"]) == (272, 193, 71)
 
     def test_per_day_calories_only_rescales_just_that_day(self):
         item = server.build_nutrient_goals_payload(
@@ -313,7 +322,52 @@ class TestSetNutrientGoals:
             server.set_nutrient_goals(c, day="monday", overrides={"calories": 3000})
         msg = str(ei.value)
         assert "did not keep the monday goal" in msg
-        assert "sent 3000, saved 2359" in msg and "Premium" in msg
+        assert "monday energy: sent 3000, saved 2359" in msg and "Premium" in msg
+        # The write was accepted, so the message must not imply nothing happened.
+        assert "accepted the write" in msg and "mfp_get_goals" in msg
+
+    def _saved_matching(self, **monday):
+        """What MFP echoes for monday=3000 kcal, with optional deviations."""
+        saved = current_item()
+        mon = _day(saved, "monday")
+        mon["energy"]["value"] = 3000.0
+        mon["carbohydrates"], mon["protein"], mon["fat"] = 327.0, 231.0, 85.0
+        mon.update(monday)
+        return saved
+
+    def _set_monday(self, saved):
+        c = _GoalsClient({"items": [current_item()]}, post_body={"item": saved})
+        return server.set_nutrient_goals(c, day="monday", overrides={"calories": 3000})
+
+    def test_per_day_check_catches_a_macro_only_mismatch(self):
+        # Energy kept, a macro not: comparing energy alone would miss this.
+        with pytest.raises(RuntimeError, match="monday protein: sent 231, saved 200"):
+            self._set_monday(self._saved_matching(protein=200.0))
+
+    def test_per_day_check_tolerates_only_rounding(self):
+        self._set_monday(self._saved_matching(protein=231.4))  # within 0.5 g
+        with pytest.raises(RuntimeError, match="monday protein"):
+            self._set_monday(self._saved_matching(protein=232.0))  # a real difference
+
+    def test_per_day_check_catches_a_missing_saved_value(self):
+        with pytest.raises(RuntimeError, match="monday fat: sent 85"):
+            self._set_monday(self._saved_matching(fat=None))
+
+    def test_per_day_check_catches_the_week_being_flattened(self):
+        # A free account might apply the one value to every day: monday then
+        # matches, and only the other days give it away.
+        saved = self._saved_matching()
+        tue = _day(saved, "tuesday")
+        tue["energy"]["value"] = 3000.0
+        with pytest.raises(RuntimeError) as ei:
+            self._set_monday(saved)
+        assert "tuesday energy: sent 2359, saved 3000" in str(ei.value)
+
+    def test_per_day_check_catches_an_energy_unit_change(self):
+        saved = self._saved_matching()
+        _day(saved, "monday")["energy"]["unit"] = "kilojoules"
+        with pytest.raises(RuntimeError, match="monday energy unit"):
+            self._set_monday(saved)
 
     def test_per_day_write_passes_when_saved_matches_as_floats(self):
         # Live, MyFitnessPal echoes what was sent as floats (3000 -> 3000.0).

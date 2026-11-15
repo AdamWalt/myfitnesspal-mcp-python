@@ -2363,14 +2363,16 @@ def _apply_one_goal(goal: Dict[str, Any], overrides: Dict[str, int]) -> None:
 
     Calories-only update: when `calories` is the only override, the three macro
     gram targets are rescaled by the same factor as the energy (rounded to whole
-    grams), so the macro split is kept and macros still add up to the new
-    energy. That is what MyFitnessPal's own goal editor does, and what this tool
+    grams), so the macro split is kept and the macros follow the new energy (to
+    within that rounding). That is what MyFitnessPal's own goal editor does, and
+    what this tool
     did while it delegated to python-myfitnesspal's `set_new_goal`. Passing any
     macro explicitly turns the rescale off: the given values are written as-is
     and the other macros are left alone. Micronutrients are never rescaled.
     """
     if "calories" in overrides:
-        energy = goal.setdefault("energy", {})
+        energy = goal.get("energy") or {}
+        goal["energy"] = energy
         old_value = energy.get("value")
         value: float = overrides["calories"]
         if energy.get("unit") == "kilojoules":
@@ -2453,36 +2455,47 @@ def _goal_numbers(goal: Dict[str, Any]) -> Dict[str, Any]:
 def _check_day_was_kept(
     day: str, sent_item: Dict[str, Any], saved_item: Dict[str, Any]
 ) -> None:
-    """Raise if MyFitnessPal's saved copy of `day` is not what was sent.
+    """Raise if MyFitnessPal's saved week is not the week that was sent.
 
     Different goals per weekday are a Premium feature. What a free account does
-    with a per-day write (reject, ignore, or override it) has not been observed,
-    so rather than assume, compare what came back: if the weekday does not hold
-    the values that were sent, say so instead of reporting success. On Premium
-    the saved item echoes the sent values exactly (verified live).
+    with a per-day write (reject it, ignore it, or flatten the week to one
+    value) has not been observed, so rather than assume, compare what came
+    back: every weekday — the one being set and the six carried forward — must
+    hold the energy, energy unit and macros that were sent. If not, say so
+    instead of reporting success. On Premium the saved item echoes the sent
+    values exactly (verified live).
+
+    By the time this runs the write has been accepted, so the error says the
+    stored goals may have changed rather than implying nothing happened.
     """
 
-    def pick(item: Dict[str, Any]) -> Dict[str, Any]:
-        return next(
-            (g for g in item.get("daily_goals", []) if g.get("day_of_week") == day), {}
-        )
+    def by_day(item: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
+        return {g.get("day_of_week"): g for g in item.get("daily_goals", [])}
 
-    want, got = _goal_numbers(pick(sent_item)), _goal_numbers(pick(saved_item))
-    differing = [
-        key
-        for key, value in want.items()
-        if value is not None
-        and (got.get(key) is None or abs(float(got[key]) - float(value)) > 0.5)
-    ]
+    sent_days, saved_days = by_day(sent_item), by_day(saved_item)
+    differing: List[str] = []
+    # The requested day first, so it leads the message.
+    for name in sorted(sent_days, key=lambda n: n != day):
+        sent_goal, saved_goal = sent_days[name], saved_days.get(name) or {}
+        want, got = _goal_numbers(sent_goal), _goal_numbers(saved_goal)
+        for key, value in want.items():
+            if value is None:
+                continue
+            if got.get(key) is None or abs(float(got[key]) - float(value)) > 0.5:
+                differing.append(
+                    f"{name} {key}: sent {_fmt_num(value)}, saved {_fmt_num(got.get(key))}"
+                )
+        sent_unit = (sent_goal.get("energy") or {}).get("unit")
+        saved_unit = (saved_goal.get("energy") or {}).get("unit")
+        if sent_unit and saved_unit and sent_unit != saved_unit:
+            differing.append(f"{name} energy unit: sent {sent_unit}, saved {saved_unit}")
     if differing:
-        detail = ", ".join(
-            f"{key}: sent {_fmt_num(want[key])}, saved {_fmt_num(got.get(key))}"
-            for key in differing
-        )
         raise RuntimeError(
-            f"MyFitnessPal did not keep the {day} goal as sent ({detail}). "
-            "Different goals per weekday need MyFitnessPal Premium; without it a "
-            "per-day value is ignored or overridden. Omit `day` to set the whole week."
+            f"MyFitnessPal accepted the write but did not keep the {day} goal as sent "
+            f"({'; '.join(differing)}). Different goals per weekday need MyFitnessPal "
+            "Premium; without it a per-day value is ignored or overridden. The stored "
+            "goals may have changed: check them with mfp_get_goals (all_days=true). "
+            "Omit `day` to set the whole week."
         )
 
 
@@ -2657,8 +2670,8 @@ async def mfp_set_goals(params: SetGoalsInput) -> str:
 
     One deliberate exception: if `calories` is the only value you pass, carbs,
     protein and fat are rescaled by the same factor so the macro split is kept
-    and the macros still add up to the new calories. Pass any macro explicitly
-    to set exact grams instead (no rescaling then).
+    and the macros follow the new calories (to within whole-gram rounding).
+    Pass any macro explicitly to set exact grams instead (no rescaling then).
 
     Pass `day` (e.g. 'monday') to change just that weekday — for Premium
     accounts that run different goals per day. Omit `day` to set every day of
