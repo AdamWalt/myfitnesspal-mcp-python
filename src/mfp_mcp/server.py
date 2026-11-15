@@ -1631,31 +1631,63 @@ _MEAL_NAMES_CACHE: Dict[str, Tuple[float, List[str]]] = {}
 _MEAL_NAMES_TTL = 300.0
 
 
+def _scrape_meal_names(client, target_date: date) -> List[str]:
+    """Read the diary page's meal headers exactly as the account spells them.
+
+    python-myfitnesspal reads the same `tr.meal_header` rows but lowercases the
+    text. The diary POST should carry the account's own spelling rather than
+    lean on MyFitnessPal matching case-insensitively, so read them directly.
+    """
+    import lxml.html
+
+    response = client.session.get(
+        f"{MFP_WEB_BASE}/food/diary",
+        params={"date": target_date.strftime("%Y-%m-%d")},
+        timeout=30,
+    )
+    if response.status_code != 200:
+        raise RuntimeError(
+            f"Could not load the diary page to read meal names: HTTP {response.status_code}"
+        )
+    document = lxml.html.document_fromstring(
+        response.content.decode("utf-8", errors="replace")
+    )
+    names: List[str] = []
+    for cell in document.xpath("//tr[@class='meal_header']/td[1]"):
+        name = (cell.text or "").strip()
+        if name:
+            names.append(name)
+    return names
+
+
 def get_meal_names(client, target_date: Optional[date] = None, use_cache: bool = True) -> List[str]:
-    """Return the account's configured meal names, in diary order.
+    """Return the account's configured meal names, in diary order, spelled the
+    way the account defines them (e.g. 'Breakfast', or a custom 'During Ride').
 
     MFP exposes no v2 endpoint for the meal list, so the diary page is the only
     source (the same one mfp_get_diary reads). It reads a single day — the
-    configured meals are account-level and identical across days. The underlying
-    library lowercases the names (e.g. 'breakfast', plus custom meals such as
-    'during ride'); that lowercased form is what the diary POST accepts. Cached
-    per user for a few minutes so bulk logging doesn't re-scrape.
+    configured meals are account-level and identical across days.
+
+    Cost: this is one extra HTML request, and it sits on the write path — the
+    first mfp_add_food_to_diary call fetches the diary page before posting. The
+    result is cached per user for a few minutes so bulk logging doesn't re-fetch.
+    An empty result (e.g. an expired session returning a login page) is never
+    cached, so the next call retries instead of failing for the whole TTL.
     """
     key = str(getattr(client, "user_id", "") or "")
     if use_cache and key:
         cached = _MEAL_NAMES_CACHE.get(key)
         if cached and cached[0] > time.time():
             return cached[1]
-    day = client.get_date(target_date or date.today())
-    names = [meal.name for meal in day.meals]
-    if key:
+    names = _scrape_meal_names(client, target_date or date.today())
+    if key and names:
         _MEAL_NAMES_CACHE[key] = (time.time() + _MEAL_NAMES_TTL, names)
     return names
 
 
 def _resolve_meal(meal: str, meal_names: List[str]) -> str:
     """Match `meal` to one of the account's configured meals (case-insensitive)
-    and return the account's own name for it (lowercased, as MFP lists it).
+    and return the account's own spelling of it, which is what gets posted.
 
     MFP's diary POST silently files an unrecognized meal_name under a default
     meal (observed: the first one) instead of erroring, so entries get mis-logged
@@ -1667,8 +1699,8 @@ def _resolve_meal(meal: str, meal_names: List[str]) -> str:
             "Could not read this account's meals from MyFitnessPal, so the entry "
             "can't be placed safely. Try again, or check mfp_get_diary."
         )
-    wanted = (meal or "").strip().lower()
-    by_name = {name.strip().lower(): name for name in meal_names}
+    wanted = (meal or "").strip().casefold()
+    by_name = {name.strip().casefold(): name for name in meal_names}
     if wanted in by_name:
         return by_name[wanted]
     # Tolerate a singular/plural slip (e.g. "snack" -> "snacks"), language-neutral.
@@ -2708,6 +2740,14 @@ async def mfp_list_meals(params: ListMealsInput) -> str:
     try:
         client = get_mfp_client()
         names = await asyncio.to_thread(get_meal_names, client, None)
+        if not names:
+            message = (
+                "No meals found: MyFitnessPal's diary page returned no meal "
+                "headers (the session may have expired — try refresh_browser_cookies)."
+            )
+            if params.response_format == ResponseFormat.MARKDOWN:
+                return f"## Meals\n{message}"
+            return json.dumps({"meals": [], "message": message}, indent=2)
         if params.response_format == ResponseFormat.MARKDOWN:
             return "## Meals\n" + "\n".join(f"- {n}" for n in names)
         return json.dumps({"meals": names}, indent=2)
