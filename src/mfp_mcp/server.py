@@ -3475,7 +3475,9 @@ async def mfp_get_fasts(params: GetFastsInput) -> str:
             try:
                 raw, _sync = mobile_sync.fetch_all_fasts(token, session=session)
             except mobile_sync.Unauthorized:
-                token = mobile_sync.get_mobile_access_token(force_refresh=True, session=session)
+                token = mobile_sync.get_mobile_access_token(
+                    force_refresh=True, session=session, rejected=token
+                )
                 raw, _sync = mobile_sync.fetch_all_fasts(token, session=session)
             return raw
 
