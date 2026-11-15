@@ -28,6 +28,7 @@ import hmac
 import json
 import logging
 import os
+import threading
 import time
 from datetime import datetime, date, timezone
 from typing import Any, Dict, List, Optional, Tuple
@@ -299,12 +300,36 @@ def login_with_password(session, client_id: str, client_secret: str,
 # --------------------------------------------------------------------------- #
 # access-token manager (module-level cache)
 # --------------------------------------------------------------------------- #
-_access_cache: Dict[str, Any] = {"token": None, "expires_at": 0.0}
+_access_cache: Dict[str, Any] = {"token": None, "expires_at": 0.0, "minted_at": 0.0}
+
+# mfp_get_fasts runs through asyncio.to_thread, so two calls can get here from
+# different worker threads. Minting has to be serialized: MyFitnessPal rotates
+# the refresh token, so a second refresh racing the first would present a token
+# the first has already invalidated, and then fall through to the password
+# bootstrap. The lock covers reading, using and storing the refresh token.
+_access_lock = threading.Lock()
 
 
 def _cache_access(token: str, ttl: Optional[int]) -> None:
+    now = time.time()
     _access_cache["token"] = token
-    _access_cache["expires_at"] = time.time() + (ttl or _DEFAULT_TTL)
+    _access_cache["minted_at"] = now
+    _access_cache["expires_at"] = now + (ttl or _DEFAULT_TTL)
+
+
+def _usable_cached_token(force_refresh: bool, since: float) -> Optional[str]:
+    """The cached token if this call may use it, else None.
+
+    A normal call takes any unexpired token. A forced refresh (the caller just
+    got a 401 with the cached one) only accepts a token minted after it started
+    — one another thread refreshed in the meantime — never the rejected one.
+    """
+    token = _access_cache["token"]
+    if not token or _access_cache["expires_at"] - 60 <= time.time():
+        return None
+    if force_refresh and _access_cache.get("minted_at", 0.0) < since:
+        return None
+    return token
 
 
 def get_mobile_access_token(force_refresh: bool = False, session=None) -> str:
@@ -313,38 +338,54 @@ def get_mobile_access_token(force_refresh: bool = False, session=None) -> str:
     Order: in-memory cache -> stored refresh token -> password bootstrap.
     The password (MFP_USERNAME/MFP_PASSWORD) is only read when there is no
     usable refresh token; the resulting refresh token is persisted and reused.
+    Safe to call from several threads: only one mints at a time, and a caller
+    that waited reuses the token the other one just obtained.
     """
-    now = time.time()
-    if not force_refresh and _access_cache["token"] and _access_cache["expires_at"] - 60 > now:
-        return _access_cache["token"]
+    started = time.time()
+    if not force_refresh:
+        token = _usable_cached_token(False, started)
+        if token:
+            return token
 
-    client_id, client_secret = get_client_credentials()
-    session = session or _new_session()
+    with _access_lock:
+        # Another thread may have minted a token while this one waited.
+        token = _usable_cached_token(force_refresh, started)
+        if token:
+            return token
 
-    refresh = _load_refresh_token()
-    if refresh:
-        try:
-            access, new_refresh, ttl = refresh_access_token(session, client_id, client_secret, refresh)
-            if new_refresh and new_refresh != refresh:
-                _store_refresh_token(new_refresh)
-            _cache_access(access, ttl)
-            return access
-        except MobileAuthError as e:
-            logger.warning("Mobile refresh token rejected (%s); re-bootstrapping from password.", e)
+        client_id, client_secret = get_client_credentials()
+        session = session or _new_session()
 
-    username = _resolve_user_credential("MFP_USERNAME")
-    password = _resolve_user_credential("MFP_PASSWORD")
-    if not username or not password:
-        raise MobileAuthError(
-            "No stored mobile session yet, and MFP_USERNAME / MFP_PASSWORD are not "
-            "available to bootstrap one. Set them once (environment or Claude Desktop "
-            "config) to enable fasting reads; the password is not stored afterwards."
+        refresh = _load_refresh_token()
+        if refresh:
+            try:
+                access, new_refresh, ttl = refresh_access_token(
+                    session, client_id, client_secret, refresh
+                )
+                if new_refresh and new_refresh != refresh:
+                    _store_refresh_token(new_refresh)
+                _cache_access(access, ttl)
+                return access
+            except MobileAuthError as e:
+                logger.warning(
+                    "Mobile refresh token rejected (%s); re-bootstrapping from password.", e
+                )
+
+        username = _resolve_user_credential("MFP_USERNAME")
+        password = _resolve_user_credential("MFP_PASSWORD")
+        if not username or not password:
+            raise MobileAuthError(
+                "No stored mobile session yet, and MFP_USERNAME / MFP_PASSWORD are not "
+                "available to bootstrap one. Set them once (environment or Claude Desktop "
+                "config) to enable fasting reads; the password is not stored afterwards."
+            )
+        access, refresh, ttl = login_with_password(
+            session, client_id, client_secret, username, password
         )
-    access, refresh, ttl = login_with_password(session, client_id, client_secret, username, password)
-    if refresh:
-        _store_refresh_token(refresh)
-    _cache_access(access, ttl)
-    return access
+        if refresh:
+            _store_refresh_token(refresh)
+        _cache_access(access, ttl)
+        return access
 
 
 # --------------------------------------------------------------------------- #

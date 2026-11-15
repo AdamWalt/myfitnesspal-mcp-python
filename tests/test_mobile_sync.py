@@ -88,6 +88,7 @@ def _fast_item(fid, started, ended, action="created"):
 def _reset_cache():
     ms._access_cache["token"] = None
     ms._access_cache["expires_at"] = 0.0
+    ms._access_cache["minted_at"] = 0.0
     yield
 
 
@@ -207,6 +208,62 @@ class TestAccessTokenManager:
                                             "expires_in": 900}))
         assert ms.get_mobile_access_token(session=s) == "NL.M.r"
         assert stored["tok"] == "ROT"  # rotated refresh persisted
+
+    @pytest.mark.parametrize("force_refresh", [False, True])
+    def test_concurrent_callers_mint_once(self, monkeypatch, force_refresh):
+        """Two worker threads (mfp_get_fasts runs via asyncio.to_thread) must not
+        both refresh: MFP rotates the refresh token, so the second would present
+        one the first already invalidated."""
+        import threading
+        import time
+
+        monkeypatch.setenv("MFP_MOBILE_CLIENT_ID", "cid")
+        monkeypatch.setenv("MFP_MOBILE_CLIENT_SECRET", "csec")
+        store = {"refresh": "R0"}
+        monkeypatch.setattr(ms, "_load_refresh_token", lambda: store["refresh"])
+        monkeypatch.setattr(ms, "_store_refresh_token", lambda t: store.update(refresh=t))
+        used = []
+
+        def fake_refresh(session, client_id, client_secret, refresh):
+            used.append(refresh)
+            time.sleep(0.05)  # hold the window open for the other thread
+            n = len(used)
+            return f"ACCESS{n}", f"R{n}", 900
+
+        monkeypatch.setattr(ms, "refresh_access_token", fake_refresh)
+
+        barrier = threading.Barrier(2)
+        results = []
+
+        def worker():
+            barrier.wait()
+            results.append(
+                ms.get_mobile_access_token(force_refresh=force_refresh, session=FakeSession())
+            )
+
+        threads = [threading.Thread(target=worker) for _ in range(2)]
+        for th in threads:
+            th.start()
+        for th in threads:
+            th.join(timeout=5)
+
+        assert used == ["R0"]  # one refresh, with the un-rotated token
+        assert results == ["ACCESS1", "ACCESS1"]  # the waiter reused the fresh token
+        assert store["refresh"] == "R1"
+
+    def test_forced_refresh_does_not_reuse_the_rejected_token(self, monkeypatch):
+        monkeypatch.setenv("MFP_MOBILE_CLIENT_ID", "cid")
+        monkeypatch.setenv("MFP_MOBILE_CLIENT_SECRET", "csec")
+        ms._cache_access("REJECTED", 900)  # cached, unexpired, but just got a 401
+        monkeypatch.setattr(ms, "_load_refresh_token", lambda: "R0")
+        monkeypatch.setattr(ms, "_store_refresh_token", lambda t: None)
+        monkeypatch.setattr(
+            ms, "refresh_access_token", lambda session, cid, csec, refresh: ("NEW", "R1", 900)
+        )
+        import time
+
+        time.sleep(0.01)  # the forced call starts after the rejected token was minted
+        assert ms.get_mobile_access_token(force_refresh=True, session=FakeSession()) == "NEW"
 
     def test_bootstrap_when_no_refresh(self, monkeypatch):
         monkeypatch.setenv("MFP_MOBILE_CLIENT_ID", "cid")
