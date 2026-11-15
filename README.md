@@ -718,7 +718,7 @@ List the account's configured meal names, in diary order and spelled the way the
 ### mfp_quick_add
 Quick Add raw calories (and optional carbs/protein/fat) with no food lookup — the equivalent of MyFitnessPal's "Quick Add". Use it to log an energy/macro total directly when you don't have or don't need a specific food (a rough restaurant meal, a ride-fuel total). The entry is backed by a throwaway food that's deleted after logging, so it doesn't clutter your food list (the entry keeps its own nutrition — the same way MFP's own Quick Add works).
 - `calories` (required): Calories to log
-- `carbohydrates` / `protein` / `fat` (optional): grams
+- `carbohydrates` / `protein` / `fat` (optional): grams (fractions are fine, e.g. `7.5`)
 - `meal` (optional): Meal to log under (see `mfp_list_meals`; default "Breakfast")
 - `date` (optional): YYYY-MM-DD format (default: today)
 - `name` (optional): Label for the entry (default: "Quick Add")

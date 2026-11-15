@@ -71,7 +71,8 @@ class TestQuickAddToDiary:
         s = rec["spec"]
         assert s["calories"] == 337 and s["carbs"] == 41 and s["protein"] == 23 and s["fat"] == 9
         assert s["serving_amount"] == 1 and s["serving_unit"] == "serving"
-        assert s["country_code"] == "NL" and s["description"] == "Quick Add"
+        # country_code is left to create_custom_food's own default
+        assert "country_code" not in s and s["description"] == "Quick Add"
         assert rec["add"] == {"mfp_id": "F1", "meal": "during ride", "quantity": 1.0}
         assert rec["deleted"] == ["F1"]  # backing food made a throwaway
 
@@ -151,6 +152,30 @@ class TestQuickAddTool:
         )
         assert out["date"] == "2026-03-09"
         assert seen["target_date"] == date(2026, 3, 9)
+
+    def test_fractional_values_are_accepted_and_passed_through(self, monkeypatch):
+        monkeypatch.setattr(server, "get_mfp_client", lambda: object())
+        seen = {}
+
+        def capture(client, **kw):
+            seen.update(kw)
+            return ("E3", kw["meal"])
+
+        monkeypatch.setattr(server, "quick_add_to_diary", capture)
+        out = json.loads(
+            asyncio.run(
+                server.mfp_quick_add(server.QuickAddInput(calories=112.5, fat=7.5, meal="snacks"))
+            )
+        )
+        assert (seen["calories"], seen["fat"]) == (112.5, 7.5)
+        assert out["logged"]["fat"] == 7.5
+        assert out["message"].startswith("Quick-added 112.5 cal")
+
+    def test_whole_calories_read_cleanly_in_the_message(self, monkeypatch):
+        monkeypatch.setattr(server, "get_mfp_client", lambda: object())
+        monkeypatch.setattr(server, "quick_add_to_diary", lambda client, **kw: ("E4", kw["meal"]))
+        out = json.loads(asyncio.run(server.mfp_quick_add(server.QuickAddInput(calories=337))))
+        assert out["message"].startswith("Quick-added 337 cal")  # not "337.0"
 
     def test_calories_is_required(self):
         with pytest.raises(ValidationError):

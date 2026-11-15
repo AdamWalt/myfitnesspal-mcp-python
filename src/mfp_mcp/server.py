@@ -1186,15 +1186,15 @@ class QuickAddInput(BaseModel):
 
     model_config = ConfigDict(str_strip_whitespace=True)
 
-    calories: int = Field(..., description="Calories to log (kcal).", ge=1, le=10000)
-    carbohydrates: Optional[int] = Field(
+    calories: float = Field(..., description="Calories to log (kcal).", ge=1, le=10000)
+    carbohydrates: Optional[float] = Field(
         default=None, description="Carbohydrates in grams (optional).", ge=0, le=2000
     )
-    protein: Optional[int] = Field(
+    protein: Optional[float] = Field(
         default=None, description="Protein in grams (optional).", ge=0, le=2000
     )
-    fat: Optional[int] = Field(
-        default=None, description="Fat in grams (optional).", ge=0, le=2000
+    fat: Optional[float] = Field(
+        default=None, description="Fat in grams (optional, e.g. 7.5).", ge=0, le=2000
     )
     meal: str = Field(
         default="Breakfast",
@@ -1857,12 +1857,12 @@ def add_food_to_diary(
 def quick_add_to_diary(
     client,
     *,
-    calories: int,
+    calories: float,
     meal: str,
     target_date: date,
-    carbohydrates: Optional[int] = None,
-    protein: Optional[int] = None,
-    fat: Optional[int] = None,
+    carbohydrates: Optional[float] = None,
+    protein: Optional[float] = None,
+    fat: Optional[float] = None,
     name: str = "Quick Add",
 ) -> Tuple[Optional[str], str]:
     """
@@ -1887,7 +1887,6 @@ def quick_add_to_diary(
         "calories": calories,
         "serving_amount": 1,
         "serving_unit": "serving",
-        "country_code": "NL",
     }
     if carbohydrates is not None:
         spec["carbs"] = carbohydrates
@@ -3198,8 +3197,8 @@ async def mfp_quick_add(params: QuickAddInput) -> str:
 
     Args:
         params: QuickAddInput containing:
-            - calories (int): calories to log (required)
-            - carbohydrates / protein / fat (int, optional): grams
+            - calories (float): calories to log (required)
+            - carbohydrates / protein / fat (float, optional): grams
             - meal (str): meal to log under (see mfp_list_meals); default Breakfast
             - date (str, optional): YYYY-MM-DD, defaults to today
             - name (str): label for the entry (default 'Quick Add')
@@ -3226,7 +3225,7 @@ async def mfp_quick_add(params: QuickAddInput) -> str:
         return json.dumps(
             {
                 "success": True,
-                "message": f"Quick-added {params.calories} cal to {resolved_meal}",
+                "message": f"Quick-added {params.calories:g} cal to {resolved_meal}",
                 "entry_id": entry_id,
                 "date": str(target_date),
                 "meal": resolved_meal,
