@@ -44,10 +44,33 @@ RESULTS_HTML = (
 ).encode()
 
 
+SEARCH_URL = "https://www.myfitnesspal.com/food/search"
+LOGIN_URL = (
+    "https://www.myfitnesspal.com/account/login"
+    "?callbackUrl=https%3A%2F%2Fwww.myfitnesspal.com%2Ffood%2Fsearch"
+)
+
+# What a logged-out request really gets back (observed live): HTTP 200 on the
+# login page, whose translation bundle contains the literal "Matching Foods:".
+LOGIN_HTML = (
+    b"<html><body><div id='__next'>Log in</div>"
+    b'<script>{"food.matchingFoods":"Matching Foods:","login.title":"Log In"}</script>'
+    b"</body></html>"
+)
+
+# A real search with no matches still renders the results scaffold.
+EMPTY_RESULTS_HTML = (
+    b"<html><body><div class='col-1' id='sort-block'>"
+    b"<h4 class='secondary-title search_'>Matching Foods:</h4></div>"
+    b"<p>No results found.</p></body></html>"
+)
+
+
 class _FakeResp:
-    def __init__(self, status=200, content=b""):
+    def __init__(self, status=200, content=b"", url=SEARCH_URL):
         self.status_code = status
         self.content = content
+        self.url = url
 
 
 class _FakeSession:
@@ -68,8 +91,12 @@ class _FakeClient:
         self.session = _FakeSession(get_resp, post_resp)
 
 
-def _client(results_html=RESULTS_HTML, form_html=FORM_HTML, results_status=200, form_status=200):
-    return _FakeClient(_FakeResp(form_status, form_html), _FakeResp(results_status, results_html))
+def _client(results_html=RESULTS_HTML, form_html=FORM_HTML, results_status=200, form_status=200,
+            results_url=SEARCH_URL, form_url=SEARCH_URL):
+    return _FakeClient(
+        _FakeResp(form_status, form_html, form_url),
+        _FakeResp(results_status, results_html, results_url),
+    )
 
 
 class TestParseEnergy:
@@ -106,6 +133,23 @@ class TestSearchFood:
         # two-part info line -> no brand, energy still parsed
         assert apple["brand"] == "" and apple["energy"] == 95.0
 
+    def test_calories_is_always_kcal_for_callers_of_the_old_schema(self):
+        banana, weetbix, _ = server.search_food(_client(), "x", limit=10)
+        assert banana["calories"] == 105.0  # kcal account value passes through
+        # 649 kJ -> kcal; energy/energy_unit still carry the displayed kJ value
+        assert weetbix["calories"] == round(649 / 4.184, 1) == 155.1
+        assert (weetbix["energy"], weetbix["energy_unit"]) == (649.0, "kilojoules")
+
+    def test_brand_with_a_comma_keeps_it(self):
+        html = (
+            "<html><body>Matching Foods:<ul>"
+            '<li class="matched-food">'
+            '  <div class="search-title-container"><a data-external-id="7">Soup</a></div>'
+            '  <p class="search-nutritional-info">Foo, Inc., 1 cup, 120 calories</p>'
+            "</li></ul></body></html>"
+        ).encode()
+        assert server.search_food(_client(results_html=html), "x", limit=10)[0]["brand"] == "Foo, Inc."
+
     def test_limit_is_respected(self):
         results = server.search_food(_client(), "x", limit=2)
         assert [r["mfp_id"] for r in results] == ["111", "222"]
@@ -125,9 +169,33 @@ class TestSearchFood:
             server.search_food(client, "x", limit=10)
 
     def test_no_results_returns_empty_list(self):
-        # A 200 with no matched-food items is an empty search, not an error.
-        client = _client(results_html=b"<html><body>No matches found</body></html>")
+        # A results page with no matched-food items is an empty search, not an error.
+        client = _client(results_html=EMPTY_RESULTS_HTML)
         assert server.search_food(client, "x", limit=10) == []
+
+    def test_login_page_on_search_raises_instead_of_zero_results(self):
+        # An expired session is redirected to the login page, which is still a
+        # 200 and even contains "Matching Foods:" (in its translation bundle).
+        client = _client(results_html=LOGIN_HTML, results_url=LOGIN_URL)
+        with pytest.raises(RuntimeError, match="login page"):
+            server.search_food(client, "x", limit=10)
+
+    def test_login_redirect_on_form_fetch_raises_auth_error(self):
+        client = _client(form_html=LOGIN_HTML, form_url=LOGIN_URL)
+        with pytest.raises(RuntimeError, match="login page"):
+            server.search_food(client, "x", limit=10)
+        assert client.session.posted is None  # never posted the query
+
+    def test_200_without_a_results_section_raises(self):
+        # Not a login redirect, but not a results page either: don't report 0 foods.
+        client = _client(results_html=b"<html><body><h1>Something else</h1></body></html>")
+        with pytest.raises(RuntimeError, match="search-results page"):
+            server.search_food(client, "x", limit=10)
+
+    def test_marker_text_inside_a_script_does_not_count_as_results(self):
+        client = _client(results_html=LOGIN_HTML)  # same body, but no login URL
+        with pytest.raises(RuntimeError, match="search-results page"):
+            server.search_food(client, "x", limit=10)
 
     def test_post_non_200_raises(self):
         client = _client(results_status=500)
