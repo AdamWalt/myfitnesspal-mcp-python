@@ -150,6 +150,18 @@ class TestSearchFood:
         ).encode()
         assert server.search_food(_client(results_html=html), "x", limit=10)[0]["brand"] == "Foo, Inc."
 
+    def test_thousands_separator_in_the_serving_is_not_a_field_break(self):
+        line = "Ben & Jerry's, 0.5 cup (1,000 g), 2,500 kilojoules"
+        assert server._parse_search_brand(line) == "Ben & Jerry's"
+
+    def test_brand_parsing_edge_cases(self):
+        assert server._parse_search_brand("1 medium, 95 calories") == ""
+        assert server._parse_search_brand("Generic, 1 medium, 105 calories") == "Generic"
+        assert server._parse_search_brand("") == ""
+        # Known limit: a comma inside the serving can't be told from one in the
+        # brand, so the serving's first half lands in the brand.
+        assert server._parse_search_brand("Generic, 1 cup, chopped, 120 calories") == "Generic, 1 cup"
+
     def test_limit_is_respected(self):
         results = server.search_food(_client(), "x", limit=2)
         assert [r["mfp_id"] for r in results] == ["111", "222"]
@@ -196,6 +208,32 @@ class TestSearchFood:
         client = _client(results_html=LOGIN_HTML)  # same body, but no login URL
         with pytest.raises(RuntimeError, match="search-results page"):
             server.search_food(client, "x", limit=10)
+
+    @pytest.mark.parametrize(
+        "body",
+        [
+            # the id alone (e.g. an account whose heading is localized)
+            b"<div id='sort-block'><h4>Alimentos encontrados:</h4></div>",
+            # the heading alone (the id renamed)
+            b"<div><h4>Matching Foods:</h4></div>",
+            # the heading after a child element, i.e. not the first text node
+            b"<h4>\n<b>3</b> Matching Foods:</h4>",
+        ],
+    )
+    def test_either_results_marker_is_enough_for_an_empty_result(self, body):
+        html = b"<html><body>" + body + b"<p>No results found.</p></body></html>"
+        assert server.search_food(_client(results_html=html), "x", limit=10) == []
+
+    @pytest.mark.parametrize("tag", ["script", "style", "noscript", "template", "textarea"])
+    def test_marker_text_in_unrendered_elements_does_not_count(self, tag):
+        html = f"<html><body><{tag}>Matching Foods:</{tag}><p>hi</p></body></html>".encode()
+        with pytest.raises(RuntimeError, match="search-results page"):
+            server.search_food(_client(results_html=html), "x", limit=10)
+
+    def test_marker_text_in_the_page_title_does_not_count(self):
+        html = b"<html><head><title>Matching Foods:</title></head><body><p>hi</p></body></html>"
+        with pytest.raises(RuntimeError, match="search-results page"):
+            server.search_food(_client(results_html=html), "x", limit=10)
 
     def test_post_non_200_raises(self):
         client = _client(results_status=500)

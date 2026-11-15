@@ -1976,6 +1976,10 @@ def _parse_search_energy(text: Optional[str]) -> Tuple[Optional[float], Optional
     return value, ("kilojoules" if u.startswith("kilojoule") or u == "kj" else "calories")
 
 
+# A comma that separates fields: any comma except one between two digits.
+_SEARCH_FIELD_COMMA_RE = re.compile(r"(?<!\d),|,(?!\d)")
+
+
 def _parse_search_brand(text: Optional[str]) -> str:
     """Brand from a search info line '<brand…>, <serving>, <energy>'. The energy
     token is stripped first so a thousands separator in it can't shift the
@@ -1985,10 +1989,15 @@ def _parse_search_brand(text: Optional[str]) -> str:
     head = text
     for match in _SEARCH_ENERGY_RE.finditer(text):
         head = text[: match.start()]  # keep trimming to the last energy token
-    parts = [p.strip() for p in head.split(",") if p.strip()]
+    # Split on the field commas, not on a thousands separator inside the serving
+    # ("0.5 cup (1,000 g)").
+    parts = [p.strip() for p in _SEARCH_FIELD_COMMA_RE.split(head) if p.strip()]
     # The last remaining field is the serving; the brand is everything before it.
     # Rejoin with ", " so a brand that itself contains a comma ("Foo, Inc.")
-    # reads as written rather than losing it.
+    # reads as written rather than losing it. The line gives no way to tell a
+    # comma in the brand from one in the serving, so a serving written with a
+    # comma ("1 cup, chopped") still leaks its first half into the brand — the
+    # same limit python-myfitnesspal's parser has.
     return ", ".join(parts[:-1]).strip() if len(parts) >= 2 else ""
 
 
@@ -2027,12 +2036,16 @@ def _raise_if_login_page(response) -> None:
 def _has_search_results_section(document) -> bool:
     """True when the page carries the search-results scaffold, which MFP renders
     even for zero matches (an `#sort-block` holding the "Matching Foods:"
-    heading). Script/style text is ignored so a translation bundle can't pass."""
+    heading). Either marker is enough: the id does not depend on the account's
+    language, the heading does not depend on the id. Text that is not rendered
+    as page content (scripts, styles, templates, the title…) is ignored so a
+    translation bundle can't pass for the heading."""
     return bool(
         document.xpath(
             "//*[@id='sort-block'] | "
-            "//*[not(self::script) and not(self::style)]"
-            "[contains(text(), 'Matching Foods:')]"
+            "//*[not(self::script or self::style or self::noscript or self::template"
+            " or self::title or self::textarea)]"
+            "/text()[contains(., 'Matching Foods:')]"
         )
     )
 
