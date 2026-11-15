@@ -31,10 +31,14 @@ def _diary_html(names):
     return f"<html><body><table>{rows}</table></body></html>".encode()
 
 
+DIARY_URL = "https://www.myfitnesspal.com/food/diary"
+
+
 class _Page:
-    def __init__(self, status, content=b""):
+    def __init__(self, status, content=b"", url=DIARY_URL):
         self.status_code = status
         self.content = content
+        self.url = url
 
 
 class _FakeClient:
@@ -82,6 +86,13 @@ class TestResolveMeal:
     def test_empty_meal_raises(self):
         with pytest.raises(RuntimeError):
             server._resolve_meal("", NAMES)
+
+    def test_empty_meal_does_not_match_a_meal_called_s(self):
+        # The plural tolerance ("" + "s") must not turn nothing into a meal.
+        with pytest.raises(RuntimeError, match="not one of this account"):
+            server._resolve_meal("", ["S", "Lunch"])
+        with pytest.raises(RuntimeError, match="not one of this account"):
+            server._resolve_meal("   ", ["S", "Lunch"])
 
     def test_singular_plural_slip_is_tolerated(self):
         # LLMs/users often say "snack" (singular) for the "Snacks" meal.
@@ -195,6 +206,45 @@ class TestGetMealNames:
         client = _FakeClient(["Breakfast"], status=500)
         with pytest.raises(RuntimeError, match="Could not load the diary page"):
             server.get_meal_names(client)
+
+    def _client_serving(self, body, url=DIARY_URL):
+        class _Session:
+            def get(self, *args, **kwargs):
+                return _Page(200, body, url)
+
+        client = _FakeClient([])
+        client.session = _Session()
+        return client
+
+    def test_login_redirect_raises_an_auth_error(self):
+        # An expired session lands on the login page with HTTP 200.
+        client = self._client_serving(
+            b"<html><body>Log in</body></html>",
+            url="https://www.myfitnesspal.com/account/login?callbackUrl=x",
+        )
+        with pytest.raises(RuntimeError, match="login page"):
+            server.get_meal_names(client)
+
+    def test_name_wrapped_in_a_child_element_is_still_read(self):
+        body = (
+            b'<html><body><table>'
+            b'<tr class="meal_header"><td class="first alt"><span>Breakfast</span></td></tr>'
+            b'<tr class="meal_header"><td class="first alt">Lunch</td></tr>'
+            b'</table></body></html>'
+        )
+        # Not a partial list with the wrapped one silently dropped.
+        assert server.get_meal_names(self._client_serving(body)) == ["Breakfast", "Lunch"]
+
+    def test_non_breaking_and_repeated_spaces_are_normalized(self):
+        body = (
+            b'<html><body><table>'
+            b'<tr class="meal_header"><td>During&nbsp;Ride</td></tr>'
+            b'<tr class="meal_header"><td>\n  Pre   Workout \n</td></tr>'
+            b'</table></body></html>'
+        )
+        names = server.get_meal_names(self._client_serving(body))
+        assert names == ["During Ride", "Pre Workout"]
+        assert server._resolve_meal("during ride", names) == "During Ride"
 
 
 class TestListMealsTool:

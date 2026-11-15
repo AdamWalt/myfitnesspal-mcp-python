@@ -1649,12 +1649,22 @@ def _scrape_meal_names(client, target_date: date) -> List[str]:
         raise RuntimeError(
             f"Could not load the diary page to read meal names: HTTP {response.status_code}"
         )
+    # An expired session is redirected to the login page, which is still a 200.
+    if "/account/login" in str(getattr(response, "url", "") or ""):
+        raise RuntimeError(
+            "MyFitnessPal redirected the diary page to its login page: the session "
+            "has expired or is not authenticated. Run refresh_browser_cookies and "
+            "try again."
+        )
     document = lxml.html.document_fromstring(
         response.content.decode("utf-8", errors="replace")
     )
     names: List[str] = []
     for cell in document.xpath("//tr[@class='meal_header']/td[1]"):
-        name = (cell.text or "").strip()
+        # The whole cell's text (not just its first text node, which would skip
+        # a name wrapped in a child element), with runs of whitespace —
+        # including non-breaking spaces — collapsed to single spaces.
+        name = " ".join(cell.text_content().split())
         if name:
             names.append(name)
     return names
@@ -1704,7 +1714,8 @@ def _resolve_meal(meal: str, meal_names: List[str]) -> str:
     if wanted in by_name:
         return by_name[wanted]
     # Tolerate a singular/plural slip (e.g. "snack" -> "snacks"), language-neutral.
-    alternates = {wanted + "s"}
+    # Not for an empty name: "" + "s" must not match a meal called "S".
+    alternates = {wanted + "s"} if wanted else set()
     if wanted.endswith("s"):
         alternates.add(wanted[:-1])
     for alt in alternates:
@@ -2727,7 +2738,7 @@ async def mfp_list_meals(params: ListMealsInput) -> str:
 
     These are the values mfp_add_food_to_diary accepts for `meal`. The defaults
     are Breakfast/Lunch/Dinner/Snacks, but an account may have renamed them
-    (localized) or added custom meals (e.g. 'supplements', 'during ride'). Pass
+    (localized) or added custom meals (e.g. 'Supplements', 'During Ride'). Pass
     one of these names (case-insensitive) when logging, so entries aren't
     rejected or silently misfiled under the wrong meal.
 
