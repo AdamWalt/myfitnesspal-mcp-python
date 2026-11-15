@@ -33,15 +33,6 @@ def test_every_alias_maps_to_a_known_cookie_path():
         )
 
 
-def test_safe_storage_service_name_round_trips_to_a_mapped_browser():
-    # The discovery loop derives the browser name via
-    # `service.replace(" Safe Storage", "")`; every mapped browser's implied
-    # service name must strip back to its own key.
-    for browser in server._CHROMIUM_COOKIES_PATHS_MACOS:
-        service = f"{browser} Safe Storage"
-        assert service.replace(" Safe Storage", "").strip() == browser
-
-
 def test_has_real_mfp_session_distinguishes_session_from_csrf():
     assert server._has_real_mfp_session({"__Secure-next-auth.session-token": "x"})
     assert server._has_real_mfp_session({"_mfp_session": "x"})

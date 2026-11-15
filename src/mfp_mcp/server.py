@@ -2883,8 +2883,8 @@ def refresh_browser_cookies(browser: str = "auto") -> str:
                  - 'auto' (default): scan every installed Chromium-based
                    browser on macOS (Arc, Dia, Chrome, Edge, Brave, Vivaldi,
                    Opera, ...) and use the first one with a valid session.
-                 - 'arc', 'chrome', 'chromium', 'edge', 'brave', 'vivaldi',
-                   'opera': force a specific Chromium browser (macOS).
+                 - 'arc', 'dia', 'chrome', 'chromium', 'edge', 'brave',
+                   'vivaldi', 'opera': force a specific Chromium browser (macOS).
                  - 'firefox': use browser_cookie3 (Firefox is not Chromium).
 
     Returns:
