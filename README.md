@@ -751,16 +751,18 @@ Get exercise log for a date.
 ### mfp_get_goals
 Get nutrition goals. By default returns the goal that applies on `date` (MyFitnessPal resolves the weekday for you).
 - `date` (optional): YYYY-MM-DD (default today)
-- `all_days` (optional): when true, return the full weekly breakdown — all 7 weekdays plus the default goal — for accounts that set different goals per day (Premium)
+- `all_days` (optional): when true, return the full weekly breakdown — all 7 weekdays plus the default goal — for accounts that set different goals per day (Premium). Each row reports `energy` with its `energy_unit` (`calories` or `kilojoules`, as the account stores it), plus carbs, protein, fat, sodium, sugar and fiber.
 - `response_format`: "markdown" or "json"
 
 ### mfp_set_goals
 Update nutrition goals. Read-modify-write: only the nutrients you pass change; the micronutrient targets, the exercise split, and (when setting one day) the other six days are all preserved.
+
+**Calories on their own rescale the macros.** If `calories` is the only value you pass, carbs, protein and fat are scaled by the same factor (rounded to whole grams), so the macro split is kept and the macros still add up to the new calories — the same thing MyFitnessPal's goal editor does. Pass any macro explicitly to set exact grams instead; nothing is rescaled then.
 - `calories` (optional): Daily calorie goal
 - `protein` (optional): Daily protein in grams
 - `carbohydrates` (optional): Daily carbs in grams
 - `fat` (optional): Daily fat in grams
-- `day` (optional): weekday to update (e.g. `monday`), for Premium accounts with different goals per day. Omit to set every day of the week (and the default) to the same values.
+- `day` (optional): weekday to update (e.g. `monday`), for Premium accounts with different goals per day. Omit to set every day of the week (and the default) to the same values. Different goals per weekday are a MyFitnessPal Premium feature: after a per-day write the tool compares what MyFitnessPal saved with what was sent and returns an error if the weekday did not keep the value, rather than reporting success.
 
 ### mfp_get_water
 Get water intake for a date.

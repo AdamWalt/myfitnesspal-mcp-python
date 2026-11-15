@@ -111,6 +111,35 @@ class TestApplyOneGoal:
         server._apply_one_goal(g, {"protein": 0})
         assert g == {"protein": 0}
 
+    def test_calories_only_rescales_macros_proportionally(self):
+        # What main did via set_new_goal: keep the macro split when only energy moves.
+        g = {"energy": {"value": 2000, "unit": "calories"},
+             "carbohydrates": 250, "protein": 150, "fat": 60, "sodium": 2300}
+        server._apply_one_goal(g, {"calories": 1800})
+        assert g["energy"]["value"] == 1800
+        assert (g["carbohydrates"], g["protein"], g["fat"]) == (225, 135, 54)
+        assert g["sodium"] == 2300  # micronutrients are never rescaled
+
+    def test_calories_with_any_macro_does_not_rescale(self):
+        g = {"energy": {"value": 2000, "unit": "calories"},
+             "carbohydrates": 250, "protein": 150, "fat": 60}
+        server._apply_one_goal(g, {"calories": 1800, "protein": 180})
+        assert (g["carbohydrates"], g["protein"], g["fat"]) == (250, 180, 60)
+
+    def test_calories_only_rescale_uses_the_stored_unit(self):
+        # 2000 kcal -> 8368 kJ; the ratio is taken in kJ against the stored kJ value.
+        g = {"energy": {"value": 10460, "unit": "kilojoules"},  # 2500 kcal
+             "carbohydrates": 300, "protein": 150, "fat": 80}
+        server._apply_one_goal(g, {"calories": 2000})
+        assert g["energy"] == {"value": 8368, "unit": "kilojoules"}
+        assert (g["carbohydrates"], g["protein"], g["fat"]) == (240, 120, 64)
+
+    def test_calories_only_without_a_previous_energy_leaves_macros(self):
+        for prior in ({}, {"energy": {"value": 0, "unit": "calories"}}):
+            g = {**prior, "carbohydrates": 250, "protein": 150, "fat": 60}
+            server._apply_one_goal(g, {"calories": 1800})
+            assert (g["carbohydrates"], g["protein"], g["fat"]) == (250, 150, 60)
+
 
 class TestBuildPayload:
     def test_flat_sets_default_and_every_day(self):
@@ -120,14 +149,26 @@ class TestBuildPayload:
         assert item["default_goal"]["energy"]["value"] == 2500
         assert all(g["energy"]["value"] == 2500 for g in item["daily_goals"])
 
-    def test_flat_only_calories_preserves_macros_and_micros(self):
+    def test_flat_only_calories_rescales_macros_and_keeps_micros(self):
         item = server.build_nutrient_goals_payload(
             current_item(), day=None, overrides={"calories": 2500}
         )["item"]
         mon = _day(item, "monday")
-        assert (mon["carbohydrates"], mon["protein"], mon["fat"]) == (257, 182, 67)
+        ratio = 2500 / 2359
+        assert (mon["carbohydrates"], mon["protein"], mon["fat"]) == (
+            round(257 * ratio), round(182 * ratio), round(67 * ratio)
+        ) == (272, 193, 71)
         assert mon["sodium"] == 2300 and mon["potassium"] == 3500
         assert mon["exercise_carbohydrates_percentage"] == 43
+
+    def test_per_day_calories_only_rescales_just_that_day(self):
+        item = server.build_nutrient_goals_payload(
+            current_item(), day="monday", overrides={"calories": 2500}
+        )["item"]
+        mon, tue = _day(item, "monday"), _day(item, "tuesday")
+        assert (mon["carbohydrates"], mon["protein"], mon["fat"]) == (272, 193, 71)
+        assert (tue["carbohydrates"], tue["protein"], tue["fat"]) == (257, 182, 67)
+        assert item["default_goal"]["carbohydrates"] == 257
 
     def test_per_day_changes_only_that_day(self):
         item = server.build_nutrient_goals_payload(
@@ -262,17 +303,51 @@ class TestSetNutrientGoals:
     def test_reread_fallback_when_post_omits_item(self):
         # If the POST response has no "item", fall back to a fresh GET.
         c = _GoalsClient({"items": [current_item()]}, post_body={})
-        saved = server.set_nutrient_goals(c, day="monday", overrides={"calories": 3000})
+        saved = server.set_nutrient_goals(c, day=None, overrides={"calories": 3000})
         assert saved["valid_from"] == "2026-11-01"  # came from the re-read GET
+
+    def test_per_day_write_that_did_not_stick_raises(self):
+        # e.g. a free account: the POST succeeds but the weekday comes back unchanged.
+        c = _GoalsClient({"items": [current_item()]}, post_body={"item": current_item()})
+        with pytest.raises(RuntimeError) as ei:
+            server.set_nutrient_goals(c, day="monday", overrides={"calories": 3000})
+        msg = str(ei.value)
+        assert "did not keep the monday goal" in msg
+        assert "sent 3000, saved 2359" in msg and "Premium" in msg
+
+    def test_per_day_write_passes_when_saved_matches_as_floats(self):
+        # Live, MyFitnessPal echoes what was sent as floats (3000 -> 3000.0).
+        saved = current_item()
+        mon = _day(saved, "monday")
+        mon["energy"]["value"] = 3000.0
+        mon["carbohydrates"], mon["protein"], mon["fat"] = 327.0, 231.0, 85.0
+        c = _GoalsClient({"items": [current_item()]}, post_body={"item": saved})
+        out = server.set_nutrient_goals(c, day="monday", overrides={"calories": 3000})
+        assert _day(out, "monday")["energy"]["value"] == 3000.0
+
+    def test_whole_week_write_is_not_subject_to_the_per_day_check(self):
+        # Flat writes work on free accounts (MFP may round them); never block those.
+        c = _GoalsClient({"items": [current_item()]}, post_body={"item": current_item()})
+        server.set_nutrient_goals(c, day=None, overrides={"calories": 3000})  # no raise
 
 
 class TestGoalWeekSummary:
     def test_monday_first_with_default_and_micros(self):
         s = server.goal_week_summary(current_item())
         assert list(s["days"].keys()) == list(server._WEEKDAYS)
-        assert s["days"]["sunday"]["calories"] == 2799
-        assert s["default"]["calories"] == 2359
+        assert s["days"]["sunday"]["energy"] == 2799
+        assert s["default"]["energy"] == 2359
         assert s["days"]["monday"]["sodium"] == 2300
+
+    def test_energy_is_labelled_with_its_unit_not_as_calories(self):
+        item = current_item()
+        for g in item["daily_goals"] + [item["default_goal"]]:
+            g["energy"] = {"value": 9870, "unit": "kilojoules"}
+        s = server.goal_week_summary(item)
+        row = s["days"]["monday"]
+        assert (row["energy"], row["energy_unit"]) == (9870, "kilojoules")
+        assert "calories" not in row  # a kJ value must not sit under "calories"
+        assert "9870 kilojoules" in server._goals_week_markdown("2026-11-15", s)
 
 
 class TestSetGoalsTool:
@@ -323,8 +398,29 @@ class TestGetGoalsTool:
                 server.mfp_get_goals(server.GetGoalsInput(all_days=True, response_format="json"))
             )
         )
-        assert out["default"]["calories"] == 2359
-        assert out["days"]["sunday"]["calories"] == 2799
+        assert out["default"]["energy"] == 2359
+        assert out["default"]["energy_unit"] == "calories"
+        assert out["days"]["sunday"]["energy"] == 2799
+
+    def test_single_day_read_runs_off_the_event_loop(self, monkeypatch):
+        import threading
+
+        seen = {}
+
+        class _Day:
+            goals = {"calories": 2359}
+
+        class _Client:
+            def get_date(self, d):
+                seen["thread"] = threading.current_thread()
+                return _Day()
+
+        monkeypatch.setattr(server, "get_mfp_client", lambda: _Client())
+        out = json.loads(
+            asyncio.run(server.mfp_get_goals(server.GetGoalsInput(response_format="json")))
+        )
+        assert out["goals"] == {"calories": 2359}
+        assert seen["thread"] is not threading.main_thread()  # not on the loop thread
 
     def test_all_days_markdown_is_readable(self, monkeypatch):
         monkeypatch.setattr(server, "get_mfp_client", lambda: object())

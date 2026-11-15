@@ -1056,7 +1056,10 @@ class SetGoalsInput(BaseModel):
 
     calories: Optional[int] = Field(
         default=None,
-        description="Daily calorie goal (e.g., 2000)",
+        description=(
+            "Daily calorie goal (e.g., 2000). Passed on its own, carbs/protein/fat "
+            "are rescaled proportionally to keep the macro split."
+        ),
         ge=500,
         le=10000,
     )
@@ -1083,8 +1086,8 @@ class SetGoalsInput(BaseModel):
         description=(
             "Weekday to update (e.g. 'monday'), for Premium accounts that set "
             "different goals per day. Omit to set the same goal for every day of "
-            "the week (and the default). Only the provided nutrients change; all "
-            "others — including micronutrients and the untouched days — are kept."
+            "the week (and the default). Micronutrients and the untouched days are "
+            "kept. Returns an error if MyFitnessPal does not keep the per-day value."
         ),
     )
 
@@ -2349,21 +2352,37 @@ def fetch_nutrient_goals(client, on_date: Optional[date] = None) -> Dict[str, An
     return items[0]
 
 
+_GOAL_MACROS = ("carbohydrates", "protein", "fat")
+
+
 def _apply_one_goal(goal: Dict[str, Any], overrides: Dict[str, int]) -> None:
     """Mutate a single goal dict in place with the provided nutrient values.
 
-    Only the keys present in `overrides` are touched. `calories` (always kcal)
-    maps to the nested energy.value, converted to kilojoules when the stored
-    goal is in kJ so the account's unit is preserved.
+    `calories` (always kcal) maps to the nested energy.value, converted to
+    kilojoules when the stored goal is in kJ so the account's unit is preserved.
+
+    Calories-only update: when `calories` is the only override, the three macro
+    gram targets are rescaled by the same factor as the energy (rounded to whole
+    grams), so the macro split is kept and macros still add up to the new
+    energy. That is what MyFitnessPal's own goal editor does, and what this tool
+    did while it delegated to python-myfitnesspal's `set_new_goal`. Passing any
+    macro explicitly turns the rescale off: the given values are written as-is
+    and the other macros are left alone. Micronutrients are never rescaled.
     """
     if "calories" in overrides:
         energy = goal.setdefault("energy", {})
+        old_value = energy.get("value")
         value: float = overrides["calories"]
         if energy.get("unit") == "kilojoules":
             value = round(value * _KJ_PER_KCAL)
         energy["value"] = value
         energy.setdefault("unit", "calories")
-    for key in ("protein", "carbohydrates", "fat"):
+        if old_value and not any(key in overrides for key in _GOAL_MACROS):
+            ratio = value / old_value
+            for key in _GOAL_MACROS:
+                if goal.get(key) is not None:
+                    goal[key] = round(goal[key] * ratio)
+    for key in _GOAL_MACROS:
         if key in overrides:
             goal[key] = overrides[key]
 
@@ -2382,8 +2401,10 @@ def build_nutrient_goals_payload(
     - day set: apply only to that weekday; default_goal and other days untouched.
 
     Every field not in `overrides` — the other days, micronutrients, exercise
-    split percentages — is carried forward unchanged. Server-computed fields are
-    stripped and valid_from is set to today so the goal takes effect immediately.
+    split percentages, any `meal_goals` — is carried forward unchanged (the one
+    exception is the calories-only macro rescale, see `_apply_one_goal`).
+    Server-computed fields are stripped and valid_from is set to today so the
+    goal takes effect immediately.
 
     Raises:
         RuntimeError: If `day` is given but absent from the weekly goals.
@@ -2421,6 +2442,50 @@ def build_nutrient_goals_payload(
     return {"item": item}
 
 
+def _goal_numbers(goal: Dict[str, Any]) -> Dict[str, Any]:
+    """The energy value and macro grams of one goal, for comparing two copies."""
+    numbers: Dict[str, Any] = {"energy": (goal.get("energy") or {}).get("value")}
+    for key in _GOAL_MACROS:
+        numbers[key] = goal.get(key)
+    return numbers
+
+
+def _check_day_was_kept(
+    day: str, sent_item: Dict[str, Any], saved_item: Dict[str, Any]
+) -> None:
+    """Raise if MyFitnessPal's saved copy of `day` is not what was sent.
+
+    Different goals per weekday are a Premium feature. What a free account does
+    with a per-day write (reject, ignore, or override it) has not been observed,
+    so rather than assume, compare what came back: if the weekday does not hold
+    the values that were sent, say so instead of reporting success. On Premium
+    the saved item echoes the sent values exactly (verified live).
+    """
+
+    def pick(item: Dict[str, Any]) -> Dict[str, Any]:
+        return next(
+            (g for g in item.get("daily_goals", []) if g.get("day_of_week") == day), {}
+        )
+
+    want, got = _goal_numbers(pick(sent_item)), _goal_numbers(pick(saved_item))
+    differing = [
+        key
+        for key, value in want.items()
+        if value is not None
+        and (got.get(key) is None or abs(float(got[key]) - float(value)) > 0.5)
+    ]
+    if differing:
+        detail = ", ".join(
+            f"{key}: sent {_fmt_num(want[key])}, saved {_fmt_num(got.get(key))}"
+            for key in differing
+        )
+        raise RuntimeError(
+            f"MyFitnessPal did not keep the {day} goal as sent ({detail}). "
+            "Different goals per weekday need MyFitnessPal Premium; without it a "
+            "per-day value is ignored or overridden. Omit `day` to set the whole week."
+        )
+
+
 def set_nutrient_goals(
     client, *, day: Optional[str], overrides: Dict[str, int]
 ) -> Dict[str, Any]:
@@ -2429,7 +2494,9 @@ def set_nutrient_goals(
     POST the result back. Returns the saved goal item.
 
     Raises:
-        RuntimeError: If the read or write fails.
+        RuntimeError: If the read or write fails, or if a per-day write did not
+            stick (the saved weekday differs from what was sent — see
+            `_check_day_was_kept`).
     """
     current = fetch_nutrient_goals(client)
     payload = build_nutrient_goals_payload(current, day=day, overrides=overrides)
@@ -2448,14 +2515,21 @@ def set_nutrient_goals(
         )
     body = response.json()
     # POST echoes {"item": {...saved...}}; re-read if a client ever omits it.
-    return body.get("item") or fetch_nutrient_goals(client)
+    saved = body.get("item") or fetch_nutrient_goals(client)
+    if day is not None:
+        _check_day_was_kept(day, payload["item"], saved)
+    return saved
 
 
 def _goal_row(goal: Dict[str, Any]) -> Dict[str, Any]:
-    """Compact nutrient view of one goal (day or default). Pure."""
+    """Compact nutrient view of one goal (day or default). Pure.
+
+    The energy is reported as stored, under `energy` with its `energy_unit`
+    beside it — not under `calories`, which would mislabel a kilojoule account.
+    """
     energy = goal.get("energy") or {}
     return {
-        "calories": energy.get("value"),
+        "energy": energy.get("value"),
         "energy_unit": energy.get("unit"),
         "carbohydrates": goal.get("carbohydrates"),
         "protein": goal.get("protein"),
@@ -2485,9 +2559,9 @@ def _fmt_num(n: Any) -> str:
 
 def _goal_row_line(row: Dict[str, Any]) -> str:
     """One compact human line for a goal row (day or default). Pure."""
-    cal = row.get("calories")
-    unit = row.get("energy_unit") or "cal"
-    parts = [f"{_fmt_num(cal)} {unit}" if cal is not None else "no energy"]
+    energy = row.get("energy")
+    unit = row.get("energy_unit") or "calories"
+    parts = [f"{_fmt_num(energy)} {unit}" if energy is not None else "no energy"]
     macros = " / ".join(
         f"{_fmt_num(row.get(k))}{abbr}"
         for k, abbr in (("carbohydrates", "C"), ("protein", "P"), ("fat", "F"))
@@ -2553,7 +2627,7 @@ async def mfp_get_goals(params: GetGoalsInput) -> str:
                 return _goals_week_markdown(str(target_date), summary)
             return json.dumps({"date": str(target_date), **summary}, indent=2)
 
-        day = client.get_date(target_date)
+        day = await asyncio.to_thread(client.get_date, target_date)
         data = {"date": str(target_date), "goals": day.goals}
 
         return format_response(data, params.response_format, "Daily Nutrition Goals")
@@ -2581,9 +2655,16 @@ async def mfp_set_goals(params: SetGoalsInput) -> str:
     other six days. This is a read-modify-write of MyFitnessPal's weekly goal,
     so nothing you leave out is lost.
 
+    One deliberate exception: if `calories` is the only value you pass, carbs,
+    protein and fat are rescaled by the same factor so the macro split is kept
+    and the macros still add up to the new calories. Pass any macro explicitly
+    to set exact grams instead (no rescaling then).
+
     Pass `day` (e.g. 'monday') to change just that weekday — for Premium
     accounts that run different goals per day. Omit `day` to set every day of
-    the week (and the default) to the same values.
+    the week (and the default) to the same values. If MyFitnessPal does not
+    keep a per-day value (per-day goals need Premium), the tool returns an
+    error rather than reporting success.
 
     Args:
         params: SetGoalsInput containing:
