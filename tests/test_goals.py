@@ -231,6 +231,34 @@ class TestBuildPayload:
                 {"daily_goals": []}, day=None, overrides={"calories": 2500}
             )
 
+    @pytest.mark.parametrize("day", ["monday", None])
+    def test_meal_goals_are_carried_through_untouched(self, day):
+        """Per-meal goals ride along as they are on every goal — not cleared the
+        way python-myfitnesspal's set_new_goal clears them, and not rescaled by
+        a calories-only update. Their inner shape is opaque to this tool; the
+        entries here are placeholders."""
+        current = current_item()
+        for index, goal in enumerate(current["daily_goals"] + [current["default_goal"]]):
+            goal["meal_goals"] = [
+                {"meal_name": "Breakfast", "energy": {"value": 600 + index, "unit": "calories"}},
+                {"meal_name": "Dinner", "energy": {"value": 900 + index, "unit": "calories"}},
+            ]
+        expected = {
+            g.get("day_of_week", "default"): json.loads(json.dumps(g["meal_goals"]))
+            for g in current["daily_goals"] + [current["default_goal"]]
+        }
+
+        item = server.build_nutrient_goals_payload(
+            current, day=day, overrides={"calories": 3000}
+        )["item"]
+
+        got = {
+            g.get("day_of_week", "default"): g["meal_goals"]
+            for g in item["daily_goals"] + [item["default_goal"]]
+        }
+        assert got == expected
+        assert len(got) == 8  # seven days and the default goal
+
 
 class _Resp:
     def __init__(self, status, body):
