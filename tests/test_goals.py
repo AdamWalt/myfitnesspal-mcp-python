@@ -232,32 +232,43 @@ class TestBuildPayload:
             )
 
     @pytest.mark.parametrize("day", ["monday", None])
-    def test_meal_goals_are_carried_through_untouched(self, day):
+    @pytest.mark.parametrize(
+        "overrides",
+        [{"calories": 3000}, {"protein": 200}, {"calories": 3000, "fat": 90}],
+        ids=["calories-only", "macro-only", "calories-and-macro"],
+    )
+    def test_meal_goals_are_carried_through_untouched(self, day, overrides):
         """Per-meal goals ride along as they are on every goal — not cleared the
         way python-myfitnesspal's set_new_goal clears them, and not rescaled by
         a calories-only update. Their inner shape is opaque to this tool; the
         entries here are placeholders."""
-        current = current_item()
-        for index, goal in enumerate(current["daily_goals"] + [current["default_goal"]]):
-            goal["meal_goals"] = [
-                {"meal_name": "Breakfast", "energy": {"value": 600 + index, "unit": "calories"}},
-                {"meal_name": "Dinner", "energy": {"value": 900 + index, "unit": "calories"}},
-            ]
-        expected = {
-            g.get("day_of_week", "default"): json.loads(json.dumps(g["meal_goals"]))
-            for g in current["daily_goals"] + [current["default_goal"]]
-        }
+        current = _with_meal_goals(current_item())
+        before = _meal_goals_by_goal(current)
 
-        item = server.build_nutrient_goals_payload(
-            current, day=day, overrides={"calories": 3000}
-        )["item"]
+        item = server.build_nutrient_goals_payload(current, day=day, overrides=overrides)["item"]
 
-        got = {
-            g.get("day_of_week", "default"): g["meal_goals"]
-            for g in item["daily_goals"] + [item["default_goal"]]
-        }
-        assert got == expected
-        assert len(got) == 8  # seven days and the default goal
+        assert _meal_goals_by_goal(item) == before
+        assert len(before) == 8  # seven days and the default goal
+        assert _meal_goals_by_goal(current) == before  # and the input is left alone
+
+
+def _with_meal_goals(item):
+    """Give every goal in `item` its own, distinct per-meal goals."""
+    for index, goal in enumerate(item["daily_goals"] + [item["default_goal"]]):
+        goal["meal_goals"] = [
+            {"meal_name": "Breakfast", "energy": {"value": 600 + index, "unit": "calories"}},
+            {"meal_name": "Dinner", "energy": {"value": 900 + index, "unit": "calories"}},
+        ]
+    return item
+
+
+def _meal_goals_by_goal(item):
+    """Each goal's meal_goals as canonical JSON text: an exact, independent
+    snapshot (a later mutation can't change it, and 600 != 600.0)."""
+    return {
+        goal.get("day_of_week", "default"): json.dumps(goal.get("meal_goals"), sort_keys=True)
+        for goal in item["daily_goals"] + [item["default_goal"]]
+    }
 
 
 class _Resp:
@@ -327,6 +338,15 @@ class TestSetNutrientGoals:
         assert c.posted["item"]["valid_from"] == TODAY
         assert "valid_to" not in c.posted["item"]
         assert saved["default_goal"]["energy"]["value"] == 2359
+
+    @pytest.mark.parametrize("day", ["monday", None])
+    def test_meal_goals_reach_the_post_body_unchanged(self, day):
+        # The whole path, not just the builder: what was fetched is what is sent.
+        fetched = _with_meal_goals(current_item())
+        before = _meal_goals_by_goal(fetched)
+        c = _GoalsClient({"items": [fetched]})
+        server.set_nutrient_goals(c, day=day, overrides={"calories": 3000})
+        assert _meal_goals_by_goal(c.posted["item"]) == before
 
     def test_post_failure_raises(self):
         c = _GoalsClient(

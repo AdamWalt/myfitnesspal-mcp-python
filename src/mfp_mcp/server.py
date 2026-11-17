@@ -2663,10 +2663,11 @@ async def mfp_set_goals(params: SetGoalsInput) -> str:
     """
     Update daily nutrition goals (calories, protein, carbs, fat).
 
-    Only the nutrients you provide change; everything else is preserved — the
-    micronutrient targets, the exercise split, and (when setting one day) the
-    other six days. This is a read-modify-write of MyFitnessPal's weekly goal,
-    so nothing you leave out is lost.
+    Only the nutrients you provide change; everything else is sent back as it
+    was read — the micronutrient targets, the exercise split, any per-meal
+    goals, and (when setting one day) the other six days. This is a
+    read-modify-write of MyFitnessPal's weekly goal, so nothing you leave out
+    is lost.
 
     One deliberate exception: if `calories` is the only value you pass, carbs,
     protein and fat are rescaled by the same factor so the macro split is kept
