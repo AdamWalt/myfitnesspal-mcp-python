@@ -687,6 +687,10 @@ Search the MyFitnessPal food database.
 - `limit` (optional): Max results (default 10, max 50)
 - `response_format`: "markdown" or "json"
 
+Each result has `mfp_id`, `name`, `brand`, `calories`, `energy`, `energy_unit` and `verified`. `calories` is always kcal. `energy` and `energy_unit` (`calories` or `kilojoules`) carry the value the way the account displays it, so on a kilojoule account `energy` is the kJ figure and `calories` is that figure converted.
+
+**Changed from earlier versions:** results no longer include `serving` (it cost one extra request per result; `mfp_get_food_details` returns the serving sizes), and they add `energy`, `energy_unit` and `verified`. A search made with an expired session now returns an error instead of `count: 0`.
+
 ### mfp_get_food_details
 Get detailed nutrition for a food item.
 - `mfp_id` (required): MyFitnessPal food ID from search results

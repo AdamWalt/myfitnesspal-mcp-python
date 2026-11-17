@@ -30,6 +30,7 @@ from pathlib import Path
 from typing import Optional, Dict, Any, List, Tuple
 from enum import Enum
 from collections import OrderedDict
+import re
 import time
 from cryptography.fernet import Fernet
 import keyring
@@ -2059,6 +2060,196 @@ async def mfp_get_diary(params: GetDiaryInput) -> str:
         return f"Error retrieving diary: {str(e)}"
 
 
+# MFP's web food-search page returns HTML. python-myfitnesspal scrapes it, but
+# its parser does `float(value.replace("calories", "").strip())`, which raises on
+# accounts whose energy unit is kilojoules (the AU/NZ default): "649 kilojoules"
+# -> ValueError, so search is unusable for those users (issue #25). We replicate
+# the request and parse the energy cell unit-aware instead. We also skip the
+# per-result detail fetch the library's FoodItem.serving triggers — search is for
+# discovery; mfp_get_food_details carries full nutrition and serving sizes.
+# The energy token is unit-anchored so it is found wherever it sits in the
+# comma-separated info line, and the number may carry a thousands separator —
+# otherwise splitting the line on "," first would turn "3,500 kilojoules" into
+# "500" (kJ values routinely exceed 1000). Observed live: MFP currently renders
+# "1380 calories" with no separator, but kJ accounts aren't testable here, so we
+# tolerate both forms.
+_SEARCH_ENERGY_RE = re.compile(
+    r"([\d,]+(?:\.\d+)?)\s*(kilojoules?|kj|calories?|kcal|cal)\b", re.I
+)
+
+
+def _parse_search_energy(text: Optional[str]) -> Tuple[Optional[float], Optional[str]]:
+    """Return (value, unit) for the energy in a search info line, e.g.
+    '…, 1 serving, 1,380 calories' -> (1380.0, 'calories').
+
+    Scans the whole line and takes the last unit-tagged number (energy follows
+    brand/serving), so it never truncates a 4-digit value or raises on the unit
+    (the #25 crash). (None, None) when no unit-tagged number is present.
+    """
+    if not text:
+        return None, None
+    matches = _SEARCH_ENERGY_RE.findall(text)
+    if not matches:
+        return None, None
+    number, unit = matches[-1]
+    try:
+        value = float(number.replace(",", ""))
+    except ValueError:
+        return None, None
+    u = unit.lower()
+    return value, ("kilojoules" if u.startswith("kilojoule") or u == "kj" else "calories")
+
+
+# A comma that separates fields: any comma except one between two digits.
+_SEARCH_FIELD_COMMA_RE = re.compile(r"(?<!\d),|,(?!\d)")
+
+
+def _parse_search_brand(text: Optional[str]) -> str:
+    """Brand from a search info line '<brand…>, <serving>, <energy>'. The energy
+    token is stripped first so a thousands separator in it can't shift the
+    comma-separated fields. Returns '' when there is only a serving + energy."""
+    if not text:
+        return ""
+    head = text
+    for match in _SEARCH_ENERGY_RE.finditer(text):
+        head = text[: match.start()]  # keep trimming to the last energy token
+    # Split on the field commas, not on a thousands separator inside the serving
+    # ("0.5 cup (1,000 g)").
+    parts = [p.strip() for p in _SEARCH_FIELD_COMMA_RE.split(head) if p.strip()]
+    # The last remaining field is the serving; the brand is everything before it.
+    # Rejoin with ", " so a brand that itself contains a comma ("Foo, Inc.")
+    # reads as written rather than losing it. The line gives no way to tell a
+    # comma in the brand from one in the serving, so a serving written with a
+    # comma ("1 cup, chopped") still leaks its first half into the brand — the
+    # same limit python-myfitnesspal's parser has.
+    return ", ".join(parts[:-1]).strip() if len(parts) >= 2 else ""
+
+
+# 1 kcal = 4.184 kJ (the factor MyFitnessPal's own web client uses).
+_SEARCH_KJ_PER_KCAL = 4.184
+
+
+def _energy_as_kcal(value: Optional[float], unit: Optional[str]) -> Optional[float]:
+    """Energy expressed in kcal whatever the account's unit, for the `calories`
+    field older callers read. None when the row had no energy."""
+    if value is None:
+        return None
+    if unit == "kilojoules":
+        return round(value / _SEARCH_KJ_PER_KCAL, 1)
+    return value
+
+
+def _raise_if_login_page(response) -> None:
+    """Raise a clear auth error when MyFitnessPal answered with its login page.
+
+    An expired or missing session is redirected (302) to /account/login, which
+    still comes back as HTTP 200. Neither the status code nor the text
+    "Matching Foods:" tells that apart from a search with no matches: the login
+    page ships the site's translation bundle, which contains that very string.
+    The final URL does (observed live, 2026-11-15). Without this, a dead
+    session reads as "0 results" rather than as an auth failure.
+    """
+    if "/account/login" in str(getattr(response, "url", "") or ""):
+        raise RuntimeError(
+            "MyFitnessPal redirected the food search to its login page: the "
+            "session has expired or is not authenticated. Run "
+            "refresh_browser_cookies and try again."
+        )
+
+
+def _has_search_results_section(document) -> bool:
+    """True when the page carries the search-results scaffold, which MFP renders
+    even for zero matches (an `#sort-block` holding the "Matching Foods:"
+    heading). Either marker is enough: the id does not depend on the account's
+    language, the heading does not depend on the id. Text that is not rendered
+    as page content (scripts, styles, templates, the title…) is ignored so a
+    translation bundle can't pass for the heading."""
+    return bool(
+        document.xpath(
+            "//*[@id='sort-block'] | "
+            "//*[not(self::script or self::style or self::noscript or self::template"
+            " or self::title or self::textarea)]"
+            "/text()[contains(., 'Matching Foods:')]"
+        )
+    )
+
+
+def search_food(client, query: str, limit: int) -> List[Dict[str, Any]]:
+    """Search MFP's food database, parsing energy unit-aware (kJ-safe).
+
+    Replicates the web search request python-myfitnesspal makes (GET the form for
+    its CSRF token, POST the query), then parses the result list ourselves.
+    Returns up to `limit` items: id, name, brand, calories (kcal), energy,
+    energy_unit, verified.
+
+    Raises:
+        RuntimeError: on an HTTP error, when the session is redirected to the
+            login page, or when the response is not a search-results page.
+    """
+    import lxml.html
+
+    search_url = f"{MFP_WEB_BASE}/food/search"
+    page = client.session.get(search_url, timeout=30)
+    if page.status_code != 200:
+        raise RuntimeError(f"Could not load the food-search page: HTTP {page.status_code}")
+    _raise_if_login_page(page)
+    form = lxml.html.document_fromstring(page.content.decode("utf-8", errors="replace"))
+    tokens = form.xpath("(//input[@name='authenticity_token']/@value)[1]")
+    if not tokens:
+        raise RuntimeError("Food-search page did not return a CSRF token")
+
+    response = client.session.post(
+        search_url,
+        data={
+            "authenticity_token": tokens[0],
+            "search": query,
+            "date": date.today().strftime("%Y-%m-%d"),
+            "meal": "0",
+        },
+        timeout=30,
+    )
+    if response.status_code != 200:
+        raise RuntimeError(f"Food search request failed: HTTP {response.status_code}")
+    _raise_if_login_page(response)
+
+    document = lxml.html.document_fromstring(response.content.decode("utf-8", errors="replace"))
+    items = document.xpath("//li[@class='matched-food']")
+    # A results page with no matches is an empty result set -> return []. Any
+    # other 200 without results is not: say so instead of reporting 0 foods.
+    if not items and not _has_search_results_section(document):
+        raise RuntimeError(
+            "MyFitnessPal did not return a search-results page (no results "
+            "section found); the session may have expired."
+        )
+    results: List[Dict[str, Any]] = []
+    for item in items:
+        anchors = item.xpath(".//div[@class='search-title-container']/a")
+        if not anchors:
+            continue
+        anchor = anchors[0]
+        info = item.xpath(".//p[@class='search-nutritional-info']")
+        info_text = (info[0].text or "").strip() if info else ""
+        energy, energy_unit = _parse_search_energy(info_text)
+        results.append({
+            "mfp_id": anchor.get("data-external-id"),
+            "name": (anchor.text or "").strip(),
+            "brand": _parse_search_brand(info_text),
+            # `calories` is always kcal (converted on kilojoule accounts), kept
+            # for callers of the previous schema; energy/energy_unit carry the
+            # value exactly as the account displays it.
+            "calories": _energy_as_kcal(energy, energy_unit),
+            "energy": energy,
+            "energy_unit": energy_unit,
+            # whole-word 'verified' so a 'unverified' class can't false-positive
+            "verified": bool(item.xpath(
+                ".//div[contains(concat(' ', normalize-space(@class), ' '), ' verified ')]"
+            )),
+        })
+        if len(results) >= limit:
+            break
+    return results
+
+
 @mcp.tool(
     name="mfp_search_food",
     annotations={
@@ -2073,8 +2264,14 @@ async def mfp_search_food(params: SearchFoodInput) -> str:
     """
     Search the MyFitnessPal food database for food items.
 
-    Returns a list of matching foods with their name, brand, serving size,
-    calories, and MFP ID (which can be used with mfp_get_food_details).
+    Returns matching foods with name, brand, calories (always kcal), energy and
+    its unit ('calories' or 'kilojoules', as the account displays it), a
+    verified flag, and the MFP ID. Pass the id to mfp_get_food_details for full
+    nutrition and serving sizes.
+
+    Energy is parsed unit-aware, so kilojoule accounts (AU/NZ) work too rather
+    than erroring. An expired session is reported as an error, not as zero
+    results.
 
     Args:
         params: SearchFoodInput containing:
@@ -2083,32 +2280,17 @@ async def mfp_search_food(params: SearchFoodInput) -> str:
             - response_format (str): 'markdown' or 'json'
 
     Returns:
-        str: List of matching food items with basic nutrition info
+        str: Matching foods — id, name, brand, calories, energy, energy_unit, verified
     """
     try:
         client = get_mfp_client()
-        results = client.get_food_search_results(params.query)
-
-        # Limit results
-        results = results[: params.limit]
-
-        data = {"query": params.query, "count": len(results), "results": []}
-
-        for item in results:
-            data["results"].append(
-                {
-                    "name": item.name,
-                    "brand": item.brand,
-                    "serving": item.serving,
-                    "calories": item.calories,
-                    "mfp_id": item.mfp_id,
-                }
-            )
-
+        results = await asyncio.to_thread(
+            search_food, client, params.query, params.limit
+        )
+        data = {"query": params.query, "count": len(results), "results": results}
         return format_response(
             data, params.response_format, f"Food Search Results for '{params.query}'"
         )
-
     except Exception as e:
         return f"Error searching foods: {str(e)}"
 
