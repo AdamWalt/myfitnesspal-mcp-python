@@ -1231,7 +1231,12 @@ class QuickAddInput(BaseModel):
 
     model_config = ConfigDict(str_strip_whitespace=True)
 
-    calories: float = Field(..., description="Calories to log (kcal).", ge=1, le=10000)
+    calories: float = Field(
+        ...,
+        description="Calories to log, in kcal (behavior on kJ-unit accounts is unverified).",
+        ge=1,
+        le=10000,
+    )
     carbohydrates: Optional[float] = Field(
         default=None, description="Carbohydrates in grams (optional).", ge=0, le=2000
     )
@@ -1365,8 +1370,9 @@ class RemoveFoodFromDiaryInput(BaseModel):
         default=None,
         description=(
             "The entry's v2 diary id (a UUID): what mfp_add_food_to_diary "
-            "returns and mfp_get_food_entries lists as `id`. Deletes exactly "
-            "that entry. If omitted, name_contains is used to match by name."
+            "and mfp_quick_add return, and mfp_get_food_entries lists as `id`. "
+            "Deletes exactly that entry. If omitted, name_contains is used to "
+            "match by name."
         ),
     )
     name_contains: Optional[str] = Field(
@@ -3577,7 +3583,8 @@ async def mfp_quick_add(params: QuickAddInput) -> str:
 
     Args:
         params: QuickAddInput containing:
-            - calories (float): calories to log (required)
+            - calories (float): calories to log, in kcal (required). Behavior
+              on kJ-unit accounts is unverified.
             - carbohydrates / protein / fat (float, optional): grams
             - meal (str): meal to log under (see mfp_list_meals); default Breakfast
             - date (str, optional): YYYY-MM-DD, defaults to today
@@ -3585,10 +3592,13 @@ async def mfp_quick_add(params: QuickAddInput) -> str:
 
     Returns:
         str: Confirmation with the entry id, resolved meal, and what was logged.
-            The entry id is valid until the entry is edited elsewhere: an edit
-            can give the entry a new id (seen with the MyFitnessPal iOS app),
-            and mfp_remove_food_from_diary then fails with HTTP 404 for the old
-            one. mfp_get_food_entries lists the current id.
+            entry_id can come back null (add_food_to_diary may return no id);
+            use mfp_get_food_entries to find the entry. The entry id is valid
+            until the entry is edited elsewhere: an edit can give the entry a
+            new id (seen with the MyFitnessPal iOS app), and
+            mfp_remove_food_from_diary then fails with
+            `Error removing food: Remove failed for entry <id>: HTTP 404`
+            for the old one. mfp_get_food_entries lists the current id.
     """
     try:
         client = get_mfp_client()
@@ -3700,11 +3710,13 @@ async def mfp_remove_food_from_diary(params: RemoveFoodFromDiaryInput) -> str:
 
     1. By entry_id (precise): delete exactly the entry whose id matches.
        The id is the entry's v2 diary id (a UUID): `mfp_add_food_to_diary`
-       returns it when you log a food, and `mfp_get_food_entries` lists it
-       as `id` for every entry of a day. `mfp_get_diary` does not include
-       ids. Use this when you already know the ID. An id MyFitnessPal does
-       not have fails with HTTP 404; an entry's id can change when it is
-       edited elsewhere, and `mfp_get_food_entries` lists the current one.
+       and `mfp_quick_add` return it when you log a food, and
+       `mfp_get_food_entries` lists it as `id` for every entry of a day.
+       `mfp_get_diary` does not include ids. Use this when you already know
+       the ID. An id MyFitnessPal does not have fails with
+       `Error removing food: Remove failed for entry <id>: HTTP 404`; an
+       entry's id can change when it is edited elsewhere, and
+       `mfp_get_food_entries` lists the current one.
 
     2. By name_contains (fuzzy): list the day's entries, find ones whose
        name contains the given substring (case-insensitive), optionally
@@ -3712,9 +3724,9 @@ async def mfp_remove_food_from_diary(params: RemoveFoodFromDiaryInput) -> str:
 
     Args:
         params: RemoveFoodFromDiaryInput with one of:
-            - entry_id: the entry's v2 diary id, from mfp_add_food_to_diary
-              or mfp_get_food_entries (NOT the numeric food_entry_id from
-              the diary page)
+            - entry_id: the entry's v2 diary id, from mfp_add_food_to_diary,
+              mfp_quick_add, or mfp_get_food_entries (NOT the numeric
+              food_entry_id from the diary page)
             - name_contains: substring match against entry names
             - meal: with name_contains, restrict matching to one meal
             - max_matches: safety cap for fuzzy matches (default 1)
