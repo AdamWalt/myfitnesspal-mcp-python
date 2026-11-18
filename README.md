@@ -12,6 +12,7 @@ A [Model Context Protocol (MCP)](https://modelcontextprotocol.io/) server that e
 | `mfp_get_food_details` | Read | Get detailed nutrition info for a food item |
 | `mfp_add_food_to_diary` | Write | Add a food item to your diary for a specific meal and date |
 | `mfp_list_meals` | Read | List the account's configured meal names (incl. renamed/custom) for use with `mfp_add_food_to_diary` |
+| `mfp_quick_add` | Write | Quick Add raw calories (+ optional macros) with no food lookup |
 | `mfp_remove_food_from_diary` | Write | Remove a logged entry from your diary |
 | `mfp_create_custom_food` | Write | Create a private custom food with a full nutrition panel |
 | `mfp_list_own_foods` | Read | List your own custom foods (private ones do not appear in search) |
@@ -713,6 +714,16 @@ The first call reads the diary page once to learn the account's meal names (cach
 ### mfp_list_meals
 List the account's configured meal names, in diary order and spelled the way the account defines them (for example `Breakfast`, a localized `Almoço`, or a custom `During Ride`). These are the values `mfp_add_food_to_diary` accepts for `meal`.
 - `response_format`: "markdown" or "json"
+
+### mfp_quick_add
+Quick Add raw calories (and optional carbs/protein/fat) with no food lookup — the equivalent of MyFitnessPal's "Quick Add". Use it to log an energy/macro total directly when you don't have or don't need a specific food (a rough restaurant meal, a ride-fuel total). The entry is backed by a throwaway food that's deleted after logging, so it doesn't clutter your food list (the entry keeps its own nutrition — the same way MFP's own Quick Add works).
+- `calories` (required): Calories to log
+- `carbohydrates` / `protein` / `fat` (optional): grams (fractions are fine, e.g. `7.5`)
+- `meal` (optional): Meal to log under (see `mfp_list_meals`; default "Breakfast")
+- `date` (optional): YYYY-MM-DD format (default: today)
+- `name` (optional): Label for the entry (default: "Quick Add")
+
+Returns the new entry's `entry_id`, which `mfp_remove_food_from_diary` accepts. That id is valid until the entry is edited elsewhere: an edit can give the entry a new id (seen with the MyFitnessPal iOS app), and `mfp_remove_food_from_diary` then fails with HTTP 404 for the old one. `mfp_get_food_entries` lists the entry's current id.
 
 ### mfp_create_custom_food
 Create a private custom food in your account. Returns the new food's `id`, which
