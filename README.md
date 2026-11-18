@@ -20,8 +20,8 @@ A [Model Context Protocol (MCP)](https://modelcontextprotocol.io/) server that e
 | `mfp_get_measurements` | Read | Get weight/body measurement history |
 | `mfp_set_measurement` | Write | Log a new weight or body measurement |
 | `mfp_get_exercises` | Read | Get logged exercises (cardio & strength) |
-| `mfp_get_goals` | Read | Get daily nutrition goals |
-| `mfp_set_goals` | Write | Update daily nutrition goals |
+| `mfp_get_goals` | Read | Get nutrition goals (per-day with `all_days`) |
+| `mfp_set_goals` | Write | Update nutrition goals (whole week or a single day) |
 | `mfp_get_water` | Read | Get water intake for a date |
 | `mfp_set_water` | Write | Log water intake for a date |
 | `mfp_get_steps` | Read | Get daily step counts synced from Apple Health / devices |
@@ -799,16 +799,20 @@ Get exercise log for a date.
 - `response_format`: "markdown" or "json"
 
 ### mfp_get_goals
-Get daily nutrition goals.
+Get nutrition goals. By default returns the goal that applies on `date` (MyFitnessPal resolves the weekday for you).
 - `date` (optional): YYYY-MM-DD (default today)
+- `all_days` (optional): when true, return the full weekly breakdown — all 7 weekdays plus the default goal — for accounts that set different goals per day (Premium). Each row reports `energy` with its `energy_unit` (`calories` or `kilojoules`, as the account stores it), plus carbs, protein, fat, sodium, sugar and fiber.
 - `response_format`: "markdown" or "json"
 
 ### mfp_set_goals
-Update nutrition goals.
+Update nutrition goals. Read-modify-write: only the nutrients you pass change; the micronutrient targets, the exercise split, any per-meal goals, and (when setting one day) the other six days are all sent back as they were read.
+
+**Calories on their own rescale the macros.** If `calories` is the only value you pass, carbs, protein and fat are scaled by the same factor (rounded to whole grams), so the macro split is kept and the macros follow the new calories (to within whole-gram rounding) — the same thing MyFitnessPal's goal editor does. Pass any macro explicitly to set exact grams instead; nothing is rescaled then.
 - `calories` (optional): Daily calorie goal
 - `protein` (optional): Daily protein in grams
 - `carbohydrates` (optional): Daily carbs in grams
 - `fat` (optional): Daily fat in grams
+- `day` (optional): weekday to update (e.g. `monday`), for Premium accounts with different goals per day. Omit to set every day of the week (and the default) to the same values. Different goals per weekday are a MyFitnessPal Premium feature: after a per-day write the tool compares what MyFitnessPal saved with what was sent and returns an error if the weekday did not keep the value, rather than reporting success.
 
 ### mfp_get_water
 Get water intake for a date.
