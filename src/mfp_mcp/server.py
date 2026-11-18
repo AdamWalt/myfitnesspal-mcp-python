@@ -1273,14 +1273,19 @@ class RemoveFoodFromDiaryInput(BaseModel):
 
     date: Optional[str] = Field(
         default=None,
-        description="Date in YYYY-MM-DD format. Defaults to today.",
+        description=(
+            "Date in YYYY-MM-DD format. Defaults to today. With "
+            "name_contains, the day to search; with entry_id it is not "
+            "used to find the entry."
+        ),
         pattern=r"^\d{4}-\d{2}-\d{2}$",
     )
     entry_id: Optional[str] = Field(
         default=None,
         description=(
-            "Specific food_entry_id to remove. If omitted, name_contains is "
-            "used to match by name."
+            "The entry's v2 diary id (a UUID): what mfp_add_food_to_diary "
+            "returns and mfp_get_food_entries lists as `id`. Deletes exactly "
+            "that entry. If omitted, name_contains is used to match by name."
         ),
     )
     name_contains: Optional[str] = Field(
@@ -1293,7 +1298,10 @@ class RemoveFoodFromDiaryInput(BaseModel):
     meal: Optional[str] = Field(
         default=None,
         description=(
-            "Restrict matching to a meal: Breakfast, Lunch, Dinner, Snacks."
+            "With name_contains, only match entries in this meal. "
+            "Case-insensitive, and part of the meal's name is enough, so "
+            "'lunch' also matches a custom meal named 'Second Lunch' "
+            "(see mfp_list_meals for the account's meal names)."
         ),
     )
     max_matches: int = Field(
@@ -3138,9 +3146,13 @@ async def mfp_remove_food_from_diary(params: RemoveFoodFromDiaryInput) -> str:
 
     Two modes:
 
-    1. By entry_id (precise): delete exactly the entry whose id matches -
-       this is the UUID `mfp_add_food_to_diary` returned when you logged it.
-       Use this when you already know the ID.
+    1. By entry_id (precise): delete exactly the entry whose id matches.
+       The id is the entry's v2 diary id (a UUID): `mfp_add_food_to_diary`
+       returns it when you log a food, and `mfp_get_food_entries` lists it
+       as `id` for every entry of a day. `mfp_get_diary` does not include
+       ids. Use this when you already know the ID. An id MyFitnessPal does
+       not have fails with HTTP 404; an entry's id can change when it is
+       edited elsewhere, and `mfp_get_food_entries` lists the current one.
 
     2. By name_contains (fuzzy): list the day's entries, find ones whose
        name contains the given substring (case-insensitive), optionally
@@ -3148,15 +3160,21 @@ async def mfp_remove_food_from_diary(params: RemoveFoodFromDiaryInput) -> str:
 
     Args:
         params: RemoveFoodFromDiaryInput with one of:
-            - entry_id: the entry's UUID, as returned by
-              mfp_add_food_to_diary (NOT a food_entry_id from the diary page)
+            - entry_id: the entry's v2 diary id, from mfp_add_food_to_diary
+              or mfp_get_food_entries (NOT the numeric food_entry_id from
+              the diary page)
             - name_contains: substring match against entry names
-            - meal: restrict matching to one meal
+            - meal: with name_contains, restrict matching to one meal
             - max_matches: safety cap for fuzzy matches (default 1)
-            - date: date to operate on (default today)
+            - date: with name_contains, the day to search (default today)
 
     Returns:
-        JSON describing each entry that was removed.
+        JSON describing each entry that was removed. Entries removed by
+        name are listed with the diary page's numeric id, not their v2
+        diary id. A by-name call reports no match both when nothing
+        matches and when the diary page could not be read, and one that
+        fails part-way returns only the error: entries it had already
+        removed stay removed.
     """
     try:
         client = get_mfp_client()
