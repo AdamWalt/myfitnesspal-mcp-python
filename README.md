@@ -757,8 +757,18 @@ food is referenced by a logged diary entry.
 - `food_id` (required): Food id from `mfp_create_custom_food` or `mfp_list_own_foods`
 
 ### mfp_remove_food_from_diary
-Remove a logged entry from your diary.
-- `entry_id` (required): Diary entry id (from `mfp_get_diary`)
+Remove one or more logged entries from your diary. Pass either `entry_id` (exact) or `name_contains` (by name).
+- `entry_id` (optional): The entry's v2 diary id; deletes exactly that entry. `mfp_add_food_to_diary` returns it when you log a food, and `mfp_get_food_entries` lists it as `id` for every entry of a day (`mfp_get_diary` does not include ids). When set, `name_contains`, `meal` and `max_matches` are ignored, and `date` is not used to find the entry.
+- `name_contains` (optional): Text to look for in the day's entries, case-insensitive. It is matched against each entry's line on the diary page, which includes the serving (e.g. `banana` or `0.5 cup rice`).
+- `meal` (optional): With `name_contains`, only match entries in this meal. Case-insensitive, and part of the meal's name is enough, so `lunch` also matches a custom meal named `Second Lunch`.
+- `max_matches` (optional): With `name_contains`, the most entries to delete in one call, taken in diary order (default: 1, max: 50)
+- `date` (optional): With `name_contains`, the day to search, in YYYY-MM-DD format (default: today)
+
+By id, an id MyFitnessPal does not have fails with `Remove failed for entry <id>: HTTP 404`. An entry's id can change when the entry is edited elsewhere (seen with the MyFitnessPal iOS app); `mfp_get_food_entries` lists the current one.
+
+By name, the response lists what was removed and reports `matched_count` and `remaining_matches_skipped`, so you can see when more entries matched than `max_matches` allowed. Those entries are listed with the diary page's numeric id, which is not the id `entry_id` takes. Two limits to know:
+- If nothing matches, nothing is deleted and `success` is `false`. A diary page that could not be read (a login page, for instance) gives the same result, so a no-match does not prove the entry is gone.
+- If a removal fails part-way through, the call returns only the error. Entries removed before it stay removed, so check the day with `mfp_get_food_entries`.
 
 ### mfp_get_measurements
 Get body measurement history.
