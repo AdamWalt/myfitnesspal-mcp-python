@@ -1226,6 +1226,42 @@ class AddFoodToDiaryInput(BaseModel):
     )
 
 
+class QuickAddInput(BaseModel):
+    """Input model for a Quick Add (raw calories/macros, no food lookup)."""
+
+    model_config = ConfigDict(str_strip_whitespace=True)
+
+    calories: float = Field(..., description="Calories to log (kcal).", ge=1, le=10000)
+    carbohydrates: Optional[float] = Field(
+        default=None, description="Carbohydrates in grams (optional).", ge=0, le=2000
+    )
+    protein: Optional[float] = Field(
+        default=None, description="Protein in grams (optional).", ge=0, le=2000
+    )
+    fat: Optional[float] = Field(
+        default=None, description="Fat in grams (optional, e.g. 7.5).", ge=0, le=2000
+    )
+    meal: str = Field(
+        default="Breakfast",
+        description=(
+            "Meal to log under, matched case-insensitively to one of the account's "
+            "configured meals (see mfp_list_meals). An unmatched name is rejected, "
+            "not silently misfiled."
+        ),
+    )
+    date: Optional[str] = Field(
+        default=None,
+        description="Date in YYYY-MM-DD format. Defaults to today if not specified.",
+        pattern=r"^\d{4}-\d{2}-\d{2}$",
+    )
+    name: str = Field(
+        default="Quick Add",
+        description="Label shown for the entry (defaults to 'Quick Add').",
+        min_length=1,
+        max_length=100,
+    )
+
+
 class CreateCustomFoodInput(BaseModel):
     """Input model for creating a private custom food."""
 
@@ -1318,14 +1354,19 @@ class RemoveFoodFromDiaryInput(BaseModel):
 
     date: Optional[str] = Field(
         default=None,
-        description="Date in YYYY-MM-DD format. Defaults to today.",
+        description=(
+            "Date in YYYY-MM-DD format. Defaults to today. With "
+            "name_contains, the day to search; with entry_id it is not "
+            "used to find the entry."
+        ),
         pattern=r"^\d{4}-\d{2}-\d{2}$",
     )
     entry_id: Optional[str] = Field(
         default=None,
         description=(
-            "Specific food_entry_id to remove. If omitted, name_contains is "
-            "used to match by name."
+            "The entry's v2 diary id (a UUID): what mfp_add_food_to_diary "
+            "returns and mfp_get_food_entries lists as `id`. Deletes exactly "
+            "that entry. If omitted, name_contains is used to match by name."
         ),
     )
     name_contains: Optional[str] = Field(
@@ -1338,7 +1379,10 @@ class RemoveFoodFromDiaryInput(BaseModel):
     meal: Optional[str] = Field(
         default=None,
         description=(
-            "Restrict matching to a meal: Breakfast, Lunch, Dinner, Snacks."
+            "With name_contains, only match entries in this meal. "
+            "Case-insensitive, and part of the meal's name is enough, so "
+            "'lunch' also matches a custom meal named 'Second Lunch' "
+            "(see mfp_list_meals for the account's meal names)."
         ),
     )
     max_matches: int = Field(
@@ -1861,6 +1905,79 @@ def add_food_to_diary(
         logger.warning("Entry created but MyFitnessPal returned no entry id")
         entry_id = None
     return entry_id, meal_name
+
+
+def quick_add_to_diary(
+    client,
+    *,
+    calories: float,
+    meal: str,
+    target_date: date,
+    carbohydrates: Optional[float] = None,
+    protein: Optional[float] = None,
+    fat: Optional[float] = None,
+    name: str = "Quick Add",
+) -> Tuple[Optional[str], str]:
+    """
+    Log raw calories/macros with no food lookup ("Quick Add"), mirroring the app.
+
+    MyFitnessPal has no clean JSON endpoint for a Quick Add (the app writes it
+    through a legacy binary sync channel), but a Quick Add is really just a diary
+    entry backed by a one-off food. So this creates a private food whose single
+    serving equals the given macros, logs one serving to the meal, then deletes
+    that backing food so it does not clutter the user's food list. The diary
+    entry keeps its own nutrition and survives the deletion — exactly how
+    MyFitnessPal's own Quick Add works (its backing food is flagged deleted).
+
+    Returns:
+        (entry id or None if MFP returned none, the resolved account meal name)
+
+    Raises:
+        RuntimeError: If the food cannot be created or the entry cannot be logged.
+    """
+    spec: Dict[str, Any] = {
+        "description": name,
+        "calories": calories,
+        "serving_amount": 1,
+        "serving_unit": "serving",
+    }
+    if carbohydrates is not None:
+        spec["carbs"] = carbohydrates
+    if protein is not None:
+        spec["protein"] = protein
+    if fat is not None:
+        spec["fat"] = fat
+
+    created = create_custom_food(client, spec)
+    food_id = created.get("id")
+    if not food_id:
+        # Rare: MFP returned success but no parseable id. The food may exist
+        # server-side, but with no id there is nothing to DELETE and no safe way
+        # to find it (matching by description could remove a real food of the
+        # same name), so we surface the error rather than guess. create_custom_food
+        # returns an id on every observed success, so this should not happen.
+        raise RuntimeError("Quick Add food was created but MyFitnessPal returned no id")
+
+    try:
+        entry_id, resolved_meal = add_food_to_diary(
+            client, mfp_id=str(food_id), meal=meal, target_date=target_date, quantity=1.0
+        )
+    except Exception:
+        # Don't leave an orphan food behind if logging failed.
+        try:
+            delete_custom_food(client, str(food_id))
+        except Exception:
+            pass
+        raise
+
+    # Make the backing food a throwaway. The diary entry keeps its own nutrition
+    # and remains, so a failed delete here is non-fatal (it just leaves a food).
+    try:
+        delete_custom_food(client, str(food_id))
+    except Exception as e:
+        logger.warning(f"Quick Add logged but backing food {food_id} not removed: {e}")
+
+    return entry_id, resolved_meal
 
 
 def list_diary_entries(client, target_date: date) -> List[Dict[str, str]]:
@@ -3439,6 +3556,77 @@ async def mfp_add_food_to_diary(params: AddFoodToDiaryInput) -> str:
         return f"Error adding food to diary: {str(e)}"
 
 
+@mcp.tool(
+    name="mfp_quick_add",
+    annotations={
+        "title": "Quick Add Calories",
+        "readOnlyHint": False,
+        "destructiveHint": False,
+        "idempotentHint": False,
+        "openWorldHint": True,
+    },
+)
+async def mfp_quick_add(params: QuickAddInput) -> str:
+    """
+    Quick Add raw calories (and optional carbs/protein/fat) with no food lookup.
+
+    Mirrors MyFitnessPal's "Quick Add": use it to log an energy/macro total
+    directly when you don't have (or don't need) a specific food — e.g. a rough
+    restaurant meal, or a ride fuel total. The entry is logged under the given
+    meal for the given date; only `calories` is required.
+
+    Args:
+        params: QuickAddInput containing:
+            - calories (float): calories to log (required)
+            - carbohydrates / protein / fat (float, optional): grams
+            - meal (str): meal to log under (see mfp_list_meals); default Breakfast
+            - date (str, optional): YYYY-MM-DD, defaults to today
+            - name (str): label for the entry (default 'Quick Add')
+
+    Returns:
+        str: Confirmation with the entry id, resolved meal, and what was logged.
+            The entry id is valid until the entry is edited elsewhere: an edit
+            can give the entry a new id (seen with the MyFitnessPal iOS app),
+            and mfp_remove_food_from_diary then fails with HTTP 404 for the old
+            one. mfp_get_food_entries lists the current id.
+    """
+    try:
+        client = get_mfp_client()
+        target_date = parse_date(params.date)
+
+        entry_id, resolved_meal = await asyncio.to_thread(
+            quick_add_to_diary,
+            client,
+            calories=params.calories,
+            meal=params.meal,
+            target_date=target_date,
+            carbohydrates=params.carbohydrates,
+            protein=params.protein,
+            fat=params.fat,
+            name=params.name,
+        )
+
+        return json.dumps(
+            {
+                "success": True,
+                "message": f"Quick-added {params.calories:g} cal to {resolved_meal}",
+                "entry_id": entry_id,
+                "date": str(target_date),
+                "meal": resolved_meal,
+                "logged": {
+                    "calories": params.calories,
+                    "carbohydrates": params.carbohydrates,
+                    "protein": params.protein,
+                    "fat": params.fat,
+                },
+            },
+            indent=2,
+        )
+
+    except Exception as e:
+        return f"Error quick-adding: {str(e)}"
+
+
 class ListMealsInput(BaseModel):
     """Input for `mfp_list_meals`."""
 
@@ -3510,9 +3698,13 @@ async def mfp_remove_food_from_diary(params: RemoveFoodFromDiaryInput) -> str:
 
     Two modes:
 
-    1. By entry_id (precise): delete exactly the entry whose id matches -
-       this is the UUID `mfp_add_food_to_diary` returned when you logged it.
-       Use this when you already know the ID.
+    1. By entry_id (precise): delete exactly the entry whose id matches.
+       The id is the entry's v2 diary id (a UUID): `mfp_add_food_to_diary`
+       returns it when you log a food, and `mfp_get_food_entries` lists it
+       as `id` for every entry of a day. `mfp_get_diary` does not include
+       ids. Use this when you already know the ID. An id MyFitnessPal does
+       not have fails with HTTP 404; an entry's id can change when it is
+       edited elsewhere, and `mfp_get_food_entries` lists the current one.
 
     2. By name_contains (fuzzy): list the day's entries, find ones whose
        name contains the given substring (case-insensitive), optionally
@@ -3520,15 +3712,21 @@ async def mfp_remove_food_from_diary(params: RemoveFoodFromDiaryInput) -> str:
 
     Args:
         params: RemoveFoodFromDiaryInput with one of:
-            - entry_id: the entry's UUID, as returned by
-              mfp_add_food_to_diary (NOT a food_entry_id from the diary page)
+            - entry_id: the entry's v2 diary id, from mfp_add_food_to_diary
+              or mfp_get_food_entries (NOT the numeric food_entry_id from
+              the diary page)
             - name_contains: substring match against entry names
-            - meal: restrict matching to one meal
+            - meal: with name_contains, restrict matching to one meal
             - max_matches: safety cap for fuzzy matches (default 1)
-            - date: date to operate on (default today)
+            - date: with name_contains, the day to search (default today)
 
     Returns:
-        JSON describing each entry that was removed.
+        JSON describing each entry that was removed. Entries removed by
+        name are listed with the diary page's numeric id, not their v2
+        diary id. A by-name call reports no match both when nothing
+        matches and when the diary page could not be read, and one that
+        fails part-way returns only the error: entries it had already
+        removed stay removed.
     """
     try:
         client = get_mfp_client()
