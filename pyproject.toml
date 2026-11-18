@@ -47,6 +47,9 @@ dependencies = [
     "pint>=0.22",
     "keyring>=24.0.0",
     "cryptography>=41.0.0",
+    # mfp_search_food parses the web search HTML with lxml (unit-aware energy,
+    # kJ-safe). lxml already arrives via myfitnesspal, but we import it directly.
+    "lxml>=4.9.0",
 ]
 
 [project.optional-dependencies]

@@ -8,7 +8,7 @@ water intake, and food search.
 Authentication Methods (in order of priority):
 1. Environment variables: MFP_USERNAME and MFP_PASSWORD
 2. Stored session cookies: ~/.mfp_mcp/cookies.json
-3. Chromium-based browser cookies (macOS): Arc, Chrome, Edge, Brave, Vivaldi,
+3. Chromium-based browser cookies (macOS): Arc, Dia, Chrome, Edge, Brave, Vivaldi,
    Opera, and any other installed Chromium browser detected via the keychain
    "Safe Storage" entry.
 4. browser_cookie3 fallback (legacy Chrome/Firefox paths on any OS)
@@ -31,6 +31,7 @@ from pathlib import Path
 from typing import Optional, Dict, Any, List, Tuple
 from enum import Enum
 from collections import OrderedDict
+import re
 import time
 from cryptography.fernet import Fernet
 import keyring
@@ -58,7 +59,6 @@ COOKIES_FILE = CONFIG_DIR / "cookies.json"
 # endpoint (/food/diary/{user}/add) was removed by MFP and now returns 404.
 MFP_API_BASE = "https://api.myfitnesspal.com"
 MFP_CLIENT_ID = "mfp-main-js"
-VALID_MEALS = ("Breakfast", "Lunch", "Dinner", "Snacks")
 
 
 # ============================================================================
@@ -158,7 +158,7 @@ def dict_to_cookiejar(cookies_dict: Dict[str, str], domain: str = ".myfitnesspal
 # Chromium Browser Cookie Extraction (macOS)
 # ============================================================================
 #
-# Chromium-based browsers (Arc, Chrome, Edge, Brave, Vivaldi, Opera, ...)
+# Chromium-based browsers (Arc, Dia, Chrome, Edge, Brave, Vivaldi, Opera, ...)
 # store cookies in a SQLite database with each value encrypted using
 # AES-128-CBC. The encryption key is derived from a per-browser password
 # stored in the macOS Keychain under a service name like
@@ -175,6 +175,8 @@ def dict_to_cookiejar(cookies_dict: Dict[str, str], domain: str = ".myfitnesspal
 _CHROMIUM_COOKIES_PATHS_MACOS: Dict[str, List[str]] = {
     "Arc":            ["Arc/User Data/Default/Network/Cookies",
                        "Arc/User Data/Default/Cookies"],
+    "Dia":            ["Dia/User Data/Default/Network/Cookies",
+                       "Dia/User Data/Default/Cookies"],
     "Chrome":         ["Google/Chrome/Default/Network/Cookies",
                        "Google/Chrome/Default/Cookies"],
     "Chromium":       ["Chromium/Default/Network/Cookies",
@@ -193,6 +195,7 @@ _CHROMIUM_COOKIES_PATHS_MACOS: Dict[str, List[str]] = {
 # mapped to the canonical "Safe Storage" service prefix.
 _CHROMIUM_BROWSER_ALIASES: Dict[str, str] = {
     "arc": "Arc",
+    "dia": "Dia",
     "chrome": "Chrome",
     "chromium": "Chromium",
     "edge": "Microsoft Edge",
@@ -609,7 +612,7 @@ def authenticate_with_credentials(username: str, password: str) -> Dict[str, str
                 "Login appeared to fail — response contained no session token. "
                 "MyFitnessPal's form login flow does not work against the "
                 "current NextAuth backend. Log into myfitnesspal.com in any "
-                "Chromium-based browser (Arc, Chrome, Edge, Brave, ...) and "
+                "Chromium-based browser (Arc, Dia, Chrome, Edge, Brave, ...) and "
                 "the MCP will pick up the session automatically."
             )
                 
@@ -628,7 +631,7 @@ def get_mfp_client():
        a. First tries previously-cached cookies for this user.
        b. Then falls back to form login (only useful on legacy accounts).
     2. Stored session cookies (~/.mfp_mcp/cookies.json)
-    3. Chromium-based browser cookies (macOS): auto-discovers Arc, Chrome,
+    3. Chromium-based browser cookies (macOS): auto-discovers Arc, Dia, Chrome,
        Edge, Brave, Vivaldi, Opera, or any other installed Chromium browser
        via the keychain's "Safe Storage" entries.
     4. `browser_cookie3` default fallback (legacy Chrome/Firefox paths).
@@ -741,7 +744,7 @@ def get_mfp_client():
             f"All authentication methods failed. Last error: {str(last_error)}\n\n"
             "Please try one of these solutions:\n"
             "1. Log into myfitnesspal.com in any Chromium-based browser "
-            "(Arc, Chrome, Edge, Brave, Vivaldi, Opera, ...) — the MCP will "
+            "(Arc, Dia, Chrome, Edge, Brave, Vivaldi, Opera, ...) — the MCP will "
             "auto-discover the session on macOS.\n"
             "2. Set MFP_USERNAME and MFP_PASSWORD in Claude Desktop config "
             "(legacy form-login flow; rarely works against the current "
@@ -1134,6 +1137,23 @@ class GetStepsInput(BaseModel):
         description="Output format: 'markdown' for human-readable or 'json' for structured data",
     )
 
+
+class GetFoodEntriesInput(BaseModel):
+    """Input model for listing a day's food entries with their times."""
+
+    model_config = ConfigDict(str_strip_whitespace=True)
+
+    date: Optional[str] = Field(
+        default=None,
+        description="Date in YYYY-MM-DD format. Defaults to today if not specified.",
+        pattern=r"^\d{4}-\d{2}-\d{2}$",
+    )
+    response_format: ResponseFormat = Field(
+        default=ResponseFormat.MARKDOWN,
+        description="Output format: 'markdown' for human-readable or 'json' for structured data",
+    )
+
+
 class GetReportInput(BaseModel):
     """Input model for getting nutrition reports."""
 
@@ -1171,7 +1191,13 @@ class AddFoodToDiaryInput(BaseModel):
     )
     meal: str = Field(
         default="Breakfast",
-        description="Meal name (e.g., 'Breakfast', 'Lunch', 'Dinner', 'Snacks')",
+        description=(
+            "Meal to log under, matched case-insensitively to one of the account's "
+            "configured meals. The defaults are Breakfast/Lunch/Dinner/Snacks, but "
+            "accounts can rename them (localized) or add custom meals — call "
+            "mfp_list_meals to see this account's meals. An unmatched name is rejected, "
+            "not silently misfiled."
+        ),
     )
     date: Optional[str] = Field(
         default=None,
@@ -1665,22 +1691,124 @@ def delete_custom_food(client, food_id: str) -> int:
     return r.status_code
 
 
+# Account meal names rarely change; cache them briefly, keyed by user id, so
+# logging many foods doesn't re-scrape the diary page on every add.
+_MEAL_NAMES_CACHE: Dict[str, Tuple[float, List[str]]] = {}
+_MEAL_NAMES_TTL = 300.0
+
+
+def _scrape_meal_names(client, target_date: date) -> List[str]:
+    """Read the diary page's meal headers exactly as the account spells them.
+
+    python-myfitnesspal reads the same `tr.meal_header` rows but lowercases the
+    text. The diary POST should carry the account's own spelling rather than
+    lean on MyFitnessPal matching case-insensitively, so read them directly.
+    """
+    import lxml.html
+
+    response = client.session.get(
+        f"{MFP_WEB_BASE}/food/diary",
+        params={"date": target_date.strftime("%Y-%m-%d")},
+        timeout=30,
+    )
+    if response.status_code != 200:
+        raise RuntimeError(
+            f"Could not load the diary page to read meal names: HTTP {response.status_code}"
+        )
+    # An expired session is redirected to the login page, which is still a 200.
+    if "/account/login" in str(getattr(response, "url", "") or ""):
+        raise RuntimeError(
+            "MyFitnessPal redirected the diary page to its login page: the session "
+            "has expired or is not authenticated. Run refresh_browser_cookies and "
+            "try again."
+        )
+    document = lxml.html.document_fromstring(
+        response.content.decode("utf-8", errors="replace")
+    )
+    names: List[str] = []
+    for cell in document.xpath("//tr[@class='meal_header']/td[1]"):
+        # The whole cell's text (not just its first text node, which would skip
+        # a name wrapped in a child element), with runs of whitespace —
+        # including non-breaking spaces — collapsed to single spaces.
+        name = " ".join(cell.text_content().split())
+        if name:
+            names.append(name)
+    return names
+
+
+def get_meal_names(client, target_date: Optional[date] = None, use_cache: bool = True) -> List[str]:
+    """Return the account's configured meal names, in diary order, spelled the
+    way the account defines them (e.g. 'Breakfast', or a custom 'During Ride').
+
+    MFP exposes no v2 endpoint for the meal list, so the diary page is the only
+    source (the same one mfp_get_diary reads). It reads a single day — the
+    configured meals are account-level and identical across days.
+
+    Cost: this is one extra HTML request, and it sits on the write path — the
+    first mfp_add_food_to_diary call fetches the diary page before posting. The
+    result is cached per user for a few minutes so bulk logging doesn't re-fetch.
+    An empty result (e.g. an expired session returning a login page) is never
+    cached, so the next call retries instead of failing for the whole TTL.
+    """
+    key = str(getattr(client, "user_id", "") or "")
+    if use_cache and key:
+        cached = _MEAL_NAMES_CACHE.get(key)
+        if cached and cached[0] > time.time():
+            return cached[1]
+    names = _scrape_meal_names(client, target_date or date.today())
+    if key and names:
+        _MEAL_NAMES_CACHE[key] = (time.time() + _MEAL_NAMES_TTL, names)
+    return names
+
+
+def _resolve_meal(meal: str, meal_names: List[str]) -> str:
+    """Match `meal` to one of the account's configured meals (case-insensitive)
+    and return the account's own spelling of it, which is what gets posted.
+
+    MFP's diary POST silently files an unrecognized meal_name under a default
+    meal (observed: the first one) instead of erroring, so entries get mis-logged
+    on accounts with renamed/localized/custom meals. We refuse a non-match and
+    name the valid options rather than let that happen.
+    """
+    if not meal_names:
+        raise RuntimeError(
+            "Could not read this account's meals from MyFitnessPal, so the entry "
+            "can't be placed safely. Try again, or check mfp_get_diary."
+        )
+    wanted = (meal or "").strip().casefold()
+    by_name = {name.strip().casefold(): name for name in meal_names}
+    if wanted in by_name:
+        return by_name[wanted]
+    # Tolerate a singular/plural slip (e.g. "snack" -> "snacks"), language-neutral.
+    # Not for an empty name: "" + "s" must not match a meal called "S".
+    alternates = {wanted + "s"} if wanted else set()
+    if wanted.endswith("s"):
+        alternates.add(wanted[:-1])
+    for alt in alternates:
+        if alt in by_name:
+            return by_name[alt]
+    raise RuntimeError(
+        f"Meal {meal!r} is not one of this account's meals "
+        f"({', '.join(meal_names)}). Use mfp_list_meals to list them."
+    )
+
+
 def add_food_to_diary(
     client, mfp_id: str, meal: str, target_date: date, quantity: float = 1.0, unit: Optional[str] = None
-) -> Optional[str]:
+) -> Tuple[Optional[str], str]:
     """
     Add a food item to the diary for a specific date and meal.
 
     Args:
         client: Authenticated myfitnesspal.Client instance
         mfp_id: MyFitnessPal food item ID
-        meal: Meal name (Breakfast, Lunch, Dinner, Snacks)
+        meal: Requested meal; matched against the account's configured meals
         target_date: Date to add the food entry
         quantity: Number of servings (default 1.0)
         unit: Optional serving unit to log against (e.g. "oz")
 
     Returns:
-        The new entry's UUID, or None if MFP did not return one
+        (entry id or None if MFP returned none, the resolved account meal name)
 
     Raises:
         RuntimeError: If the operation fails
@@ -1688,11 +1816,7 @@ def add_food_to_diary(
     food = get_food_v2(client, mfp_id)
     serving_size = select_serving_size(food, unit)
 
-    meal_name = meal.strip().capitalize()
-    if meal_name not in VALID_MEALS:
-        raise RuntimeError(
-            f"Invalid meal {meal!r}. Expected one of: {', '.join(VALID_MEALS)}"
-        )
+    meal_name = _resolve_meal(meal, get_meal_names(client, target_date))
 
     entry = {
         "type": "food_entry",
@@ -1732,10 +1856,11 @@ def add_food_to_diary(
     # MFP returns the new entry's id here and nowhere else - the diary page
     # exposes only legacy numeric ids, which the v2 API does not accept.
     try:
-        return response.json()["items"][0]["id"]
+        entry_id = response.json()["items"][0]["id"]
     except (ValueError, KeyError, IndexError):
         logger.warning("Entry created but MyFitnessPal returned no entry id")
-        return None
+        entry_id = None
+    return entry_id, meal_name
 
 
 def list_diary_entries(client, target_date: date) -> List[Dict[str, str]]:
@@ -1980,6 +2105,196 @@ async def mfp_get_diary(params: GetDiaryInput) -> str:
         return f"Error retrieving diary: {str(e)}"
 
 
+# MFP's web food-search page returns HTML. python-myfitnesspal scrapes it, but
+# its parser does `float(value.replace("calories", "").strip())`, which raises on
+# accounts whose energy unit is kilojoules (the AU/NZ default): "649 kilojoules"
+# -> ValueError, so search is unusable for those users (issue #25). We replicate
+# the request and parse the energy cell unit-aware instead. We also skip the
+# per-result detail fetch the library's FoodItem.serving triggers — search is for
+# discovery; mfp_get_food_details carries full nutrition and serving sizes.
+# The energy token is unit-anchored so it is found wherever it sits in the
+# comma-separated info line, and the number may carry a thousands separator —
+# otherwise splitting the line on "," first would turn "3,500 kilojoules" into
+# "500" (kJ values routinely exceed 1000). Observed live: MFP currently renders
+# "1380 calories" with no separator, but kJ accounts aren't testable here, so we
+# tolerate both forms.
+_SEARCH_ENERGY_RE = re.compile(
+    r"([\d,]+(?:\.\d+)?)\s*(kilojoules?|kj|calories?|kcal|cal)\b", re.I
+)
+
+
+def _parse_search_energy(text: Optional[str]) -> Tuple[Optional[float], Optional[str]]:
+    """Return (value, unit) for the energy in a search info line, e.g.
+    '…, 1 serving, 1,380 calories' -> (1380.0, 'calories').
+
+    Scans the whole line and takes the last unit-tagged number (energy follows
+    brand/serving), so it never truncates a 4-digit value or raises on the unit
+    (the #25 crash). (None, None) when no unit-tagged number is present.
+    """
+    if not text:
+        return None, None
+    matches = _SEARCH_ENERGY_RE.findall(text)
+    if not matches:
+        return None, None
+    number, unit = matches[-1]
+    try:
+        value = float(number.replace(",", ""))
+    except ValueError:
+        return None, None
+    u = unit.lower()
+    return value, ("kilojoules" if u.startswith("kilojoule") or u == "kj" else "calories")
+
+
+# A comma that separates fields: any comma except one between two digits.
+_SEARCH_FIELD_COMMA_RE = re.compile(r"(?<!\d),|,(?!\d)")
+
+
+def _parse_search_brand(text: Optional[str]) -> str:
+    """Brand from a search info line '<brand…>, <serving>, <energy>'. The energy
+    token is stripped first so a thousands separator in it can't shift the
+    comma-separated fields. Returns '' when there is only a serving + energy."""
+    if not text:
+        return ""
+    head = text
+    for match in _SEARCH_ENERGY_RE.finditer(text):
+        head = text[: match.start()]  # keep trimming to the last energy token
+    # Split on the field commas, not on a thousands separator inside the serving
+    # ("0.5 cup (1,000 g)").
+    parts = [p.strip() for p in _SEARCH_FIELD_COMMA_RE.split(head) if p.strip()]
+    # The last remaining field is the serving; the brand is everything before it.
+    # Rejoin with ", " so a brand that itself contains a comma ("Foo, Inc.")
+    # reads as written rather than losing it. The line gives no way to tell a
+    # comma in the brand from one in the serving, so a serving written with a
+    # comma ("1 cup, chopped") still leaks its first half into the brand — the
+    # same limit python-myfitnesspal's parser has.
+    return ", ".join(parts[:-1]).strip() if len(parts) >= 2 else ""
+
+
+# 1 kcal = 4.184 kJ (the factor MyFitnessPal's own web client uses).
+_SEARCH_KJ_PER_KCAL = 4.184
+
+
+def _energy_as_kcal(value: Optional[float], unit: Optional[str]) -> Optional[float]:
+    """Energy expressed in kcal whatever the account's unit, for the `calories`
+    field older callers read. None when the row had no energy."""
+    if value is None:
+        return None
+    if unit == "kilojoules":
+        return round(value / _SEARCH_KJ_PER_KCAL, 1)
+    return value
+
+
+def _raise_if_login_page(response) -> None:
+    """Raise a clear auth error when MyFitnessPal answered with its login page.
+
+    An expired or missing session is redirected (302) to /account/login, which
+    still comes back as HTTP 200. Neither the status code nor the text
+    "Matching Foods:" tells that apart from a search with no matches: the login
+    page ships the site's translation bundle, which contains that very string.
+    The final URL does (observed live, 2026-11-15). Without this, a dead
+    session reads as "0 results" rather than as an auth failure.
+    """
+    if "/account/login" in str(getattr(response, "url", "") or ""):
+        raise RuntimeError(
+            "MyFitnessPal redirected the food search to its login page: the "
+            "session has expired or is not authenticated. Run "
+            "refresh_browser_cookies and try again."
+        )
+
+
+def _has_search_results_section(document) -> bool:
+    """True when the page carries the search-results scaffold, which MFP renders
+    even for zero matches (an `#sort-block` holding the "Matching Foods:"
+    heading). Either marker is enough: the id does not depend on the account's
+    language, the heading does not depend on the id. Text that is not rendered
+    as page content (scripts, styles, templates, the title…) is ignored so a
+    translation bundle can't pass for the heading."""
+    return bool(
+        document.xpath(
+            "//*[@id='sort-block'] | "
+            "//*[not(self::script or self::style or self::noscript or self::template"
+            " or self::title or self::textarea)]"
+            "/text()[contains(., 'Matching Foods:')]"
+        )
+    )
+
+
+def search_food(client, query: str, limit: int) -> List[Dict[str, Any]]:
+    """Search MFP's food database, parsing energy unit-aware (kJ-safe).
+
+    Replicates the web search request python-myfitnesspal makes (GET the form for
+    its CSRF token, POST the query), then parses the result list ourselves.
+    Returns up to `limit` items: id, name, brand, calories (kcal), energy,
+    energy_unit, verified.
+
+    Raises:
+        RuntimeError: on an HTTP error, when the session is redirected to the
+            login page, or when the response is not a search-results page.
+    """
+    import lxml.html
+
+    search_url = f"{MFP_WEB_BASE}/food/search"
+    page = client.session.get(search_url, timeout=30)
+    if page.status_code != 200:
+        raise RuntimeError(f"Could not load the food-search page: HTTP {page.status_code}")
+    _raise_if_login_page(page)
+    form = lxml.html.document_fromstring(page.content.decode("utf-8", errors="replace"))
+    tokens = form.xpath("(//input[@name='authenticity_token']/@value)[1]")
+    if not tokens:
+        raise RuntimeError("Food-search page did not return a CSRF token")
+
+    response = client.session.post(
+        search_url,
+        data={
+            "authenticity_token": tokens[0],
+            "search": query,
+            "date": date.today().strftime("%Y-%m-%d"),
+            "meal": "0",
+        },
+        timeout=30,
+    )
+    if response.status_code != 200:
+        raise RuntimeError(f"Food search request failed: HTTP {response.status_code}")
+    _raise_if_login_page(response)
+
+    document = lxml.html.document_fromstring(response.content.decode("utf-8", errors="replace"))
+    items = document.xpath("//li[@class='matched-food']")
+    # A results page with no matches is an empty result set -> return []. Any
+    # other 200 without results is not: say so instead of reporting 0 foods.
+    if not items and not _has_search_results_section(document):
+        raise RuntimeError(
+            "MyFitnessPal did not return a search-results page (no results "
+            "section found); the session may have expired."
+        )
+    results: List[Dict[str, Any]] = []
+    for item in items:
+        anchors = item.xpath(".//div[@class='search-title-container']/a")
+        if not anchors:
+            continue
+        anchor = anchors[0]
+        info = item.xpath(".//p[@class='search-nutritional-info']")
+        info_text = (info[0].text or "").strip() if info else ""
+        energy, energy_unit = _parse_search_energy(info_text)
+        results.append({
+            "mfp_id": anchor.get("data-external-id"),
+            "name": (anchor.text or "").strip(),
+            "brand": _parse_search_brand(info_text),
+            # `calories` is always kcal (converted on kilojoule accounts), kept
+            # for callers of the previous schema; energy/energy_unit carry the
+            # value exactly as the account displays it.
+            "calories": _energy_as_kcal(energy, energy_unit),
+            "energy": energy,
+            "energy_unit": energy_unit,
+            # whole-word 'verified' so a 'unverified' class can't false-positive
+            "verified": bool(item.xpath(
+                ".//div[contains(concat(' ', normalize-space(@class), ' '), ' verified ')]"
+            )),
+        })
+        if len(results) >= limit:
+            break
+    return results
+
+
 @mcp.tool(
     name="mfp_search_food",
     annotations={
@@ -1994,8 +2309,14 @@ async def mfp_search_food(params: SearchFoodInput) -> str:
     """
     Search the MyFitnessPal food database for food items.
 
-    Returns a list of matching foods with their name, brand, serving size,
-    calories, and MFP ID (which can be used with mfp_get_food_details).
+    Returns matching foods with name, brand, calories (always kcal), energy and
+    its unit ('calories' or 'kilojoules', as the account displays it), a
+    verified flag, and the MFP ID. Pass the id to mfp_get_food_details for full
+    nutrition and serving sizes.
+
+    Energy is parsed unit-aware, so kilojoule accounts (AU/NZ) work too rather
+    than erroring. An expired session is reported as an error, not as zero
+    results.
 
     Args:
         params: SearchFoodInput containing:
@@ -2004,32 +2325,17 @@ async def mfp_search_food(params: SearchFoodInput) -> str:
             - response_format (str): 'markdown' or 'json'
 
     Returns:
-        str: List of matching food items with basic nutrition info
+        str: Matching foods — id, name, brand, calories, energy, energy_unit, verified
     """
     try:
         client = get_mfp_client()
-        results = client.get_food_search_results(params.query)
-
-        # Limit results
-        results = results[: params.limit]
-
-        data = {"query": params.query, "count": len(results), "results": []}
-
-        for item in results:
-            data["results"].append(
-                {
-                    "name": item.name,
-                    "brand": item.brand,
-                    "serving": item.serving,
-                    "calories": item.calories,
-                    "mfp_id": item.mfp_id,
-                }
-            )
-
+        results = await asyncio.to_thread(
+            search_food, client, params.query, params.limit
+        )
+        data = {"query": params.query, "count": len(results), "results": results}
         return format_response(
             data, params.response_format, f"Food Search Results for '{params.query}'"
         )
-
     except Exception as e:
         return f"Error searching foods: {str(e)}"
 
@@ -2907,6 +3213,160 @@ async def mfp_get_steps(params: GetStepsInput) -> str:
         return f"Error getting steps: {str(e)}"
 
 
+# Each logged food is a `food_entry` item in the v2 diary, and carries the
+# times the mobile app's timeline shows (shape captured live 2026-11-11):
+#   consumed_at       "15:45:00"                   time of day picked in the app, no zone
+#   logged_at         "2026-01-15T14:45:28+00:00"  when the entry was logged, UTC
+#   logged_at_offset  "+01:00"                     the logging device's UTC offset
+#   created_at        "2026-01-15T14:45:29Z"       server-side creation, always set
+# The first three are null together on some entries (9 of 57 on the capture
+# day). The app still shows a time for those, but it is not derivable from
+# this payload: created_at matched the app for one such entry and was over
+# two hours later for another, so the fields are passed through as-is and
+# never substituted for each other.
+_ENTRY_NUTRIENTS = ("carbohydrates", "fat", "protein", "fiber", "sodium", "sugar")
+
+
+def _round_or_none(value: Optional[float]) -> Optional[float]:
+    return round(value, 1) if value is not None else None
+
+
+def _food_entry_summary(item: Dict[str, Any]) -> Dict[str, Any]:
+    """Flatten one v2 `food_entry` item. Pure: no network, no client."""
+    food = item.get("food") or {}
+    serving = item.get("serving_size") or {}
+    nutrition = item.get("nutritional_contents") or {}
+    energy = nutrition.get("energy") or {}
+
+    servings = item.get("servings")
+    quantity = servings
+    if servings is not None and serving.get("value") is not None:
+        quantity = round(servings * serving["value"], 2)
+
+    summary: Dict[str, Any] = {
+        "id": item.get("id"),
+        "meal": item.get("meal_name"),
+        "name": food.get("description"),
+        "brand": food.get("brand_name"),
+        "quantity": quantity,
+        "unit": serving.get("unit"),
+        "consumed_at": item.get("consumed_at"),
+        "logged_at": item.get("logged_at"),
+        "logged_at_offset": item.get("logged_at_offset"),
+        "created_at": item.get("created_at"),
+        # Entry-level nutrition is already the total for the logged amount.
+        "energy": _round_or_none(energy.get("value")),
+        "energy_unit": energy.get("unit"),
+    }
+    for nutrient in _ENTRY_NUTRIENTS:
+        summary[nutrient] = _round_or_none(nutrition.get(nutrient))
+    return summary
+
+
+def get_food_entries(client, target_date: date) -> List[Dict[str, Any]]:
+    """
+    Fetch one day's food entries from the v2 diary, in the API's order.
+
+    Raises:
+        RuntimeError: If the request fails
+    """
+    date_str = target_date.strftime("%Y-%m-%d")
+    response = client.session.get(
+        f"{MFP_API_BASE}/v2/diary",
+        params={"entry_date": date_str, "types": "food_entry"},
+        headers=_mfp_api_headers(client),
+        timeout=30,
+    )
+    if response.status_code != 200:
+        detail = _api_error_detail(response)
+        raise RuntimeError(
+            f"Could not fetch food entries for {date_str}: HTTP {response.status_code}"
+            + (f" - {detail}" if detail else "")
+        )
+    return [
+        _food_entry_summary(item)
+        for item in response.json().get("items") or []
+        if item.get("type") == "food_entry" and not item.get("deleted")
+    ]
+
+
+def _food_entries_markdown(date_str: str, entries: List[Dict[str, Any]]) -> str:
+    """One line per entry, grouped by meal. Pure."""
+    lines = [f"## Food Entries for {date_str}\n", f"- **count**: {len(entries)}"]
+    by_meal: Dict[str, List[Dict[str, Any]]] = {}
+    for entry in entries:
+        by_meal.setdefault(entry["meal"] or "Unknown meal", []).append(entry)
+    for meal, meal_entries in by_meal.items():
+        lines.append(f"### {meal}")
+        for e in meal_entries:
+            time_label = (e["consumed_at"] or "")[:5] or "no time"
+            # A bare unit with no number ("g") is meaningless, so the amount
+            # clause needs the quantity; the unit alone is dropped.
+            amount = (
+                " ".join(str(p) for p in (e["quantity"], e["unit"]) if p is not None)
+                if e["quantity"] is not None
+                else ""
+            )
+            energy = " ".join(str(p) for p in (e["energy"], e["energy_unit"]) if p is not None)
+            lines.append(
+                f"- {time_label} - {e['name'] or 'Unknown food'}"
+                + (f", {amount}" if amount else "")
+                + (f" - {energy}" if energy else "")
+                + f" (id: {e['id']})"
+            )
+    return "\n".join(lines)
+
+
+@mcp.tool(
+    name="mfp_get_food_entries",
+    annotations={
+        "title": "Get Food Entries with Times",
+        "readOnlyHint": True,
+        "destructiveHint": False,
+        "idempotentHint": True,
+        "openWorldHint": True,
+    },
+)
+async def mfp_get_food_entries(params: GetFoodEntriesInput) -> str:
+    """
+    List a day's individual food entries with the time each was eaten.
+
+    Unlike mfp_get_diary, which reports meals and totals, this returns one
+    record per logged food with the times MyFitnessPal stores for it:
+
+    - consumed_at: time of day chosen in the app ("15:45:00"), no time zone
+    - logged_at / logged_at_offset: when it was logged (UTC) and the logging
+      device's UTC offset
+    - created_at: when MyFitnessPal created the entry (UTC)
+
+    consumed_at, logged_at and logged_at_offset can all be null: MyFitnessPal
+    does not store a time for every entry. created_at is not a reliable
+    stand-in for the eating time.
+
+    Args:
+        params: GetFoodEntriesInput containing:
+            - date (str, optional): Date in YYYY-MM-DD format, defaults to today
+            - response_format (str): 'markdown' or 'json'
+
+    Returns:
+        str: Each entry's id, meal, name, amount, energy, macros and times
+    """
+    try:
+        target_date = parse_date(params.date)
+        client = get_mfp_client()
+        entries = await asyncio.to_thread(get_food_entries, client, target_date)
+
+        if params.response_format == ResponseFormat.MARKDOWN:
+            return _food_entries_markdown(str(target_date), entries)
+        return json.dumps(
+            {"date": str(target_date), "count": len(entries), "entries": entries},
+            indent=2,
+        )
+
+    except Exception as e:
+        return f"Error getting food entries: {str(e)}"
+
+
 @mcp.tool(
     name="mfp_add_food_to_diary",
     annotations={
@@ -2927,7 +3387,7 @@ async def mfp_add_food_to_diary(params: AddFoodToDiaryInput) -> str:
     Args:
         params: AddFoodToDiaryInput containing:
             - mfp_id (str): MyFitnessPal food item ID (from mfp_search_food)
-            - meal (str): Meal name - 'Breakfast', 'Lunch', 'Dinner', or 'Snacks' (default: 'Breakfast')
+            - meal (str): Meal to log under; matched to the account's configured meals (see mfp_list_meals). Default 'Breakfast'.
             - date (str, optional): Date in YYYY-MM-DD format, defaults to today
             - quantity (float): For gram-based foods pass the actual weight in grams (e.g. 120
               for 120 g); for serving-based foods pass the number of servings (e.g. 1.5).
@@ -2941,34 +3401,32 @@ async def mfp_add_food_to_diary(params: AddFoodToDiaryInput) -> str:
     try:
         client = get_mfp_client()
         target_date = parse_date(params.date)
-        
-        # Normalize meal name (capitalize first letter)
-        meal = params.meal.strip().capitalize()
-        if meal.lower() == "snack":
-            meal = "Snacks"
-        
-        # Add food to diary
-        entry_id = add_food_to_diary(
-            client=client,
-            mfp_id=params.mfp_id,
-            meal=meal,
-            target_date=target_date,
-            quantity=params.quantity,
-            unit=params.unit,
-        )
 
-        try:
-            food_name = get_food_v2(client, params.mfp_id).get("description", "Food item")
-        except Exception:
-            food_name = "Food item"
+        def _work():
+            # Meal resolution + the blocking HTTP all run off the event loop.
+            entry_id, resolved_meal = add_food_to_diary(
+                client=client,
+                mfp_id=params.mfp_id,
+                meal=params.meal,
+                target_date=target_date,
+                quantity=params.quantity,
+                unit=params.unit,
+            )
+            try:
+                food_name = get_food_v2(client, params.mfp_id).get("description", "Food item")
+            except Exception:
+                food_name = "Food item"
+            return entry_id, resolved_meal, food_name
+
+        entry_id, resolved_meal, food_name = await asyncio.to_thread(_work)
 
         return json.dumps(
             {
                 "success": True,
-                "message": f"Successfully added {food_name} to {meal}",
+                "message": f"Successfully added {food_name} to {resolved_meal}",
                 "entry_id": entry_id,
                 "date": str(target_date),
-                "meal": meal,
+                "meal": resolved_meal,
                 "food_id": params.mfp_id,
                 "food_name": food_name,
                 "quantity": params.quantity,
@@ -2979,6 +3437,61 @@ async def mfp_add_food_to_diary(params: AddFoodToDiaryInput) -> str:
         
     except Exception as e:
         return f"Error adding food to diary: {str(e)}"
+
+
+class ListMealsInput(BaseModel):
+    """Input for `mfp_list_meals`."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    response_format: ResponseFormat = Field(
+        default=ResponseFormat.MARKDOWN,
+        description="Output format: 'markdown' (default) or 'json'.",
+    )
+
+
+@mcp.tool(
+    name="mfp_list_meals",
+    annotations={
+        "title": "List Configured Meals",
+        "readOnlyHint": True,
+        "destructiveHint": False,
+        "idempotentHint": True,
+        "openWorldHint": True,
+    },
+)
+async def mfp_list_meals(params: ListMealsInput) -> str:
+    """
+    List this account's configured meal names.
+
+    These are the values mfp_add_food_to_diary accepts for `meal`. The defaults
+    are Breakfast/Lunch/Dinner/Snacks, but an account may have renamed them
+    (localized) or added custom meals (e.g. 'Supplements', 'During Ride'). Pass
+    one of these names (case-insensitive) when logging, so entries aren't
+    rejected or silently misfiled under the wrong meal.
+
+    Args:
+        params: ListMealsInput (response_format)
+
+    Returns:
+        str: The account's meal names, in diary order
+    """
+    try:
+        client = get_mfp_client()
+        names = await asyncio.to_thread(get_meal_names, client, None)
+        if not names:
+            message = (
+                "No meals found: MyFitnessPal's diary page returned no meal "
+                "headers (the session may have expired — try refresh_browser_cookies)."
+            )
+            if params.response_format == ResponseFormat.MARKDOWN:
+                return f"## Meals\n{message}"
+            return json.dumps({"meals": [], "message": message}, indent=2)
+        if params.response_format == ResponseFormat.MARKDOWN:
+            return "## Meals\n" + "\n".join(f"- {n}" for n in names)
+        return json.dumps({"meals": names}, indent=2)
+    except Exception as e:
+        return f"Error listing meals: {str(e)}"
 
 
 @mcp.tool(
@@ -3250,10 +3763,10 @@ def refresh_browser_cookies(browser: str = "auto") -> str:
     Args:
         browser: Source to extract cookies from. Options:
                  - 'auto' (default): scan every installed Chromium-based
-                   browser on macOS (Arc, Chrome, Edge, Brave, Vivaldi,
+                   browser on macOS (Arc, Dia, Chrome, Edge, Brave, Vivaldi,
                    Opera, ...) and use the first one with a valid session.
-                 - 'arc', 'chrome', 'chromium', 'edge', 'brave', 'vivaldi',
-                   'opera': force a specific Chromium browser (macOS).
+                 - 'arc', 'dia', 'chrome', 'chromium', 'edge', 'brave',
+                   'vivaldi', 'opera': force a specific Chromium browser (macOS).
                  - 'firefox': use browser_cookie3 (Firefox is not Chromium).
 
     Returns:
@@ -3268,7 +3781,7 @@ def refresh_browser_cookies(browser: str = "auto") -> str:
             return (
                 "Auto-discovery did not find a Chromium browser with a "
                 "valid MyFitnessPal session. Log into myfitnesspal.com in "
-                "Arc, Chrome, Edge, Brave, Vivaldi, or Opera, then retry. "
+                "Arc, Dia, Chrome, Edge, Brave, Vivaldi, or Opera, then retry. "
                 "(macOS only — on Linux/Windows, pass 'chrome' or "
                 "'firefox' instead.)"
             )

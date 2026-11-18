@@ -7,9 +7,11 @@ A [Model Context Protocol (MCP)](https://modelcontextprotocol.io/) server that e
 | Tool | Type | Description |
 |------|------|-------------|
 | `mfp_get_diary` | Read | Get food diary entries for any date |
+| `mfp_get_food_entries` | Read | List a day's individual food entries with the time each was eaten |
 | `mfp_search_food` | Read | Search the MyFitnessPal food database |
 | `mfp_get_food_details` | Read | Get detailed nutrition info for a food item |
 | `mfp_add_food_to_diary` | Write | Add a food item to your diary for a specific meal and date |
+| `mfp_list_meals` | Read | List the account's configured meal names (incl. renamed/custom) for use with `mfp_add_food_to_diary` |
 | `mfp_remove_food_from_diary` | Write | Remove a logged entry from your diary |
 | `mfp_create_custom_food` | Write | Create a private custom food with a full nutrition panel |
 | `mfp_list_own_foods` | Read | List your own custom foods (private ones do not appear in search) |
@@ -85,7 +87,7 @@ Garmin sleep window + first-meal timestamp) or correcting entries programmatical
 - **pip 21.3+** (for pyproject.toml support; upgrade with `pip install --upgrade pip`)
 - **MyFitnessPal account**
 - **One of the following for authentication:**
-  - **Recommended (macOS):** any Chromium-based browser (Arc, Chrome, Edge,
+  - **Recommended (macOS):** any Chromium-based browser (Arc, Dia, Chrome, Edge,
     Brave, Vivaldi, Opera, ...) with an active MyFitnessPal login session —
     the MCP auto-discovers the session on next call
   - Firefox with an active MyFitnessPal login session (via the
@@ -100,7 +102,7 @@ This MCP supports multiple authentication methods:
 
 | Method | Setup | Persistence |
 |--------|-------|-------------|
-| **Chromium browser auto-discovery (macOS, recommended)** | Log into myfitnesspal.com in any Chromium-based browser (Arc, Chrome, Edge, Brave, Vivaldi, Opera, ...). The MCP auto-detects installed browsers via the macOS keychain and uses whichever one is logged in. | Until browser session expires (cached for 30 days in `~/.mfp_mcp/cookies.json`) |
+| **Chromium browser auto-discovery (macOS, recommended)** | Log into myfitnesspal.com in any Chromium-based browser (Arc, Dia, Chrome, Edge, Brave, Vivaldi, Opera, ...). The MCP auto-detects installed browsers via the macOS keychain and uses whichever one is logged in. | Until browser session expires (cached for 30 days in `~/.mfp_mcp/cookies.json`) |
 | **Encrypted credentials (legacy)** | Add encrypted `MFP_USERNAME` and `MFP_PASSWORD` to Claude Desktop config; set `MFP_SECRET_KEY` outside the config (for example via shell env or OS keychain) | Form login no longer works against MFP's NextAuth backend — only useful if cached cookies are still valid |
 | **Plain credentials (legacy)** | Add `MFP_USERNAME` and `MFP_PASSWORD` to Claude Desktop config | Same as above — form login flow is deprecated |
 | **Browser cookies (browser_cookie3 fallback)** | Log into myfitnesspal.com in Chrome or Firefox via the default profile paths | Until browser session expires |
@@ -343,7 +345,7 @@ server scans the macOS keychain for `<Browser> Safe Storage` entries to find
 every installed Chromium-based browser, then tries each one's cookies
 database until it finds a valid MyFitnessPal session token.
 
-This works out of the box with Arc, Chrome, Edge, Brave, Vivaldi, Opera,
+This works out of the box with Arc, Dia, Chrome, Edge, Brave, Vivaldi, Opera,
 Chromium, and any other Chromium-derived browser. You only need to be
 logged into [myfitnesspal.com](https://www.myfitnesspal.com) in one of
 them.
@@ -408,6 +410,7 @@ Once configured, you can interact with your MyFitnessPal data through Claude:
 "Show me what I ate today"
 "Get my food diary for 2026-01-05"
 "What meals did I log yesterday?"
+"What time did I have my first and last food today?"
 ```
 
 ### Logging and Correcting Food
@@ -587,10 +590,10 @@ pip install -e .
 
 **Solutions**:
 1. **Easiest (macOS)**: Log into [myfitnesspal.com](https://www.myfitnesspal.com)
-   in any Chromium-based browser (Arc, Chrome, Edge, Brave, ...). The MCP
+   in any Chromium-based browser (Arc, Dia, Chrome, Edge, Brave, ...). The MCP
    will auto-discover the session on the next call.
 2. **Force a refresh**: Call the `refresh_browser_cookies` tool — `auto`
-   scans every browser, or pass a specific name (`arc`, `chrome`, `edge`,
+   scans every browser, or pass a specific name (`arc`, `dia`, `chrome`, `edge`,
    `brave`, `vivaldi`, `opera`, `firefox`).
 3. **If using credentials**: Double-check your MFP_USERNAME and MFP_PASSWORD
    in the config. Note that the legacy form-login flow no longer works
@@ -662,11 +665,31 @@ Get food diary for a specific date.
 - `date` (optional): YYYY-MM-DD format, defaults to today
 - `response_format`: "markdown" or "json"
 
+### mfp_get_food_entries
+List a day's individual food entries, one record per logged food, with the times MyFitnessPal stores for each.
+- `date` (optional): YYYY-MM-DD format, defaults to today
+- `response_format`: "markdown" or "json"
+
+Each entry has `id`, `meal`, `name`, `brand`, `quantity`, `unit`, `energy`, `energy_unit`, macros (plus `fiber`, `sodium`, `sugar`), and four time fields. The `id` is the entry's v2 diary id: pass it as `entry_id` to `mfp_remove_food_from_diary` to delete exactly that entry.
+
+| Field | Example | Meaning |
+|-------|---------|---------|
+| `consumed_at` | `15:45:00` | Time of day chosen in the app. No time zone. |
+| `logged_at` | `2026-01-15T14:45:28+00:00` | When the entry was logged, in UTC |
+| `logged_at_offset` | `+01:00` | UTC offset of the device that logged it |
+| `created_at` | `2026-01-15T14:45:29Z` | When MyFitnessPal created the entry, in UTC |
+
+`consumed_at`, `logged_at` and `logged_at_offset` can all be `null`: MyFitnessPal does not store a time for every entry. `created_at` is always set but is not a reliable substitute for the eating time.
+
 ### mfp_search_food
 Search the MyFitnessPal food database.
 - `query` (required): Search term
 - `limit` (optional): Max results (default 10, max 50)
 - `response_format`: "markdown" or "json"
+
+Each result has `mfp_id`, `name`, `brand`, `calories`, `energy`, `energy_unit` and `verified`. `calories` is always kcal. `energy` and `energy_unit` (`calories` or `kilojoules`) carry the value the way the account displays it, so on a kilojoule account `energy` is the kJ figure and `calories` is that figure converted.
+
+**Changed from earlier versions:** results no longer include `serving` (it cost one extra request per result; `mfp_get_food_details` returns the serving sizes), and they add `energy`, `energy_unit` and `verified`. A search made with an expired session now returns an error instead of `count: 0`.
 
 ### mfp_get_food_details
 Get detailed nutrition for a food item.
@@ -676,14 +699,20 @@ Get detailed nutrition for a food item.
 ### mfp_add_food_to_diary
 Add a food item to your diary for a specific meal and date.
 - `mfp_id` (required): MyFitnessPal food ID from search results (use `mfp_search_food` first)
-- `meal` (optional): Meal name - "Breakfast", "Lunch", "Dinner", or "Snacks" (default: "Breakfast")
+- `meal` (optional): Meal to log under (default: "Breakfast"). Matched case-insensitively against the account's own meals — the defaults (Breakfast, Lunch, Dinner, Snacks), renamed or localized ones, and custom meals — and posted with the account's exact spelling. A name that matches none of them is rejected with the list of valid meals, because MyFitnessPal would otherwise file the entry under the first meal without an error. Use `mfp_list_meals` to see the account's meals.
 - `date` (optional): YYYY-MM-DD format (default: today)
 - `quantity` (optional): Number of servings (default: 1.0)
 - `unit` (optional): Unit/serving size description (e.g., "1 cup", "100g")
 
+The first call reads the diary page once to learn the account's meal names (cached for a few minutes).
+
 **Example workflow:**
 1. Use `mfp_search_food` to find a food item and get its `mfp_id`
 2. Use `mfp_add_food_to_diary` with the `mfp_id` to add it to your diary
+
+### mfp_list_meals
+List the account's configured meal names, in diary order and spelled the way the account defines them (for example `Breakfast`, a localized `Almoço`, or a custom `During Ride`). These are the values `mfp_add_food_to_diary` accepts for `meal`.
+- `response_format`: "markdown" or "json"
 
 ### mfp_create_custom_food
 Create a private custom food in your account. Returns the new food's `id`, which
