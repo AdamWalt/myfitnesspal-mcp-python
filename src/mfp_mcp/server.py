@@ -3204,7 +3204,11 @@ async def mfp_quick_add(params: QuickAddInput) -> str:
             - name (str): label for the entry (default 'Quick Add')
 
     Returns:
-        str: Confirmation with the entry id, resolved meal, and what was logged
+        str: Confirmation with the entry id, resolved meal, and what was logged.
+            The entry id is valid until the entry is edited elsewhere: an edit
+            can give the entry a new id (seen with the MyFitnessPal iOS app),
+            and mfp_remove_food_from_diary then fails with HTTP 404 for the old
+            one. mfp_get_food_entries lists the current id.
     """
     try:
         client = get_mfp_client()
