@@ -337,6 +337,7 @@ This setup puts no credentials in the config. The server reads the session from 
 Give credentials to `mfp-mcp-login` only. The server posts `env` credentials on every failed call. The server's form login rarely works against NextAuth.
 
 **macOS Example:**
+
 ```json
 {
   "mcpServers": {
