@@ -1,7 +1,7 @@
 """Log in to MyFitnessPal with a headed Chrome and save the session cookies.
 
 Usage:
-    python -m mfp_mcp.login [--dry-run | --check] [--no-attempt-log]
+    python -m mfp_mcp.login [--dry-run | --check]
 
 The cookie file is the one the MCP server reads, `server.COOKIES_FILE`, read
 when `main` runs. `main` takes a `cookies_file` keyword for tests.
@@ -16,22 +16,27 @@ On Linux it draws on a private Xvfb display, found on PATH. On macOS the window
 opens off-screen. The browser login needs `websockets>=11`.
 
 With no flag the command checks the saved session first and logs in only when
-that check fails. `--dry-run` logs in and verifies, but writes nothing.
+that check fails. `--dry-run` logs in and verifies, but writes no cookie file.
 `--check` never logs in: it checks the age of the saved file and verifies it.
 
-Each real form submission appends one line to the file named by
-`MFP_LOGIN_LOG`, with the date and `MFP_LOGIN_ROLE`. Six lines block any
-further submission. With `MFP_LOGIN_LOG` unset, a submission needs
-`--no-attempt-log`.
+The attempt log `login-attempts.log` and the run lock `login.lock` sit in the
+cookie file's folder, created with mode 0700 when missing. Every run but
+`--check` takes the lock first, an exclusive `flock` held for the whole run, so
+a second run exits 2. That run then drops log lines older than 30 days. Each
+form submission, dry runs included, appends one UTC stamp just before submit.
+Three submissions in the last 24 hours refuse a login with exit 6, before any
+credential prompt or browser. A line that is not a timestamp counts inside the
+window and is never dropped. A stamp with no offset is read as UTC. `--check`
+takes no lock and never reads or writes the log.
 
 Exit codes:
     0      session saved, verified in dry-run, or still valid
     2      setup error: bad usage, a missing or undecryptable credential,
-           no Chrome, no Xvfb, no attempt log, or no `websockets>=11`
+           no Chrome, no Xvfb, no `websockets>=11`, or another run holds the lock
     3      captcha, Turnstile that never clears, lock or rate-limit page
     4      session fails verification, or the saved file is too old
     5      any other page after the submission, a timeout, or an unexpected error
-    6      the attempt log already holds six lines
+    6      three submissions in the last 24 hours, or unreadable log lines
     128+N  stopped by signal N (SIGINT, SIGTERM or SIGHUP), after cleanup
 
 Every output line, argparse usage and errors included, goes through one
@@ -58,7 +63,7 @@ import tempfile
 import time
 from collections.abc import Callable, Iterable, Iterator
 from contextlib import ExitStack, contextmanager
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, NoReturn, Protocol
 from urllib.parse import quote, quote_plus
@@ -92,7 +97,11 @@ EMAIL_SEL = "#email"
 PASSWORD_SEL = "#password"
 TURNSTILE_SEL = 'input[name="cf-turnstile-response"]'
 
-MAX_ATTEMPTS = 6
+ATTEMPT_LOG = "login-attempts.log"
+LOCK_FILE = "login.lock"
+WINDOW_MAX = 3
+WINDOW = timedelta(hours=24)
+ATTEMPT_KEEP = timedelta(days=30)
 MAX_AGE = timedelta(days=29)
 FORM_TIMEOUT = 30.0
 TURNSTILE_TIMEOUT = 30.0
@@ -204,20 +213,26 @@ def msg_fill_failed() -> str:
     return "page: a login field did not take its text, not submitted"
 
 
-def msg_log_unset() -> str:
-    return "attempts: MFP_LOGIN_LOG unset, pass --no-attempt-log to log in without it"
+def msg_lock_held(path: Path) -> str:
+    return f"lock: another mfp-mcp-login run holds {path}, try again when it ends"
 
 
-def msg_log_full(count: int) -> str:
-    return f"attempts: log holds {count} lines, limit {MAX_ATTEMPTS}, refused"
+def msg_log_full(path: Path, count: int, reopen: datetime) -> str:
+    return (
+        f"attempts: {count} logins in the last 24 hours, limit {WINDOW_MAX}, refused. "
+        f"Log: {path}. Next login allowed from {reopen.isoformat(timespec='seconds')}"
+    )
+
+
+def msg_log_unreadable(path: Path, count: int) -> str:
+    return (
+        f"attempts: {path} holds {count} unreadable lines, each counts against the limit "
+        f"of {WINDOW_MAX} per 24 hours, refused. Delete those lines to log in again"
+    )
 
 
 def msg_attempt_logged(count: int) -> str:
-    return f"attempts: logged line {count} of {MAX_ATTEMPTS}"
-
-
-def msg_attempt_skipped() -> str:
-    return "attempts: not logged (--no-attempt-log)"
+    return f"attempts: logged, {count} of {WINDOW_MAX} in the last 24 hours"
 
 
 def msg_form_found() -> str:
@@ -500,35 +515,143 @@ def browser_env(base: dict[str, str], root: Path, display: int | None) -> dict[s
 # --- attempt log ----------------------------------------------------------------
 
 
-def _count_lines(path: Path) -> int:
-    if not path.is_file():
-        return 0
-    return sum(1 for line in path.read_text(encoding="utf-8").splitlines() if line.strip())
-
-
-def attempt_precheck(log_path: str | None, no_attempt_log: bool) -> None:
-    """Refuse before any browser starts. A set log always applies its limit."""
-    if not log_path:
-        if no_attempt_log:
-            return
-        raise LoginError(EXIT_CONFIG, msg_log_unset())
-    count = _count_lines(Path(log_path))
-    if count >= MAX_ATTEMPTS:
-        raise LoginError(EXIT_LIMIT, msg_log_full(count))
-
-
-def record_attempt(
-    log_path: str | None, role: str, no_attempt_log: bool, now: datetime, reporter: Reporter
-) -> None:
-    """Append one line right before a real submission."""
-    attempt_precheck(log_path, no_attempt_log)
-    if not log_path:
-        reporter.line(msg_attempt_skipped())
+def _ensure_folder(folder: Path) -> None:
+    """Create `folder` with mode 0700 when it is missing. An existing one keeps its mode."""
+    if folder.exists():
         return
-    path = Path(log_path)
-    with path.open("a", encoding="utf-8") as f:
-        f.write(f"{now.isoformat(timespec='seconds')} {role}\n")
-    reporter.line(msg_attempt_logged(_count_lines(path)))
+    folder.mkdir(parents=True, mode=0o700, exist_ok=True)
+    folder.chmod(0o700)
+
+
+def _write_atomic(path: Path, text: str, prefix: str, errors: str = "strict") -> None:
+    """Write a temp file in the same folder with mode 0600, then rename it over `path`."""
+    fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=prefix, suffix=".tmp")
+    try:
+        os.fchmod(fd, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8", errors=errors) as f:
+            f.write(text)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
+    except BaseException:
+        Path(tmp).unlink(missing_ok=True)
+        raise
+
+
+def attempt_log_path(target: Path) -> Path:
+    """The attempt log, beside the cookie target. Resolved per call, never from CONFIG_DIR."""
+    return target.parent / ATTEMPT_LOG
+
+
+def lock_path(target: Path) -> Path:
+    return target.parent / LOCK_FILE
+
+
+@contextmanager
+def run_lock(target: Path) -> Iterator[None]:
+    """Hold an exclusive `flock` on `login.lock` beside `target` for the whole block.
+
+    flock binds to the open file description, so a second open in the same
+    process conflicts too. Closing the descriptor releases the lock.
+    """
+    import fcntl
+
+    path = lock_path(target)
+    _ensure_folder(path.parent)
+    fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            raise LoginError(EXIT_CONFIG, msg_lock_held(path)) from None
+        yield
+    finally:
+        os.close(fd)
+
+
+def _read_log(path: Path) -> list[str]:
+    """Every line of the log, blank ones included. Bytes that are not UTF-8 survive."""
+    if not path.is_file():
+        return []
+    return path.read_text(encoding="utf-8", errors="surrogateescape").splitlines()
+
+
+def _parse_stamp(line: str) -> datetime | None:
+    """The line's time, a naive stamp read as UTC. None when the line is not a stamp."""
+    try:
+        stamp = datetime.fromisoformat(line.strip())
+    except ValueError:
+        return None
+    return stamp if stamp.tzinfo is not None else stamp.replace(tzinfo=timezone.utc)
+
+
+def _window(lines: Iterable[str], now: datetime) -> tuple[list[datetime], int]:
+    """Stamps inside the last 24 hours, oldest first, and the count of unreadable lines.
+
+    Blank lines count as nothing. A stamp later than `now` counts, so a clock
+    set back never frees the window early.
+    """
+    stamps: list[datetime] = []
+    unreadable = 0
+    for line in lines:
+        if not line.strip():
+            continue
+        stamp = _parse_stamp(line)
+        if stamp is None:
+            unreadable += 1
+        elif stamp > now - WINDOW:
+            stamps.append(stamp)
+    return sorted(stamps), unreadable
+
+
+def check_attempt_window(log: Path, now: datetime) -> None:
+    """Refuse with exit 6 when the last 24 hours already hold three submissions.
+
+    The reopen time is when enough counted stamps age out to leave room for one
+    more. With exactly three counted lines that is the oldest plus 24 hours.
+    """
+    stamps, unreadable = _window(_read_log(log), now)
+    count = len(stamps) + unreadable
+    if count < WINDOW_MAX:
+        return
+    if unreadable >= WINDOW_MAX:
+        raise LoginError(EXIT_LIMIT, msg_log_unreadable(log, unreadable))
+    reopen = stamps[count - WINDOW_MAX] + WINDOW
+    raise LoginError(EXIT_LIMIT, msg_log_full(log, count, reopen))
+
+
+def prune_attempts(log: Path, now: datetime) -> None:
+    """Drop stamps older than 30 days and blank lines. Unreadable lines stay.
+
+    The file is rewritten atomically, and only when a line goes.
+    """
+    lines = _read_log(log)
+    cutoff = now - ATTEMPT_KEEP
+    kept = []
+    for line in lines:
+        if not line.strip():
+            continue
+        stamp = _parse_stamp(line)
+        if stamp is None or stamp >= cutoff:
+            kept.append(line)
+    if kept == lines:
+        return
+    text = "".join(f"{line}\n" for line in kept)
+    _write_atomic(log, text, ".attempts-", errors="surrogateescape")
+
+
+def record_attempt(log: Path, now: datetime, reporter: Reporter) -> None:
+    """Append one UTC stamp right before a submission. A dry run records one too."""
+    _ensure_folder(log.parent)
+    old = log.read_bytes() if log.is_file() else b""
+    lead = b"\n" if old and not old.endswith(b"\n") else b""
+    fd = os.open(log, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
+    try:
+        os.write(fd, lead + f"{now.isoformat(timespec='seconds')}\n".encode())
+    finally:
+        os.close(fd)
+    stamps, unreadable = _window(_read_log(log), now)
+    reporter.line(msg_attempt_logged(len(stamps) + unreadable))
 
 
 # --- cookies, verification, write ------------------------------------------------
@@ -610,21 +733,8 @@ def build_payload(
 
 def write_cookie_file(target: Path, payload: dict[str, Any]) -> None:
     """Write atomically: temp file in the same folder, mode 0600, then rename."""
-    folder = target.parent
-    if not folder.exists():
-        folder.mkdir(parents=True, mode=0o700)
-        folder.chmod(0o700)
-    fd, tmp = tempfile.mkstemp(dir=folder, prefix=".cookies-", suffix=".tmp")
-    try:
-        os.fchmod(fd, 0o600)
-        with os.fdopen(fd, "w", encoding="utf-8") as f:
-            json.dump(payload, f, indent=2)
-            f.flush()
-            os.fsync(f.fileno())
-        os.replace(tmp, target)
-    except BaseException:
-        Path(tmp).unlink(missing_ok=True)
-        raise
+    _ensure_folder(target.parent)
+    _write_atomic(target, json.dumps(payload, indent=2), ".cookies-")
 
 
 def finalize(
@@ -1117,7 +1227,13 @@ def _has_websockets_sync() -> bool:
 
 
 def _now() -> datetime:
+    """Naive local time, for the cookie file's `saved_at`, as the server reads it."""
     return datetime.now()
+
+
+def _utc_now() -> datetime:
+    """Aware UTC time, for attempt stamps only. Its isoformat ends `+00:00`, never `Z`."""
+    return datetime.now(timezone.utc)
 
 
 def _sleep(seconds: float) -> None:
@@ -1131,7 +1247,6 @@ def _monotonic() -> float:
 def run_login(
     *,
     dry_run: bool,
-    no_attempt_log: bool,
     target: Path,
     reporter: Reporter,
     env: dict[str, str],
@@ -1140,25 +1255,28 @@ def run_login(
     chrome_finder: Callable[[], str] | None = None,
     xvfb_finder: Callable[[], str | None] | None = None,
     now: Callable[[], datetime] | None = None,
+    utc_now: Callable[[], datetime] | None = None,
     sleep: Callable[[float], None] | None = None,
     monotonic: Callable[[], float] | None = None,
 ) -> int:
     """Read credentials, find Chrome and Xvfb, log in, verify and write.
 
+    `main` calls it under the run lock, after the attempt window check. The
+    attempt record goes to the log beside `target`, just before submit. `now`
+    stamps the cookie file and `utc_now` the attempt, so `saved_at` stays naive.
     Every `None` default is resolved here, at call time, from the module globals.
     """
     browser_factory = browser_factory or chrome_session
     verify = verify or verify_session
     now = now or _now
+    utc_now = utc_now or _utc_now
     sleep = sleep or _sleep
     monotonic = monotonic or _monotonic
     path = env.get("PATH", os.defpath)
     try:
         username, password = read_credentials(reporter)
         reporter.line(msg_credentials_ok())
-        log_path = env.get("MFP_LOGIN_LOG")
-        role = env.get("MFP_LOGIN_ROLE", "")
-        attempt_precheck(log_path, no_attempt_log)
+        log = attempt_log_path(target)
         chrome = chrome_finder() if chrome_finder else find_chrome(sys.platform, path)
         reporter.line(msg_chrome(chrome))
         xvfb = xvfb_finder() if xvfb_finder else find_xvfb(sys.platform, path)
@@ -1166,7 +1284,7 @@ def run_login(
             reporter.line(msg_xvfb(xvfb))
 
         def gate() -> None:
-            record_attempt(log_path, role, no_attempt_log, now(), reporter)
+            record_attempt(log, utc_now(), reporter)
 
         try:
             with browser_factory(chrome, reporter, xvfb) as page:
@@ -1218,8 +1336,6 @@ def parse_args(argv: list[str] | None, reporter: Reporter) -> argparse.Namespace
     mode = p.add_mutually_exclusive_group()
     mode.add_argument("--dry-run", action="store_true", help="log in and verify, write nothing")
     mode.add_argument("--check", action="store_true", help="verify the saved file, never log in")
-    p.add_argument("--no-attempt-log", action="store_true",
-                   help="allow a login with MFP_LOGIN_LOG unset")
     return p.parse_args(argv)
 
 
@@ -1249,20 +1365,32 @@ def _target_path(cookies_file: str | os.PathLike[str] | None) -> Path:
 
 
 def _main(args: argparse.Namespace, target: Path, reporter: Reporter) -> int:
+    """`--check` alone, with no lock. Every other run holds the lock throughout.
+
+    Under the lock: prune the log, check the saved session unless `--dry-run`,
+    then the attempt window, then `websockets`, and only then `run_login`.
+    """
     if args.check:
         return run_check(target, verify_session, reporter, _now())
-    if not args.dry_run and run_check(target, verify_session, reporter, _now()) == EXIT_OK:
-        return EXIT_OK
-    if not _has_websockets_sync():
-        reporter.line(msg_no_websockets())
-        return EXIT_CONFIG
-    return run_login(
-        dry_run=args.dry_run,
-        no_attempt_log=args.no_attempt_log,
-        target=target,
-        reporter=reporter,
-        env=dict(os.environ),
-    )
+    try:
+        with run_lock(target):
+            log = attempt_log_path(target)
+            prune_attempts(log, _utc_now())
+            if not args.dry_run and run_check(target, verify_session, reporter, _now()) == EXIT_OK:
+                return EXIT_OK
+            check_attempt_window(log, _utc_now())
+            if not _has_websockets_sync():
+                reporter.line(msg_no_websockets())
+                return EXIT_CONFIG
+            return run_login(
+                dry_run=args.dry_run,
+                target=target,
+                reporter=reporter,
+                env=dict(os.environ),
+            )
+    except LoginError as e:
+        reporter.line(e.message)
+        return e.code
 
 
 def main(

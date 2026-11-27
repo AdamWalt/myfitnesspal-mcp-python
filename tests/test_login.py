@@ -23,7 +23,7 @@ import subprocess
 import sys
 import tempfile
 import types
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from urllib.parse import quote, quote_plus
 
@@ -38,6 +38,10 @@ PASSWORD = "S3cret!x"
 COOKIE_VALUE = "tok-123"
 EMAIL = "user@example.com"
 NOW = datetime(2026, 11, 11, 12, 0, 0)
+# The attempt clock, aware UTC. Kept apart from NOW, which stamps `saved_at`.
+UTC_NOW = datetime(2026, 11, 27, 12, 0, 0, tzinfo=timezone.utc)
+LOG_NAME = "login-attempts.log"
+LOCK_NAME = "login.lock"
 SESSION = "__Secure-next-auth.session-token"
 SPECIAL = 'p@ss w0rd+"<&>'
 
@@ -52,7 +56,7 @@ MASKED = frozenset({
 ORIG = {
     name: getattr(login, name, None)
     for name in ("chrome_session", "_spawn", "verify_session", "_has_websockets_sync",
-                 "_kill_leftovers")
+                 "_kill_leftovers", "_utc_now")
 }
 
 
@@ -76,7 +80,8 @@ class _Guard:
         self.allowed_pids: set[int] = set()
 
     def inside_tmp(self, argv0: str, env: dict | None) -> bool:
-        path = (env or {}).get("PATH") if env else os.environ.get("PATH")
+        # The lookup `subprocess` makes: env's PATH, else os.defpath, when env is given.
+        path = os.pathsep.join(os.get_exec_path(env))
         resolved = argv0 if os.sep in argv0 else __import__("shutil").which(argv0, path=path)
         return bool(resolved) and Path(resolved).resolve().is_relative_to(self.tmp)
 
@@ -168,7 +173,11 @@ def _under(path, tmp_path: Path) -> bool:
 
 
 def _guard_targets(tmp_path: Path):
-    """Wrap `main` and `run_login` so a test cannot reach either with a real target."""
+    """Wrap `main` and `run_login` so a test cannot reach either with a real target.
+
+    The attempt log and the lock sit beside the target, so a target under
+    tmp_path keeps both there too.
+    """
     real_main, real_run_login = login.main, login.run_login
 
     def main(argv=None, *, cookies_file=None):
@@ -177,9 +186,9 @@ def _guard_targets(tmp_path: Path):
         return real_main(argv, cookies_file=cookies_file)
 
     def run_login(**kwargs):
-        log = kwargs["env"].get("MFP_LOGIN_LOG")
-        if not _under(log, tmp_path):
-            pytest.fail(f"login.run_login reached without MFP_LOGIN_LOG under tmp_path: {log!r}")
+        target = kwargs.get("target")
+        if not _under(target, tmp_path):
+            pytest.fail(f"login.run_login reached without a tmp_path target: {target!r}")
         return real_run_login(**kwargs)
 
     return main, run_login
@@ -219,6 +228,7 @@ def _isolate(monkeypatch, tmp_path):
     monkeypatch.setattr(login, "_sleep", clock.sleep, raising=False)
     monkeypatch.setattr(login, "_monotonic", clock.monotonic, raising=False)
     monkeypatch.setattr(login, "_now", lambda: NOW, raising=False)
+    monkeypatch.setattr(login, "_utc_now", lambda: UTC_NOW, raising=False)
     yield guard
     # `read_credentials` may set MFP_SECRET_KEY outside `main`; drop it here.
     for key in list(os.environ):
@@ -274,17 +284,30 @@ def test_fixture_path_is_a_link_folder_under_tmp_path(tmp_path):
 
 
 def test_fixture_guards_need_tmp_targets(tmp_path, monkeypatch):
-    """`main` needs a cookies_file under tmp_path, `run_login` a log there."""
+    """`main` needs a cookies_file under tmp_path, `run_login` a target there."""
     with pytest.raises(pytest.fail.Exception):
         login.main(["--check"])
     with pytest.raises(pytest.fail.Exception):
         login.main(["--check"], cookies_file="/srv/u/cookies.json")
-    kwargs = {"dry_run": True, "no_attempt_log": True, "target": tmp_path / "c.json",
-              "reporter": Capture().reporter, "browser_factory": _tripwire("browser")}
+    kwargs = {"dry_run": True, "env": {}, "reporter": Capture().reporter,
+              "browser_factory": _tripwire("browser")}
     with pytest.raises(pytest.fail.Exception):
-        login.run_login(env={}, **kwargs)
+        login.run_login(target=Path("/srv/u/cookies.json"), **kwargs)
     with pytest.raises(pytest.fail.Exception):
-        login.run_login(env={"MFP_LOGIN_LOG": "/srv/u/attempts.log"}, **kwargs)
+        login.run_login(target=None, **kwargs)
+
+
+def test_fixture_guard_resolves_like_subprocess_without_env_path(tmp_path, monkeypatch,
+                                                                 _isolate):
+    """With `env` given but no PATH in it, `subprocess` searches os.defpath, not PATH."""
+    fakes = tmp_path / "fakes"
+    fakes.mkdir()
+    _fake_exe(fakes, "sudo")
+    monkeypatch.setenv("PATH", os.pathsep.join([str(fakes), os.environ["PATH"]]))
+    assert _isolate.inside_tmp("sudo", None) is True
+    assert _isolate.inside_tmp("sudo", {"PATH": str(fakes)}) is True
+    assert _isolate.inside_tmp("sudo", {"LANG": "C"}) is False
+    assert _isolate.inside_tmp("sudo", {}) is False
 
 
 # --- Chrome finder ----------------------------------------------------------
@@ -775,36 +798,47 @@ class FakeBrowser:
         return False
 
 
+def _stamp(ago: timedelta) -> str:
+    """An attempt line as the command writes it: UTC, seconds, `+00:00`."""
+    return (UTC_NOW - ago).isoformat(timespec="seconds")
+
+
+def _seed_log(folder: Path, lines: list[str]) -> Path:
+    folder.mkdir(parents=True, exist_ok=True)
+    log = folder / LOG_NAME
+    log.write_text("".join(f"{line}\n" for line in lines), encoding="utf-8")
+    return log
+
+
+def _log_lines(log: Path) -> list[str]:
+    return log.read_text(encoding="utf-8").splitlines()
+
+
 def _run_login(monkeypatch, tmp_path, log_lines: int, page: FakePage,
-               no_attempt_log: bool = False, xvfb_finder=lambda: "/fake/Xvfb",
-               password: str = PASSWORD, browser: FakeBrowser | None = None):
-    """Credentials and the attempt log come from this test's environment only."""
+               xvfb_finder=lambda: "/fake/Xvfb", password: str = PASSWORD,
+               browser: FakeBrowser | None = None):
+    """Credentials come from this test's environment. The log sits beside the target."""
     monkeypatch.setenv("MFP_USERNAME", EMAIL)
     monkeypatch.setenv("MFP_PASSWORD", password)
-    monkeypatch.setenv("MFP_LOGIN_ROLE", "dev")
-    log = tmp_path / "attempts.txt"
-    log.write_text("".join(f"2026-11-11T00:00:0{i} dev\n" for i in range(log_lines)),
-                   encoding="utf-8")
-    monkeypatch.setenv("MFP_LOGIN_LOG", str(log))
+    log = _seed_log(tmp_path, [_stamp(timedelta(hours=i + 1)) for i in range(log_lines)])
     browser = browser or FakeBrowser(page)
     clock = FakeClock()
     cap = Capture()
     code = login.run_login(
-        dry_run=True, no_attempt_log=no_attempt_log, target=tmp_path / "c.json",
+        dry_run=True, target=tmp_path / "c.json",
         reporter=cap.reporter, env=dict(os.environ, PATH=""), browser_factory=browser,
         verify=_ok_verify, chrome_finder=lambda: "/fake/chrome", xvfb_finder=xvfb_finder,
-        now=lambda: NOW, sleep=clock.sleep, monotonic=clock.monotonic,
+        now=lambda: NOW, utc_now=lambda: UTC_NOW, sleep=clock.sleep, monotonic=clock.monotonic,
     )
     return code, browser, log, cap
 
 
 def _fake_main_browser(monkeypatch, tmp_path, page: FakePage, password: str = PASSWORD,
                        error: Exception | None = None, creds: bool = True) -> FakeBrowser:
-    """Fakes for a run through `main`: browser, finders, verify and the attempt log."""
+    """Fakes for a run through `main`: browser, finders and verify."""
     if creds:
         monkeypatch.setenv("MFP_USERNAME", EMAIL)
         monkeypatch.setenv("MFP_PASSWORD", password)
-    monkeypatch.setenv("MFP_LOGIN_LOG", str(tmp_path / "attempts.log"))
     browser = FakeBrowser(page, error)
     monkeypatch.setattr(login, "chrome_session", browser)
     monkeypatch.setattr(login, "find_chrome", lambda platform, path: "/fake/chrome")
@@ -857,41 +891,294 @@ def test_fill_check_counts_utf16_units(tmp_path, monkeypatch):
 
 
 def test_attempt_log_full_refuses_before_browser(tmp_path, monkeypatch):
-    code, browser, log, _ = _run_login(monkeypatch, tmp_path, 6, FakePage())
-    assert code == 6
+    browser = _fake_main_browser(monkeypatch, tmp_path, FakePage())
+    lines = [_stamp(timedelta(hours=h)) for h in (1, 2, 3)]
+    log = _seed_log(tmp_path, lines)
+    assert login.main([], cookies_file=tmp_path / "c.json") == 6
     assert browser.started == 0
-    assert len(log.read_text(encoding="utf-8").splitlines()) == 6
+    assert _log_lines(log) == lines
 
 
-def test_attempt_log_five_lines_appends_sixth_and_goes_on(tmp_path, monkeypatch):
+def test_attempt_log_two_lines_append_a_third_and_five_refuse(tmp_path, monkeypatch, capsys):
     page = FakePage()
-    code, browser, log, cap = _run_login(monkeypatch, tmp_path, 5, page)
-    assert code == 0
+    browser = _fake_main_browser(monkeypatch, tmp_path, page)
+    two = [_stamp(timedelta(hours=h)) for h in (1, 2)]
+    log = _seed_log(tmp_path, two)
+    assert login.main(["--dry-run"], cookies_file=tmp_path / "c.json") == 0
     assert browser.started == 1
-    lines = log.read_text(encoding="utf-8").splitlines()
-    assert len(lines) == 6
-    assert lines[-1] == "2026-11-11T12:00:00 dev"
     assert page.submitted is True
-    assert page.filled == {login.EMAIL_SEL: EMAIL, login.PASSWORD_SEL: PASSWORD}
-    assert cap.lines[-1] == "dry-run: 2 cookies, session ok"
+    assert _log_lines(log) == [*two, "2026-11-27T12:00:00+00:00"]
+    out = _lines(capsys)
+    assert login.msg_attempt_logged(3) in out
+    assert out[-1] == "dry-run: 2 cookies, session ok"
+    five = [_stamp(timedelta(hours=h)) for h in range(1, 6)]
+    _seed_log(tmp_path, five)
+    assert login.main(["--dry-run"], cookies_file=tmp_path / "c.json") == 6
+    assert browser.started == 1
+    assert _log_lines(log) == five
 
 
-def test_attempt_log_unset_refuses_with_2():
-    """Driven below `run_login`, which every test reaches with the log set."""
-    for unset in (None, ""):
-        with pytest.raises(login.LoginError) as err:
-            login.attempt_precheck(unset, False)
-        assert err.value.code == 2
-        assert err.value.message == login.msg_log_unset()
+@pytest.mark.parametrize("third, code", [
+    (timedelta(hours=23, minutes=59), 6),
+    (timedelta(hours=24, minutes=1), 0),
+], ids=["23h59m-inside", "24h01m-outside"])
+def test_window_edge_with_a_fixed_clock(tmp_path, monkeypatch, third, code):
+    browser = _fake_main_browser(monkeypatch, tmp_path, FakePage())
+    _seed_log(tmp_path, [_stamp(timedelta(hours=1))] * 2 + [_stamp(third)])
+    assert login.main(["--dry-run"], cookies_file=tmp_path / "c.json") == code
+    assert browser.started == (1 if code == 0 else 0)
 
 
-def test_no_attempt_log_flag_allows_login_without_log(tmp_path):
-    cap = Capture()
-    for unset in (None, ""):
-        assert login.attempt_precheck(unset, True) is None
-        login.record_attempt(unset, "dev", True, NOW, cap.reporter)
-    assert cap.lines == [login.msg_attempt_skipped()] * 2
-    assert sorted(p.name for p in tmp_path.iterdir()) == [SAFE_BIN, "tmp"]
+def test_prune_drops_lines_older_than_30_days(tmp_path, monkeypatch):
+    _fake_main_browser(monkeypatch, tmp_path, FakePage())
+    keep, drop = _stamp(timedelta(days=29)), _stamp(timedelta(days=31))
+    log = _seed_log(tmp_path, [drop, "", keep])
+    assert login.main(["--dry-run"], cookies_file=tmp_path / "c.json") == 0
+    assert _log_lines(log) == [keep, _stamp(timedelta(0))]
+
+
+def test_a_run_that_finds_a_valid_session_still_prunes(tmp_path, monkeypatch):
+    browser = _fake_main_browser(monkeypatch, tmp_path, FakePage())
+    target = _cookie_file(tmp_path / "c.json", NOW - timedelta(days=1))
+    keep, drop = _stamp(timedelta(days=29)), _stamp(timedelta(days=31))
+    log = _seed_log(tmp_path, [drop, keep])
+    assert login.main([], cookies_file=target) == 0
+    assert browser.started == 0
+    assert _log_lines(log) == [keep]
+
+
+def test_prune_failure_leaves_the_log_and_no_temp_file(tmp_path, monkeypatch):
+    browser = _fake_main_browser(monkeypatch, tmp_path, FakePage())
+    log = _seed_log(tmp_path, [_stamp(timedelta(days=31))])
+    before = log.read_bytes()
+
+    def boom(src, dst):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(login.os, "replace", boom)
+    assert login.main(["--dry-run"], cookies_file=tmp_path / "c.json") == 5
+    assert log.read_bytes() == before
+    assert sorted(p.name for p in tmp_path.iterdir()) == [LOG_NAME, LOCK_NAME, SAFE_BIN, "tmp"]
+    assert browser.started == 0
+
+
+def test_unreadable_line_counts_and_survives_a_prune(tmp_path, monkeypatch):
+    browser = _fake_main_browser(monkeypatch, tmp_path, FakePage())
+    recent = [_stamp(timedelta(hours=h)) for h in (1, 2)]
+    log = _seed_log(tmp_path, ["garbage", *recent])
+    assert login.main(["--dry-run"], cookies_file=tmp_path / "c.json") == 6
+    assert browser.started == 0
+    assert _log_lines(log) == ["garbage", *recent]
+    _seed_log(tmp_path, ["garbage", _stamp(timedelta(days=31)), recent[0]])
+    assert login.main(["--dry-run"], cookies_file=tmp_path / "c.json") == 0
+    assert browser.started == 1
+    assert _log_lines(log) == ["garbage", recent[0], _stamp(timedelta(0))]
+
+
+def test_bytes_that_are_not_utf8_survive_a_prune(tmp_path, monkeypatch):
+    _fake_main_browser(monkeypatch, tmp_path, FakePage())
+    log = tmp_path / LOG_NAME
+    log.write_bytes(b"\xff\xfe junk\n" + _stamp(timedelta(days=31)).encode() + b"\n")
+    assert login.main(["--dry-run"], cookies_file=tmp_path / "c.json") == 0
+    assert log.read_bytes() == b"\xff\xfe junk\n" + b"2026-11-27T12:00:00+00:00\n"
+
+
+def test_three_unreadable_lines_exit_6_naming_the_file_and_count(tmp_path, monkeypatch, capsys):
+    browser = _fake_main_browser(monkeypatch, tmp_path, FakePage())
+    log = _seed_log(tmp_path, ["garbage", "2026-13-01T00:00:00", "dev"])
+    assert login.main([], cookies_file=tmp_path / "c.json") == 6
+    out = _lines(capsys)
+    assert out == ["check: no cookie file", login.msg_log_unreadable(log, 3)]
+    assert str(log) in out[-1]
+    assert "holds 3 unreadable lines" in out[-1]
+    assert "Delete those lines" in out[-1]
+    assert browser.started == 0
+
+
+def test_exit_6_names_the_file_and_the_reopen_time(tmp_path, monkeypatch, capsys):
+    _fake_main_browser(monkeypatch, tmp_path, FakePage())
+    log = _seed_log(tmp_path, [_stamp(timedelta(hours=h)) for h in (1, 2, 3)])
+    assert login.main([], cookies_file=tmp_path / "c.json") == 6
+    last = _lines(capsys)[-1]
+    oldest = UTC_NOW - timedelta(hours=3)
+    assert last == login.msg_log_full(log, 3, oldest + timedelta(hours=24))
+    assert str(log) in last
+    assert "from 2026-11-28T09:00:00+00:00" in last
+
+
+@pytest.mark.parametrize("lines, count, reopen", [
+    ([timedelta(hours=h) for h in range(1, 6)], 5, "2026-11-28T09:00:00+00:00"),
+    (["garbage", *(timedelta(hours=h) for h in (1, 2, 3))], 4, "2026-11-28T10:00:00+00:00"),
+], ids=["five-stamps", "one-unreadable-three-stamps"])
+def test_reopen_time_is_when_the_window_drops_below_three(tmp_path, monkeypatch, capsys,
+                                                          lines, count, reopen):
+    """Over three counted lines, the oldest one ageing out still leaves three."""
+    _fake_main_browser(monkeypatch, tmp_path, FakePage())
+    log = _seed_log(tmp_path, [x if isinstance(x, str) else _stamp(x) for x in lines])
+    assert login.main(["--dry-run"], cookies_file=tmp_path / "c.json") == 6
+    assert _lines(capsys) == [
+        login.msg_log_full(log, count, datetime.fromisoformat(reopen))
+    ]
+
+
+def test_naive_stamp_is_read_as_utc(tmp_path, monkeypatch, capsys):
+    browser = _fake_main_browser(monkeypatch, tmp_path, FakePage())
+    recent = [_stamp(timedelta(hours=1)), _stamp(timedelta(minutes=30))]
+    log = _seed_log(tmp_path, ["2026-11-27T10:00:00", *recent])
+    assert login.main([], cookies_file=tmp_path / "c.json") == 6
+    # As an unreadable line it would reopen at 11:00, from the oldest stamp left.
+    reopen = datetime(2026, 11, 28, 10, 0, 0, tzinfo=timezone.utc)
+    assert _lines(capsys)[-1] == login.msg_log_full(log, 3, reopen)
+    _seed_log(tmp_path, ["2026-11-26T11:00:00", *recent])
+    assert login.main(["--dry-run"], cookies_file=tmp_path / "c.json") == 0
+    assert browser.started == 1
+
+
+def test_written_stamp_is_utc_and_parses_on_this_python(tmp_path, monkeypatch):
+    monkeypatch.setattr(login, "_utc_now", ORIG["_utc_now"])
+    _fake_main_browser(monkeypatch, tmp_path, FakePage())
+    before = datetime.now(timezone.utc).replace(microsecond=0)
+    assert login.main(["--dry-run"], cookies_file=tmp_path / "c.json") == 0
+    after = datetime.now(timezone.utc)
+    (line,) = _log_lines(tmp_path / LOG_NAME)
+    assert line.endswith("+00:00")
+    stamp = datetime.fromisoformat(line)
+    assert stamp.utcoffset() == timedelta(0)
+    assert before <= stamp <= after
+
+
+def test_record_starts_a_new_line_when_the_log_lacks_one(tmp_path, monkeypatch):
+    _fake_main_browser(monkeypatch, tmp_path, FakePage())
+    log = tmp_path / LOG_NAME
+    log.write_bytes(_stamp(timedelta(hours=5)).encode())
+    assert login.main(["--dry-run"], cookies_file=tmp_path / "c.json") == 0
+    assert _log_lines(log) == [_stamp(timedelta(hours=5)), _stamp(timedelta(0))]
+
+
+def test_fresh_home_gets_a_0700_folder_holding_the_log(tmp_path, monkeypatch):
+    _fake_main_browser(monkeypatch, tmp_path, FakePage())
+    fresh = tmp_path / "fresh"
+    assert login.main(["--dry-run"], cookies_file=fresh / "c.json") == 0
+    assert stat.S_IMODE(fresh.stat().st_mode) == 0o700
+    assert _log_lines(fresh / LOG_NAME) == ["2026-11-27T12:00:00+00:00"]
+    assert sorted(p.name for p in fresh.iterdir()) == [LOG_NAME, LOCK_NAME]
+
+
+def test_fresh_lock_file_has_mode_0600(tmp_path, monkeypatch):
+    _fake_main_browser(monkeypatch, tmp_path, FakePage())
+    old_umask = os.umask(0o022)
+    try:
+        assert login.main(["--dry-run"], cookies_file=tmp_path / "c.json") == 0
+    finally:
+        os.umask(old_umask)
+    lock = tmp_path / LOCK_NAME
+    assert stat.S_IMODE(os.stat(lock).st_mode) == 0o600
+
+
+def _hold_lock(folder: Path) -> int:
+    """Take the lock the way another run would: flock on its own open of login.lock."""
+    import fcntl
+
+    folder.mkdir(parents=True, exist_ok=True)
+    fd = os.open(folder / LOCK_NAME, os.O_RDWR | os.O_CREAT, 0o600)
+    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    return fd
+
+
+def test_held_lock_exits_2_before_the_session_check(tmp_path, monkeypatch, capsys):
+    browser = _fake_main_browser(monkeypatch, tmp_path, FakePage())
+    old = _stamp(timedelta(days=31))
+    log = _seed_log(tmp_path, [old])
+    fd = _hold_lock(tmp_path)
+    try:
+        assert login.main([], cookies_file=tmp_path / "c.json") == 2
+        assert login.main(["--dry-run"], cookies_file=tmp_path / "c.json") == 2
+    finally:
+        os.close(fd)
+    assert _lines(capsys) == [login.msg_lock_held(tmp_path / LOCK_NAME)] * 2
+    assert browser.started == 0
+    assert _log_lines(log) == [old]
+    assert login.main(["--dry-run"], cookies_file=tmp_path / "c.json") == 0
+    assert browser.started == 1
+    assert _log_lines(log) == [_stamp(timedelta(0))]
+
+
+def test_check_runs_while_the_lock_is_held(tmp_path, monkeypatch, capsys):
+    """Regression guard, kept on purpose: `--check` takes no lock."""
+    monkeypatch.setattr(login, "verify_session", _ok_verify)
+    target = _cookie_file(tmp_path / "c.json", NOW - timedelta(days=1))
+    fd = _hold_lock(tmp_path)
+    try:
+        assert login.main(["--check"], cookies_file=target) == 0
+        assert _lines(capsys)[-1] == "check: session still valid"
+        target.unlink()
+        assert login.main(["--check"], cookies_file=target) == 4
+    finally:
+        os.close(fd)
+    assert _lines(capsys) == ["check: no cookie file"]
+
+
+def test_check_leaves_the_log_byte_for_byte(tmp_path, monkeypatch):
+    """Regression guard, kept on purpose: `--check` never prunes or writes the log."""
+    monkeypatch.setattr(login, "verify_session", _ok_verify)
+    target = _cookie_file(tmp_path / "c.json", NOW - timedelta(days=1))
+    log = _seed_log(tmp_path, [_stamp(timedelta(days=40)), "garbage", "",
+                               _stamp(timedelta(hours=1))])
+    before = log.read_bytes()
+    assert login.main(["--check"], cookies_file=target) == 0
+    assert log.read_bytes() == before
+    assert not (tmp_path / LOCK_NAME).exists()
+
+
+def test_window_check_comes_before_the_credential_prompt(tmp_path, monkeypatch, capsys):
+    browser = _fake_main_browser(monkeypatch, tmp_path, FakePage(), creds=False)
+    monkeypatch.setattr("builtins.input", _tripwire("input"))
+    monkeypatch.setattr(login.getpass, "getpass", _tripwire("getpass"))
+    log = _seed_log(tmp_path, [_stamp(timedelta(hours=h)) for h in (1, 2, 3)])
+    assert login.main([], cookies_file=tmp_path / "c.json") == 6
+    reopen = UTC_NOW + timedelta(hours=21)
+    assert _lines(capsys) == ["check: no cookie file", login.msg_log_full(log, 3, reopen)]
+    assert browser.started == 0
+
+
+def test_window_check_comes_before_the_websockets_check(tmp_path, monkeypatch, capsys):
+    browser = _fake_main_browser(monkeypatch, tmp_path, FakePage())
+    _hide_websockets(monkeypatch)
+    log = _seed_log(tmp_path, [_stamp(timedelta(hours=h)) for h in (1, 2, 3)])
+    assert login.main(["--dry-run"], cookies_file=tmp_path / "c.json") == 6
+    reopen = UTC_NOW + timedelta(hours=21)
+    assert _lines(capsys) == [login.msg_log_full(log, 3, reopen)]
+    assert browser.started == 0
+
+
+def test_dry_run_with_a_full_window_exits_6_before_any_browser(tmp_path, monkeypatch, capsys):
+    browser = _fake_main_browser(monkeypatch, tmp_path, FakePage())
+    lines = [_stamp(timedelta(hours=h)) for h in (1, 2, 3)]
+    log = _seed_log(tmp_path, lines)
+    assert login.main(["--dry-run"], cookies_file=tmp_path / "c.json") == 6
+    assert browser.started == 0
+    assert _log_lines(log) == lines
+    assert _lines(capsys)[-1].startswith("attempts: 3 logins in the last 24 hours")
+
+
+def test_dry_run_appends_exactly_one_line(tmp_path, monkeypatch):
+    _fake_main_browser(monkeypatch, tmp_path, FakePage())
+    log = _seed_log(tmp_path, [_stamp(timedelta(hours=5))])
+    before = log.read_bytes()
+    assert login.main(["--dry-run"], cookies_file=tmp_path / "c.json") == 0
+    assert log.read_bytes() == before + b"2026-11-27T12:00:00+00:00\n"
+    assert not (tmp_path / "c.json").exists()
+
+
+def test_saved_at_stays_naive_while_the_attempt_stamp_is_utc(tmp_path, monkeypatch):
+    """A dry run writes no cookie file, so a plain run shows the finalize stamp."""
+    _fake_main_browser(monkeypatch, tmp_path, FakePage())
+    target = tmp_path / "c.json"
+    assert login.main([], cookies_file=target) == 0
+    saved_at = datetime.fromisoformat(json.loads(target.read_text(encoding="utf-8"))["saved_at"])
+    assert saved_at.tzinfo is None
+    assert saved_at == NOW
+    assert _log_lines(tmp_path / LOG_NAME) == ["2026-11-27T12:00:00+00:00"]
 
 
 def test_turnstile_never_clears_exits_3_without_counting(tmp_path, monkeypatch):
@@ -1254,7 +1541,6 @@ def test_signal_inside_the_real_chrome_session_cleans_its_root(tmp_path, monkeyp
     monkeypatch.setattr(login, "find_xvfb", lambda platform, path: None)
     monkeypatch.setenv("MFP_USERNAME", EMAIL)
     monkeypatch.setenv("MFP_PASSWORD", PASSWORD)
-    monkeypatch.setenv("MFP_LOGIN_LOG", str(tmp_path / "attempts.log"))
     assert login.main(["--dry-run"], cookies_file=tmp_path / "c.json") == 143
     assert len(kills) == 1
     root = kills[0]
@@ -1363,7 +1649,7 @@ def test_dry_run_writes_only_the_expected_paths(tmp_path, monkeypatch):
     links = [Path(SAFE_BIN, name) for name in os.listdir(tmp_path / SAFE_BIN)]
     assert login.main(["--dry-run"], cookies_file=tmp_path / "c.json") == 0
     assert sorted(p.relative_to(tmp_path) for p in tmp_path.rglob("*")) == sorted(
-        [Path("attempts.log"), Path(SAFE_BIN), Path("tmp"), *links]
+        [Path(LOG_NAME), Path(LOCK_NAME), Path(SAFE_BIN), Path("tmp"), *links]
     )
     assert homes == [str(tmp_path), str(tmp_path)]
     assert os.environ["HOME"] == str(tmp_path)
@@ -1435,10 +1721,10 @@ MESSAGE_CALLS = {
     "msg_xvfb": lambda f: f("/usr/bin/Xvfb"),
     "msg_no_xvfb": lambda f: f(),
     "msg_fill_failed": lambda f: f(),
-    "msg_log_unset": lambda f: f(),
-    "msg_log_full": lambda f: f(6),
+    "msg_lock_held": lambda f: f(Path("/x") / LOCK_NAME),
+    "msg_log_full": lambda f: f(Path("/x") / LOG_NAME, 3, UTC_NOW),
+    "msg_log_unreadable": lambda f: f(Path("/x") / LOG_NAME, 3),
     "msg_attempt_logged": lambda f: f(3),
-    "msg_attempt_skipped": lambda f: f(),
     "msg_form_found": lambda f: f(),
     "msg_form_missing": lambda f: f(30),
     "msg_consent": lambda f: f(),
