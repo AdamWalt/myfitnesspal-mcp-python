@@ -61,9 +61,14 @@ dev = [
     "mypy>=1.0.0",
     "ruff>=0.1.0",
 ]
+login = [
+    "websockets>=11",
+    "requests",
+]
 
 [project.scripts]
 mfp-mcp = "mfp_mcp.server:main"
+mfp-mcp-login = "mfp_mcp.login:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/mfp_mcp"]

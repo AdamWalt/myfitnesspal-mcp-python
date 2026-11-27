@@ -10,12 +10,14 @@ from __future__ import annotations
 
 import html
 import importlib.machinery
+import importlib.metadata
 import importlib.util
 import inspect
 import io
 import json
 import logging
 import os
+import re
 import signal
 import socket
 import stat
@@ -1810,6 +1812,59 @@ def test_websockets_check_needs_the_sync_client(monkeypatch):
     monkeypatch.setitem(sys.modules, "websockets.sync.client",
                         _fake_package("websockets.sync.client", False))
     assert check() is True
+
+
+# --- packaging ----------------------------------------------------------------
+
+REPO = Path(__file__).resolve().parents[1]
+
+
+def _requirement_name(requirement: str) -> str:
+    return re.split(r"[\s<>=!~;\[(]", requirement, maxsplit=1)[0].lower()
+
+
+def _load_toml(path: Path) -> dict:
+    if sys.version_info >= (3, 11):
+        import tomllib
+    else:
+        try:
+            import tomli as tomllib
+        except ImportError:
+            pytest.skip("tomli is not installed, and Python 3.10 has no tomllib")
+    with path.open("rb") as fh:
+        return tomllib.load(fh)
+
+
+def test_module_imports_with_websockets_hidden(monkeypatch):
+    """The base install has no websockets, so `mfp_mcp.login` imports without it."""
+    import mfp_mcp
+
+    hidden = {"websockets", "websockets.sync", "websockets.sync.client"}
+    hidden |= {name for name in sys.modules if name.startswith("websockets.")}
+    for name in hidden:
+        monkeypatch.setitem(sys.modules, name, None)
+    monkeypatch.delitem(sys.modules, "mfp_mcp.login")
+    monkeypatch.setattr(mfp_mcp, "login", login)
+    fresh = importlib.import_module("mfp_mcp.login")
+    assert fresh is not login
+    assert callable(fresh.main)
+    with pytest.raises(ImportError):
+        importlib.import_module("websockets")
+
+
+def test_pyproject_declares_the_command_and_the_login_extra():
+    project = _load_toml(REPO / "pyproject.toml")["project"]
+    assert project["scripts"]["mfp-mcp-login"] == "mfp_mcp.login:main"
+    assert project["optional-dependencies"]["login"] == ["websockets>=11", "requests"]
+    base = {_requirement_name(req) for req in project["dependencies"]}
+    assert "websockets" not in base
+
+
+def test_installed_entry_point_runs_login_main():
+    """An install check: it reads the env's dist-info, written by `pip install -e .`."""
+    scripts = importlib.metadata.entry_points(group="console_scripts")
+    found = [(ep.name, ep.value) for ep in scripts if ep.name == "mfp-mcp-login"]
+    assert found == [("mfp-mcp-login", "mfp_mcp.login:main")]
 
 
 # --- signals ------------------------------------------------------------------
