@@ -56,7 +56,7 @@ MASKED = frozenset({
 ORIG = {
     name: getattr(login, name, None)
     for name in ("chrome_session", "_spawn", "verify_session", "_has_websockets_sync",
-                 "_kill_leftovers", "_utc_now")
+                 "_kill_leftovers", "_utc_now", "find_xvfb", "find_chrome")
 }
 
 
@@ -323,12 +323,99 @@ def test_find_chrome_linux_order_on_fake_path(tmp_path):
     assert login.find_chrome("linux", path) == str(stable)
     stable.unlink()
     assert login.find_chrome("linux", path) == str(chromium)
+    browser = _fake_exe(b, "chromium-browser")
+    assert login.find_chrome("linux", path) == str(chromium)
+    chromium.unlink()
+    assert login.find_chrome("linux", path) == str(browser)
+
+
+def _which_map(found: dict[str, str]):
+    """A `which` seam that answers only for the names given."""
+    def which(name, path=None):
+        return found.get(name)
+
+    return which
+
+
+def test_find_chrome_skips_a_snap_path_before_resolving(tmp_path):
+    cap = Capture()
+    resolved: list[str] = []
+    real = _fake_exe(tmp_path, "chromium-browser")
+
+    def resolve(p):
+        resolved.append(p)
+        return p
+
+    which = _which_map({"chromium": "/snap/bin/chromium", "chromium-browser": str(real)})
+    found = login.find_chrome("linux", str(tmp_path), reporter=cap.reporter, which=which,
+                              resolve=resolve)
+    assert found == str(real)
+    assert resolved == [str(real)]
+    assert cap.lines == [login.msg_chrome_snap("/snap/bin/chromium")]
+    assert "Google Chrome" in cap.lines[0]
+
+
+def test_find_chrome_skips_a_path_that_resolves_into_the_snap(tmp_path):
+    cap = Capture()
+    fake = _fake_exe(tmp_path, "chromium")
+    snap = "/snap/chromium/current/usr/lib/chromium-browser/chrome"
+    which = _which_map({"chromium": str(fake)})
+    with pytest.raises(login.LoginError) as err:
+        login.find_chrome("linux", str(tmp_path), reporter=cap.reporter, which=which,
+                          resolve=lambda p: snap if p == str(fake) else p)
+    assert err.value.code == 2
+    assert cap.lines == [login.msg_chrome_snap(str(fake))]
+
+
+def test_find_chrome_skips_a_chromium_browser_script_that_runs_the_snap(tmp_path):
+    cap = Capture()
+    wrapper = tmp_path / "chromium-browser"
+    wrapper.write_text('#!/bin/sh\nexec /snap/bin/chromium "$@"\n', encoding="utf-8")
+    wrapper.chmod(0o755)
+    with pytest.raises(login.LoginError) as err:
+        login.find_chrome("linux", str(tmp_path), reporter=cap.reporter)
+    assert err.value.code == 2
+    assert cap.lines == [login.msg_chrome_snap(str(wrapper))]
+    wrapper.write_text("#!/bin/sh\nexec /opt/chromium/chrome \"$@\"\n", encoding="utf-8")
+    assert login.find_chrome("linux", str(tmp_path), reporter=cap.reporter) == str(wrapper)
+
+
+@pytest.mark.parametrize("start, skipped", [(4090, True), (4091, False)],
+                         ids=["last-byte-4096", "last-byte-4097"])
+def test_chromium_browser_sniff_reads_the_first_4_kb_only(tmp_path, start, skipped):
+    """`/snap/` ending on byte 4096 is seen. Ending on byte 4097, it is not."""
+    wrapper = tmp_path / "chromium-browser"
+    head = b"#!/bin/sh\n"
+    wrapper.write_bytes(head + b"#" * (start - len(head)) + b"/snap/bin/chromium\n")
+    wrapper.chmod(0o755)
+    assert wrapper.read_bytes().index(b"/snap/") == start
+    cap = Capture()
+    if skipped:
+        with pytest.raises(login.LoginError):
+            login.find_chrome("linux", str(tmp_path), reporter=cap.reporter)
+        assert cap.lines == [login.msg_chrome_snap(str(wrapper))]
+    else:
+        assert login.find_chrome("linux", str(tmp_path), reporter=cap.reporter) == str(wrapper)
+        assert cap.lines == []
+
+
+def test_only_a_chromium_browser_script_is_sniffed(tmp_path):
+    """A `chromium` script that names `/snap/` is not a snap wrapper by its text alone."""
+    script = tmp_path / "chromium"
+    script.write_text('#!/bin/sh\n# moved off /snap/ long ago\nexec /opt/c "$@"\n',
+                      encoding="utf-8")
+    script.chmod(0o755)
+    cap = Capture()
+    assert login.find_chrome("linux", str(tmp_path), reporter=cap.reporter) == str(script)
+    assert cap.lines == []
 
 
 def test_find_chrome_none_exits_2(tmp_path):
     with pytest.raises(login.LoginError) as err:
         login.find_chrome("linux", str(tmp_path))
     assert err.value.code == 2
+    assert err.value.message == login.msg_no_chrome("linux")
+    assert "https://www.google.com/chrome/" in err.value.message
 
 
 def test_find_chrome_macos_uses_app_path():
@@ -337,6 +424,7 @@ def test_find_chrome_macos_uses_app_path():
     with pytest.raises(login.LoginError) as err:
         login.find_chrome("darwin", "", exists=lambda p: False)
     assert err.value.code == 2
+    assert "brew install --cask google-chrome" in err.value.message
 
 
 # --- virtual display and Chrome flags ---------------------------------------
@@ -349,23 +437,162 @@ def test_find_xvfb_prefers_path(tmp_path):
     assert login.find_xvfb("linux", str(bin_dir)) == str(on_path)
 
 
-def test_find_xvfb_missing_exits_2_and_unpacks_nothing(tmp_path, monkeypatch):
-    """No Xvfb on PATH is a plain exit 2. Nothing is downloaded or unpacked."""
-    ran: list[list[str]] = []
-    monkeypatch.setattr(login, "_run_cmd", lambda cmd, cwd=None: ran.append(cmd))
-    before = sorted(p.relative_to(tmp_path) for p in tmp_path.rglob("*"))
-    with pytest.raises(login.LoginError) as err:
-        login.find_xvfb("linux", str(tmp_path))
-    assert err.value.code == 2
-    assert ran == []
-    assert sorted(p.relative_to(tmp_path) for p in tmp_path.rglob("*")) == before
+class _FakeTools:
+    """Fake package tools in a folder put before the fixture's link folder.
+
+    The fake `sudo` logs its argv and environment, then runs its arguments.
+    The fake `apt-get` logs its argv, then makes a fake Xvfb unless told to fail.
+    """
+
+    def __init__(self, tmp_path: Path, names: tuple[str, ...], apt_exit: int = 0,
+                 apt_makes_xvfb: bool = True) -> None:
+        self.dir = tmp_path / "fakes"
+        self.dir.mkdir()
+        self.log = tmp_path / "fakes.log"
+        self.env_log = tmp_path / "sudo.env"
+        self.path = os.pathsep.join([str(self.dir), os.environ["PATH"]])
+        scripts = {
+            "sudo": f'echo "sudo $*" >> {self.log}\nenv > {self.env_log}\nexec "$@"\n',
+            "apt-get": (f'echo "apt-get $*" >> {self.log}\n'
+                        + (f"printf '#!/bin/sh\\n' > {self.dir}/Xvfb\n"
+                           f"chmod 755 {self.dir}/Xvfb\n" if apt_makes_xvfb else "")
+                        + f"exit {apt_exit}\n"),
+            "dnf": f'echo "dnf $*" >> {self.log}\n',
+            "pacman": f'echo "pacman $*" >> {self.log}\n',
+        }
+        for name in names:
+            exe = self.dir / name
+            exe.write_text("#!/bin/sh\n" + scripts[name], encoding="utf-8")
+            exe.chmod(0o755)
+
+    def calls(self) -> list[str]:
+        return self.log.read_text(encoding="utf-8").splitlines() if self.log.exists() else []
 
 
-def test_find_xvfb_missing_exits_2_with_install_hint(tmp_path):
+def test_find_xvfb_missing_without_the_flag_names_apt_get_and_installs_nothing(tmp_path,
+                                                                             monkeypatch):
+    """No Xvfb, `apt-get` on PATH, no flag: exit 2 with the hint, and no tool runs."""
+    tools = _FakeTools(tmp_path, ("sudo", "apt-get"))
+    monkeypatch.setattr(login, "_is_tty", lambda: True)
     with pytest.raises(login.LoginError) as err:
-        login.find_xvfb("linux", str(tmp_path))
+        login.find_xvfb("linux", tools.path, env=dict(os.environ, PATH=tools.path))
     assert err.value.code == 2
-    assert "sudo apt install xvfb" in err.value.message
+    assert err.value.message == login.msg_no_xvfb("sudo apt-get install xvfb", True)
+    assert "sudo apt-get install xvfb" in err.value.message
+    assert "--install-xvfb" in err.value.message
+    assert tools.calls() == []
+    assert not (tools.dir / "Xvfb").exists()
+
+
+def test_install_flag_runs_sudo_apt_get_and_uses_the_new_xvfb(tmp_path, monkeypatch, capsys):
+    tools = _FakeTools(tmp_path, ("sudo", "apt-get"))
+    monkeypatch.setenv("PATH", tools.path)
+    monkeypatch.setattr(login, "_is_tty", lambda: True)
+    browser = _fake_main_browser(monkeypatch, tmp_path, FakePage())
+    monkeypatch.setattr(login, "find_xvfb", ORIG["find_xvfb"])
+    monkeypatch.setenv("MFP_SECRET_KEY", "k3y")
+    monkeypatch.setenv("MFP_FOO", "bar")
+    code = login.main(["--dry-run", "--install-xvfb"], cookies_file=tmp_path / "c.json")
+    assert code == 0
+    apt_get = str(tools.dir / "apt-get")
+    assert tools.calls() == [f"sudo {apt_get} install xvfb", "apt-get install xvfb"]
+    assert browser.xvfb == str(tools.dir / "Xvfb")
+    out = _lines(capsys)
+    assert login.msg_xvfb_installing("sudo apt-get install xvfb") in out
+    assert login.msg_xvfb(str(tools.dir / "Xvfb")) in out
+    sudo_env = tools.env_log.read_text(encoding="utf-8")
+    assert [line for line in sudo_env.splitlines() if line.startswith("MFP_")] == []
+
+
+def test_install_flag_strips_every_mfp_variable_from_sudo(tmp_path, monkeypatch):
+    tools = _FakeTools(tmp_path, ("sudo", "apt-get"))
+    monkeypatch.setattr(login, "_is_tty", lambda: True)
+    env = dict(os.environ, PATH=tools.path, MFP_USERNAME=EMAIL, MFP_PASSWORD=PASSWORD,
+               MFP_SECRET_KEY="k3y", MFP_FOO="bar")
+    found = login.find_xvfb("linux", tools.path, install=True, env=env)
+    assert found == str(tools.dir / "Xvfb")
+    seen = dict(line.split("=", 1) for line in
+                tools.env_log.read_text(encoding="utf-8").splitlines() if "=" in line)
+    assert sorted(k for k in seen if k.startswith("MFP_")) == []
+    assert seen["PATH"] == tools.path
+    assert PASSWORD not in tools.env_log.read_text(encoding="utf-8")
+
+
+def test_install_flag_as_root_runs_apt_get_without_sudo(tmp_path, monkeypatch):
+    tools = _FakeTools(tmp_path, ("sudo", "apt-get"))
+    monkeypatch.setattr(login, "_is_tty", lambda: True)
+    monkeypatch.setattr(login.os, "geteuid", lambda: 0)
+    found = login.find_xvfb("linux", tools.path, install=True,
+                            env=dict(os.environ, PATH=tools.path))
+    assert found == str(tools.dir / "Xvfb")
+    assert tools.calls() == ["apt-get install xvfb"]
+
+
+def test_install_flag_without_a_tty_exits_2_and_runs_nothing(tmp_path, monkeypatch, capsys):
+    tools = _FakeTools(tmp_path, ("sudo", "apt-get"))
+    monkeypatch.setenv("PATH", tools.path)
+    browser = _fake_main_browser(monkeypatch, tmp_path, FakePage())
+    monkeypatch.setattr(login, "find_xvfb", ORIG["find_xvfb"])
+    code = login.main(["--dry-run", "--install-xvfb"], cookies_file=tmp_path / "c.json")
+    assert code == 2
+    last = _lines(capsys)[-1]
+    assert last == login.msg_xvfb_cannot_install("no terminal for apt",
+                                                 "sudo apt-get install xvfb")
+    assert "sudo apt-get install xvfb" in last
+    assert tools.calls() == []
+    assert browser.started == 0
+
+
+def test_install_flag_with_xvfb_on_path_runs_nothing(tmp_path, monkeypatch):
+    tools = _FakeTools(tmp_path, ("sudo", "apt-get"))
+    on_path = _fake_exe(tools.dir, "Xvfb")
+    monkeypatch.setattr(login, "_is_tty", lambda: True)
+    found = login.find_xvfb("linux", tools.path, install=True,
+                            env=dict(os.environ, PATH=tools.path))
+    assert found == str(on_path)
+    assert tools.calls() == []
+
+
+@pytest.mark.parametrize("apt_exit, makes, code", [
+    (100, False, 100), (0, False, 0), (100, True, 100),
+], ids=["apt-exits-100", "apt-ok-but-no-xvfb", "apt-exits-100-after-making-xvfb"])
+def test_find_xvfb_install_failure_exits_2_naming_the_step_and_code(tmp_path, monkeypatch,
+                                                                    apt_exit, makes, code):
+    tools = _FakeTools(tmp_path, ("sudo", "apt-get"), apt_exit=apt_exit, apt_makes_xvfb=makes)
+    monkeypatch.setattr(login, "_is_tty", lambda: True)
+    with pytest.raises(login.LoginError) as err:
+        login.find_xvfb("linux", tools.path, install=True, env=dict(os.environ, PATH=tools.path))
+    assert err.value.code == 2
+    assert err.value.message == login.msg_xvfb_install_failed("sudo apt-get install xvfb", code)
+    assert "'sudo apt-get install xvfb'" in err.value.message
+    assert f"exited with code {code}" in err.value.message
+    assert len(tools.calls()) == 2
+
+
+@pytest.mark.parametrize("names, hint", [
+    (("dnf",), "sudo dnf install xorg-x11-server-Xvfb"),
+    (("pacman",), "sudo pacman -S xorg-server-xvfb"),
+    (("dnf", "pacman"), "sudo dnf install xorg-x11-server-Xvfb"),
+    ((), None),
+], ids=["dnf", "pacman", "dnf-first", "none"])
+@pytest.mark.parametrize("flag", [False, True], ids=["no-flag", "flag"])
+def test_find_xvfb_without_apt_get_prints_the_distro_command(tmp_path, monkeypatch, names, hint,
+                                                             flag):
+    tools = _FakeTools(tmp_path, ("sudo", *names))
+    monkeypatch.setattr(login, "_is_tty", lambda: True)
+    with pytest.raises(login.LoginError) as err:
+        login.find_xvfb("linux", tools.path, install=flag, env=dict(os.environ, PATH=tools.path))
+    assert err.value.code == 2
+    if flag:
+        assert err.value.message == login.msg_xvfb_cannot_install("no apt-get on PATH", hint)
+    else:
+        assert err.value.message == login.msg_no_xvfb(hint, False)
+    assert "--install-xvfb" not in err.value.message or flag
+    if hint:
+        assert hint in err.value.message
+    else:
+        assert "install Xvfb" in err.value.message
+    assert tools.calls() == []
 
 
 def test_find_xvfb_macos_needs_none(tmp_path):
@@ -373,10 +600,118 @@ def test_find_xvfb_macos_needs_none(tmp_path):
 
 
 def test_xvfb_args():
-    assert login.xvfb_args("/x/Xvfb", 7) == [
-        "/x/Xvfb", "-displayfd", "7", "-nolisten", "tcp", "-nolisten", "unix", "-nolock",
+    args = login.xvfb_args("/x/Xvfb", 7)
+    assert args == [
+        "/x/Xvfb", "-displayfd", "7", "-nolisten", "tcp", "-nolisten", "unix",
         "-screen", "0", "1366x768x24",
     ]
+    assert "-nolock" not in args
+
+
+def test_xvfb_start_failure_prints_its_own_stderr(tmp_path, monkeypatch):
+    monkeypatch.setattr(login, "_spawn", ORIG["_spawn"])
+    fake = tmp_path / "Xvfb"
+    fake.write_text("#!/bin/sh\necho boom >&2\nexit 1\n", encoding="utf-8")
+    fake.chmod(0o755)
+    root = tmp_path / "root"
+    root.mkdir()
+    cap = Capture()
+    env = login.browser_env(dict(os.environ), root, None)
+    with pytest.raises(login.LoginError) as err:
+        login.start_xvfb(str(fake), env, root, cap.reporter)
+    assert err.value.code == 2
+    assert err.value.message == login.msg_xvfb_start_failed("boom")
+    assert "boom" in err.value.message
+    assert not err.value.message.startswith("display: no Xvfb")
+
+
+def test_xvfb_start_failure_redacts_its_stderr_before_the_cut(tmp_path):
+    cap = Capture()
+    cap.reporter.add_secrets([PASSWORD])
+    log = tmp_path / "xvfb.log"
+    log.write_text("\n".join(["one", "two", "three", "four", "five", "six",
+                              f"bad {PASSWORD}"]) + "\n", encoding="utf-8")
+    tail = login._tail(log, cap.reporter.secrets)
+    assert tail == "three / four / five / six / bad ***"
+    # A cut first would keep the password's last letters, which no redaction finds.
+    log.write_text(PASSWORD + "x" * 196, encoding="utf-8")
+    assert login._tail(log, [PASSWORD]) == "***" + "x" * 196
+    assert login._tail(tmp_path / "none.log", []) == ""
+
+
+class _LiveProc:
+    """A process that ignores SIGTERM until told otherwise."""
+
+    pid = 424_242
+
+    def __init__(self, dies_on_term: bool) -> None:
+        self.dies_on_term = dies_on_term
+        self.waits: list[float | None] = []
+        self.alive = True
+
+    def poll(self):
+        return None if self.alive else 0
+
+    def wait(self, timeout=None):
+        self.waits.append(timeout)
+        if self.alive:
+            raise subprocess.TimeoutExpired("Xvfb", timeout)
+        return 0
+
+
+@pytest.mark.parametrize("dies_on_term, sent", [
+    (True, [signal.SIGTERM]),
+    (False, [signal.SIGTERM, signal.SIGKILL]),
+], ids=["exits-on-sigterm", "needs-sigkill"])
+def test_xvfb_cleanup_sends_sigterm_before_sigkill(monkeypatch, dies_on_term, sent):
+    proc = _LiveProc(dies_on_term)
+    signals: list[tuple[int, int]] = []
+
+    def killpg(pgid, sig):
+        signals.append((pgid, sig))
+        if sig == signal.SIGKILL or (sig == signal.SIGTERM and proc.dies_on_term):
+            proc.alive = False
+
+    monkeypatch.setattr(login.os, "killpg", killpg)
+    login._kill_group(proc, login.XVFB_TERM_GRACE)
+    assert signals == [(proc.pid, s) for s in sent]
+    assert proc.waits[0] == 5.0
+    assert login.XVFB_TERM_GRACE == 5.0
+
+
+def test_chrome_session_stops_chrome_then_sends_xvfb_sigterm_first(tmp_path, monkeypatch):
+    """`chrome_session` itself: Chrome gets SIGKILL, Xvfb SIGTERM, then SIGKILL."""
+    chrome, xvfb = _LiveProc(False), _LiveProc(False)
+    chrome.pid, xvfb.pid = 515_151, 616_161
+    signals: list[tuple[int, int]] = []
+
+    def killpg(pgid, sig):
+        signals.append((pgid, sig))
+        if sig == signal.SIGKILL:
+            (chrome if pgid == chrome.pid else xvfb).alive = False
+
+    monkeypatch.setattr(login.os, "killpg", killpg)
+    monkeypatch.setattr(login, "chrome_session", ORIG["chrome_session"])
+    monkeypatch.setattr(login, "_kill_leftovers", lambda root, *a: None)
+    monkeypatch.setattr(login, "start_xvfb", lambda *a: (xvfb, 9))
+    spawned: list[list[str]] = []
+
+    def spawn(args, env, pass_fds=(), stderr=None):
+        spawned.append(args)
+        return chrome
+
+    monkeypatch.setattr(login, "_spawn", spawn)
+
+    def port(self, timeout=30.0):
+        raise OSError("Chrome exited")
+
+    monkeypatch.setattr(login.ChromeProcess, "port", port)
+    session = login.chrome_session("/fake/chrome", Capture().reporter, "/fake/Xvfb", "darwin")
+    with pytest.raises(OSError), session:
+        pass
+    assert signals == [(chrome.pid, signal.SIGKILL), (xvfb.pid, signal.SIGTERM),
+                       (xvfb.pid, signal.SIGKILL)]
+    assert "--window-position=-32000,-32000" in spawned[0]
 
 
 def test_parse_display():
@@ -393,13 +728,14 @@ def test_chrome_args_linux_headed(tmp_path):
     assert args[0] == "/usr/bin/google-chrome"
     assert args[-1] == "about:blank"
     assert not any(a.startswith("--headless") for a in args)
-    assert "--enable-automation" not in args
+    assert not any(a.startswith("--enable-automation") for a in args)
     assert not any(a.startswith("--user-agent") for a in args)
-    for flag in ("--remote-debugging-port=0", "--password-store=basic", "--no-first-run",
-                 "--disable-blink-features=AutomationControlled", "--window-size=1366,768",
-                 "--window-position=0,0", "--ozone-platform=x11",
-                 f"--user-data-dir={tmp_path / 'profile'}"):
-        assert flag in args
+    assert args[1:] == [
+        "--remote-debugging-port=0", "--password-store=basic", "--no-first-run",
+        "--no-default-browser-check", f"--user-data-dir={tmp_path / 'profile'}",
+        "--disable-blink-features=AutomationControlled", "--window-size=1366,768",
+        "--window-position=0,0", "--ozone-platform=x11", "about:blank",
+    ]
 
 
 def test_chrome_args_macos_off_screen(tmp_path):
@@ -422,19 +758,6 @@ def test_browser_env_points_home_and_display_at_ours(tmp_path):
                    "WAYLAND_DISPLAY": "wayland-0", "PATH": "/usr/bin"}
     assert base["HOME"] == "/srv/u"
     assert base["MFP_PASSWORD"] == PASSWORD
-
-
-def test_run_cmd_passes_no_mfp_variable(tmp_path, monkeypatch):
-    monkeypatch.setenv("MFP_USERNAME", EMAIL)
-    monkeypatch.setenv("MFP_PASSWORD", PASSWORD)
-    monkeypatch.setenv("MFP_SECRET_KEY", "k3y")
-    monkeypatch.setenv("MFP_FOO", "bar")
-    out = tmp_path / "env.json"
-    script = "import json, os, sys; open(sys.argv[1], 'w').write(json.dumps(dict(os.environ)))"
-    login._run_cmd([sys.executable, "-c", script, str(out)])
-    seen = json.loads(out.read_text(encoding="utf-8"))
-    assert sorted(k for k in seen if k.startswith("MFP_")) == []
-    assert seen["PATH"] == os.environ["PATH"]
 
 
 # --- cookie filter and session test -----------------------------------------
@@ -685,12 +1008,12 @@ def test_check_reads_server_cookie_file_at_call_time(tmp_path, monkeypatch):
     cap = Capture()
     args = login.parse_args(["--check"], cap.reporter)
     assert login._target_path(None) == server.COOKIES_FILE
-    assert login._main(args, login._target_path(None), cap.reporter) == 4
+    assert login._main(args, login._target_path(None), cap.reporter, "linux") == 4
     assert cap.lines == ["check: no cookie file"]
     moved = _cookie_file(tmp_path / "elsewhere" / "cookies.json", NOW - timedelta(days=1))
     monkeypatch.setattr(server, "COOKIES_FILE", moved)
     assert login._target_path(None) == moved
-    assert login._main(args, login._target_path(None), cap.reporter) == 0
+    assert login._main(args, login._target_path(None), cap.reporter, "linux") == 0
     assert cap.lines[-1] == "check: session still valid"
     given = tmp_path / "given.json"
     assert login._target_path(given) == given
@@ -782,10 +1105,12 @@ class FakeBrowser:
         self.started = 0
         self.cleaned = 0
         self.xvfb: str | None = "unset"
+        self.platform = "unset"
 
-    def __call__(self, chrome: str, reporter, xvfb: str | None):
+    def __call__(self, chrome: str, reporter, xvfb: str | None, platform: str):
         self.started += 1
         self.xvfb = xvfb
+        self.platform = platform
         if self.error is not None:
             raise self.error
         return self
@@ -826,11 +1151,16 @@ def _run_login(monkeypatch, tmp_path, log_lines: int, page: FakePage,
     cap = Capture()
     code = login.run_login(
         dry_run=True, target=tmp_path / "c.json",
-        reporter=cap.reporter, env=dict(os.environ, PATH=""), browser_factory=browser,
+        reporter=cap.reporter, env=dict(os.environ, PATH=""), platform="linux",
+        browser_factory=browser,
         verify=_ok_verify, chrome_finder=lambda: "/fake/chrome", xvfb_finder=xvfb_finder,
         now=lambda: NOW, utc_now=lambda: UTC_NOW, sleep=clock.sleep, monotonic=clock.monotonic,
     )
     return code, browser, log, cap
+
+
+# The lines `_fake_main_browser`'s finders print, before any credential line.
+FOUND = [login.msg_chrome("/fake/chrome"), login.msg_xvfb("/fake/Xvfb")]
 
 
 def _fake_main_browser(monkeypatch, tmp_path, page: FakePage, password: str = PASSWORD,
@@ -841,8 +1171,8 @@ def _fake_main_browser(monkeypatch, tmp_path, page: FakePage, password: str = PA
         monkeypatch.setenv("MFP_PASSWORD", password)
     browser = FakeBrowser(page, error)
     monkeypatch.setattr(login, "chrome_session", browser)
-    monkeypatch.setattr(login, "find_chrome", lambda platform, path: "/fake/chrome")
-    monkeypatch.setattr(login, "find_xvfb", lambda platform, path: "/fake/Xvfb")
+    monkeypatch.setattr(login, "find_chrome", lambda platform, path, **kw: "/fake/chrome")
+    monkeypatch.setattr(login, "find_xvfb", lambda platform, path, **kw: "/fake/Xvfb")
     monkeypatch.setattr(login, "verify_session", _ok_verify)
     return browser
 
@@ -858,13 +1188,13 @@ def test_browser_gets_the_xvfb_found(tmp_path, monkeypatch):
 
 def test_missing_xvfb_refuses_before_browser(tmp_path, monkeypatch):
     def finder() -> str:
-        raise login.LoginError(2, login.msg_no_xvfb())
+        raise login.LoginError(2, login.msg_no_xvfb(None, False))
 
     code, browser, log, cap = _run_login(monkeypatch, tmp_path, 0, FakePage(), xvfb_finder=finder)
     assert code == 2
     assert browser.started == 0
     assert log.read_text(encoding="utf-8") == ""
-    assert cap.lines[-1] == login.msg_no_xvfb()
+    assert cap.lines[-1] == login.msg_no_xvfb(None, False)
 
 
 @pytest.mark.parametrize("dropped", ["email", "password"])
@@ -1019,6 +1349,22 @@ def test_reopen_time_is_when_the_window_drops_below_three(tmp_path, monkeypatch,
     assert _lines(capsys) == [
         login.msg_log_full(log, count, datetime.fromisoformat(reopen))
     ]
+
+
+def test_far_future_stamps_count_as_unreadable_and_exit_6(tmp_path, monkeypatch, capsys):
+    """A stamp whose reopen time or UTC form overflows is unreadable, so exit 6 says delete it.
+
+    Before, three such lines made the reopen time overflow: exit 5, no hint.
+    """
+    browser = _fake_main_browser(monkeypatch, tmp_path, FakePage())
+    lines = ["9999-12-31T23:00:00+00:00", "9999-12-31T23:59:59", "9999-12-31T22:00:00-05:00"]
+    log = _seed_log(tmp_path, lines)
+    assert login.main(["--dry-run"], cookies_file=tmp_path / "c.json") == 6
+    assert _lines(capsys) == [login.msg_log_unreadable(log, 3)]
+    assert browser.started == 0
+    assert _log_lines(log) == lines
+    assert login._parse_stamp("0001-01-01T00:00:00+05:00") is None
+    assert login._parse_stamp("9999-12-30T12:00:00+00:00") is not None
 
 
 def test_naive_stamp_is_read_as_utc(tmp_path, monkeypatch, capsys):
@@ -1319,8 +1665,8 @@ def test_unset_without_a_tty_exits_2_naming_the_variable(tmp_path, monkeypatch, 
     monkeypatch.setenv("MFP_USERNAME", EMAIL)
     assert login.main(["--dry-run"], cookies_file=tmp_path / "c.json") == 2
     lines = _lines(capsys)
-    assert lines == [login.msg_credential_missing("MFP_PASSWORD")]
-    assert "MFP_PASSWORD" in lines[0]
+    assert lines == [*FOUND, login.msg_credential_missing("MFP_PASSWORD")]
+    assert "MFP_PASSWORD" in lines[-1]
     assert browser.started == 0
 
 
@@ -1330,8 +1676,8 @@ def test_ciphertext_without_a_key_exits_2_saying_no_key(tmp_path, monkeypatch, c
     monkeypatch.setattr(server, "get_secret_key", lambda: None)
     assert login.main(["--dry-run"], cookies_file=tmp_path / "c.json") == 2
     lines = _lines(capsys)
-    assert lines == [login.msg_credential_no_key("MFP_PASSWORD")]
-    assert "no key" in lines[0]
+    assert lines == [*FOUND, login.msg_credential_no_key("MFP_PASSWORD")]
+    assert "no key" in lines[-1]
     assert token not in "\n".join(lines)
     assert browser.started == 0
 
@@ -1343,8 +1689,8 @@ def test_ciphertext_with_a_wrong_key_exits_2_saying_bad_token(tmp_path, monkeypa
     monkeypatch.setattr(server, "get_secret_key", lambda: wrong)
     assert login.main(["--dry-run"], cookies_file=tmp_path / "c.json") == 2
     lines = _lines(capsys)
-    assert lines == [login.msg_credential_bad_token("MFP_PASSWORD")]
-    assert "failed to decrypt" in lines[0] and "bad token" in lines[0]
+    assert lines == [*FOUND, login.msg_credential_bad_token("MFP_PASSWORD")]
+    assert "failed to decrypt" in lines[-1] and "bad token" in lines[-1]
     out = "\n".join(lines)
     assert token not in out and wrong not in out
     assert "MFP_SECRET_KEY" not in os.environ
@@ -1537,8 +1883,8 @@ def test_signal_inside_the_real_chrome_session_cleans_its_root(tmp_path, monkeyp
         return 0
 
     monkeypatch.setattr(login.ChromeProcess, "port", port)
-    monkeypatch.setattr(login, "find_chrome", lambda platform, path: "/fake/chrome")
-    monkeypatch.setattr(login, "find_xvfb", lambda platform, path: None)
+    monkeypatch.setattr(login, "find_chrome", lambda platform, path, **kw: "/fake/chrome")
+    monkeypatch.setattr(login, "find_xvfb", lambda platform, path, **kw: None)
     monkeypatch.setenv("MFP_USERNAME", EMAIL)
     monkeypatch.setenv("MFP_PASSWORD", PASSWORD)
     assert login.main(["--dry-run"], cookies_file=tmp_path / "c.json") == 143
@@ -1582,6 +1928,102 @@ def test_kill_leftovers_kills_only_the_process_naming_our_root(tmp_path, monkeyp
     monkeypatch.setattr(login.os, "kill", lambda pid, sig: sent.append((pid, sig)))
     ORIG["_kill_leftovers"](root, proc_dir=proc_dir)
     assert sent == [(4242, signal.SIGKILL)]
+
+
+# --- platform, discovery order -------------------------------------------------
+
+
+def test_no_chrome_exits_2_before_the_credential_check(tmp_path, monkeypatch, capsys):
+    """No Chrome, no credentials, no TTY: the Chrome message, not the credential one."""
+    browser = _fake_main_browser(monkeypatch, tmp_path, FakePage(), creds=False)
+    monkeypatch.setattr(login, "find_chrome", ORIG["find_chrome"])
+    monkeypatch.setattr("builtins.input", _tripwire("input"))
+    monkeypatch.setattr(login.getpass, "getpass", _tripwire("getpass"))
+    assert login.main([], cookies_file=tmp_path / "c.json") == 2
+    lines = _lines(capsys)
+    assert lines == ["check: no cookie file", login.msg_no_chrome("linux")]
+    assert "https://www.google.com/chrome/" in lines[-1]
+    assert browser.started == 0
+
+
+def test_darwin_without_the_app_exits_2_naming_brew(tmp_path, monkeypatch, capsys):
+    browser = _fake_main_browser(monkeypatch, tmp_path, FakePage())
+    monkeypatch.setattr(login, "find_chrome", ORIG["find_chrome"])
+    monkeypatch.setattr(login, "_platform", lambda: "darwin")
+    assert not os.path.exists(login.MAC_CHROME)
+    assert login.main(["--dry-run"], cookies_file=tmp_path / "c.json") == 2
+    lines = _lines(capsys)
+    assert lines == [login.msg_macos_experimental(), login.msg_no_chrome("darwin")]
+    assert "brew install --cask google-chrome" in lines[-1]
+    assert browser.started == 0
+
+
+def test_darwin_prints_the_experimental_line_once_and_passes_its_platform(tmp_path,
+                                                                         monkeypatch, capsys):
+    browser = _fake_main_browser(monkeypatch, tmp_path, FakePage())
+    calls: list[str] = []
+    seen: dict[str, str] = {}
+
+    def platform():
+        calls.append("darwin")
+        return "darwin"
+
+    def chrome(platform, path, **kw):
+        seen["chrome"] = platform
+        return "/fake/chrome"
+
+    def xvfb(platform, path, **kw):
+        seen["xvfb"] = platform
+        return ORIG["find_xvfb"](platform, path, **kw)
+
+    monkeypatch.setattr(login, "_platform", platform)
+    monkeypatch.setattr(login, "find_chrome", chrome)
+    monkeypatch.setattr(login, "find_xvfb", xvfb)
+    assert login.main(["--dry-run"], cookies_file=tmp_path / "c.json") == 0
+    out = _lines(capsys)
+    assert out.count(login.msg_macos_experimental()) == 1
+    assert out[0] == login.msg_macos_experimental()
+    assert calls == ["darwin"]
+    assert seen == {"chrome": "darwin", "xvfb": "darwin"}
+    assert browser.platform == "darwin"
+    assert browser.xvfb is None
+
+
+def test_darwin_check_prints_the_experimental_line_first(tmp_path, monkeypatch, capsys):
+    monkeypatch.setattr(login, "verify_session", _ok_verify)
+    monkeypatch.setattr(login, "_platform", lambda: "darwin")
+    target = _cookie_file(tmp_path / "c.json", NOW - timedelta(days=1))
+    assert login.main(["--check"], cookies_file=target) == 0
+    out = _lines(capsys)
+    assert out[0] == login.msg_macos_experimental()
+    assert out.count(login.msg_macos_experimental()) == 1
+    assert out[-1] == "check: session still valid"
+
+
+@pytest.mark.parametrize("argv", [[], ["--dry-run"], ["--check"], ["--install-xvfb"]])
+def test_windows_exits_2_with_the_wsl2_line_before_anything(tmp_path, monkeypatch, capsys,
+                                                            argv):
+    browser = _fake_main_browser(monkeypatch, tmp_path, FakePage())
+    monkeypatch.setattr(login, "_platform", lambda: "win32")
+    monkeypatch.setitem(sys.modules, "fcntl", None)
+    monkeypatch.setattr(login, "verify_session", _tripwire("verify_session"))
+    target = _cookie_file(tmp_path / "c.json", NOW - timedelta(days=1))
+    assert login.main(argv, cookies_file=target) == 2
+    lines = _lines(capsys)
+    assert lines == [login.msg_windows()]
+    assert "WSL2" in lines[0]
+    assert browser.started == 0
+    assert not (tmp_path / LOCK_NAME).exists()
+
+
+def test_help_names_the_install_flag_and_the_sudo_install(tmp_path, monkeypatch):
+    written: list[str] = []
+    real = login.Reporter
+    monkeypatch.setattr(login, "Reporter", lambda: real(write=written.append))
+    assert login.main(["--help"], cookies_file=tmp_path / "c.json") == 0
+    text = " ".join(" ".join(written).split())
+    assert "--install-xvfb" in text
+    assert "sudo apt-get install xvfb" in text
 
 
 # --- main: catch-all, usage, logging, paths -----------------------------------
@@ -1715,11 +2157,18 @@ MESSAGE_CALLS = {
     "msg_credential_no_key": lambda f: f("MFP_PASSWORD"),
     "msg_credential_bad_token": lambda f: f("MFP_PASSWORD"),
     "msg_no_websockets": lambda f: f(),
+    "msg_windows": lambda f: f(),
+    "msg_macos_experimental": lambda f: f(),
     "msg_no_chrome": lambda f: f("linux"),
+    "msg_chrome_snap": lambda f: f("/snap/bin/chromium"),
     "msg_chrome": lambda f: f("/usr/bin/google-chrome"),
     "msg_browser_started": lambda f: f("Xvfb :0"),
     "msg_xvfb": lambda f: f("/usr/bin/Xvfb"),
-    "msg_no_xvfb": lambda f: f(),
+    "msg_no_xvfb": lambda f: f("sudo apt-get install xvfb", True),
+    "msg_xvfb_cannot_install": lambda f: f("no terminal for apt", "sudo apt-get install xvfb"),
+    "msg_xvfb_installing": lambda f: f("sudo apt-get install xvfb"),
+    "msg_xvfb_install_failed": lambda f: f("sudo apt-get install xvfb", 100),
+    "msg_xvfb_start_failed": lambda f: f(SECRET_BEARING),
     "msg_fill_failed": lambda f: f(),
     "msg_lock_held": lambda f: f(Path("/x") / LOCK_NAME),
     "msg_log_full": lambda f: f(Path("/x") / LOG_NAME, 3, UTC_NOW),

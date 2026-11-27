@@ -1,7 +1,7 @@
 """Log in to MyFitnessPal with a headed Chrome and save the session cookies.
 
 Usage:
-    python -m mfp_mcp.login [--dry-run | --check]
+    python -m mfp_mcp.login [--dry-run | --check] [--install-xvfb]
 
 The cookie file is the one the MCP server reads, `server.COOKIES_FILE`, read
 when `main` runs. `main` takes a `cookies_file` keyword for tests.
@@ -12,8 +12,17 @@ server. An unset value is prompted for on a terminal: the username with
 `input`, the password with `getpass`. A typed value is used as typed.
 
 Chrome runs headed, since Cloudflare Turnstile never clears in headless Chrome.
-On Linux it draws on a private Xvfb display, found on PATH. On macOS the window
-opens off-screen. The browser login needs `websockets>=11`.
+On Linux it is Google Chrome or Chromium from PATH; a snap Chromium is skipped.
+It draws on a private Xvfb display, found on PATH. With no Xvfb there, the run
+exits 2 and prints the install command for the package tool it finds. With
+`--install-xvfb`, `apt-get` on PATH and a terminal, it runs
+`sudo apt-get install xvfb` itself, so apt asks for consent. On macOS the
+window opens off-screen; that path is experimental and was never run live. On
+Windows the command exits 2: run it under WSL2, where the Linux steps apply.
+The browser login needs `websockets>=11`.
+
+Chrome and Xvfb are found before any credential prompt, so a missing tool
+fails before a password is typed.
 
 With no flag the command checks the saved session first and logs in only when
 that check fails. `--dry-run` logs in and verifies, but writes no cookie file.
@@ -31,8 +40,9 @@ takes no lock and never reads or writes the log.
 
 Exit codes:
     0      session saved, verified in dry-run, or still valid
-    2      setup error: bad usage, a missing or undecryptable credential,
-           no Chrome, no Xvfb, no `websockets>=11`, or another run holds the lock
+    2      setup error: bad usage, Windows, a missing or undecryptable
+           credential, no Chrome, no Xvfb, a failed Xvfb install or start,
+           no `websockets>=11`, or another run holds the lock
     3      captcha, Turnstile that never clears, lock or rate-limit page
     4      session fails verification, or the saved file is too old
     5      any other page after the submission, a timeout, or an unexpected error
@@ -42,7 +52,16 @@ Exit codes:
 Every output line, argparse usage and errors included, goes through one
 redacting Reporter. It never prints a secret value. Two prompts are fixed text
 printed outside it: `input` writes the username prompt, and `getpass` writes
-the password prompt to the terminal. Neither holds a secret.
+the password prompt to the terminal. Neither holds a secret. The apt install
+that `--install-xvfb` runs writes to the terminal directly.
+
+Known limits:
+    - The DevTools port listens on loopback. Any local user can reach it
+      during a run.
+    - Consent banners inside an iframe are not dismissed.
+    - The timeouts are 30 seconds for the form and Turnstile, and 60 seconds
+      for the session cookie.
+    - Live runs used Google Chrome 157 only.
 """
 
 from __future__ import annotations
@@ -87,10 +106,23 @@ LIBRARY_UA = (
     "(KHTML, like Gecko) Chrome/88.0.4324.104 Safari/537.36"
 )
 
-LINUX_CHROMES = ("google-chrome", "google-chrome-stable", "chromium")
+LINUX_CHROMES = ("google-chrome", "google-chrome-stable", "chromium", "chromium-browser")
 MAC_CHROME = "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
+CHROME_URL = "https://www.google.com/chrome/"
+BREW_CHROME = "brew install --cask google-chrome"
+SNAP_PREFIX = "/snap/"
+SNAP_SNIFF_BYTES = 4096
+# The install command per package tool, in the order they are looked for on PATH.
+XVFB_INSTALL = (
+    ("apt-get", "sudo apt-get install xvfb"),
+    ("dnf", "sudo dnf install xorg-x11-server-Xvfb"),
+    ("pacman", "sudo pacman -S xorg-server-xvfb"),
+)
 SCREEN = (1366, 768)
 XVFB_TIMEOUT = 15.0
+XVFB_TERM_GRACE = 5.0
+XVFB_LOG = "xvfb.log"
+XVFB_TAIL_LINES = 5
 TEMP_PREFIX = "mfp-login-"
 
 EMAIL_SEL = "#email"
@@ -189,8 +221,30 @@ def msg_no_websockets() -> str:
     return 'setup: the browser login needs websockets>=11, run: pip install "websockets>=11"'
 
 
+def msg_windows() -> str:
+    return (
+        "platform: Windows is not supported directly. Run mfp-mcp-login under WSL2, "
+        "where the Linux steps apply"
+    )
+
+
+def msg_macos_experimental() -> str:
+    return "platform: macOS support is experimental and was never run live"
+
+
 def msg_no_chrome(platform: str) -> str:
+    if platform.startswith("linux"):
+        return f"chrome: none found on PATH, install Google Chrome from {CHROME_URL}"
+    if platform == "darwin":
+        return f"chrome: Google Chrome not found, install it with: {BREW_CHROME}"
     return f"chrome: none found for {platform}"
+
+
+def msg_chrome_snap(path: str) -> str:
+    return (
+        f"chrome: skipped {path}, a snap Chromium, which this command does not support. "
+        f"Install Google Chrome from {CHROME_URL}"
+    )
 
 
 def msg_chrome(path: str) -> str:
@@ -201,8 +255,32 @@ def msg_xvfb(path: str) -> str:
     return f"display: {path}"
 
 
-def msg_no_xvfb() -> str:
-    return "display: no Xvfb on PATH, install it, for example: sudo apt install xvfb"
+def _install_text(hint: str | None) -> str:
+    return f"install it: {hint}" if hint else "install Xvfb with your package manager"
+
+
+def msg_no_xvfb(hint: str | None, can_install: bool) -> str:
+    text = f"display: no Xvfb on PATH, {_install_text(hint)}"
+    return f"{text}, or run again with --install-xvfb" if can_install else text
+
+
+def msg_xvfb_cannot_install(reason: str, hint: str | None) -> str:
+    return f"display: --install-xvfb cannot run, {reason}. No Xvfb on PATH, {_install_text(hint)}"
+
+
+def msg_xvfb_installing(step: str) -> str:
+    return f"display: no Xvfb on PATH, running: {step}"
+
+
+def msg_xvfb_install_failed(step: str, code: int) -> str:
+    if code == 0:
+        return f"display: install step '{step}' exited with code 0, but no Xvfb is on PATH"
+    return f"display: install step '{step}' failed, exited with code {code}"
+
+
+def msg_xvfb_start_failed(tail: str) -> str:
+    detail = f", it said: {tail}" if tail else ", it printed nothing"
+    return f"display: Xvfb did not start{detail}"
 
 
 def msg_browser_started(where: str) -> str:
@@ -432,14 +510,47 @@ def read_credentials(reporter: Reporter) -> tuple[str, str]:
 # --- Chrome finder ---------------------------------------------------------------
 
 
+def _runs_the_snap(path: str) -> bool:
+    """True when the first 4 KB of a `chromium-browser` wrapper name `/snap/`."""
+    try:
+        with open(path, "rb") as f:
+            return SNAP_PREFIX.encode() in f.read(SNAP_SNIFF_BYTES)
+    except OSError:
+        return False
+
+
+def _is_snap(name: str, found: str, resolve: Callable[[str], str]) -> bool:
+    if found.startswith(SNAP_PREFIX):
+        return True
+    if resolve(found).startswith(SNAP_PREFIX):
+        return True
+    return name == "chromium-browser" and _runs_the_snap(found)
+
+
 def find_chrome(
-    platform: str, path: str | None, exists: Callable[[str], bool] = os.path.exists
+    platform: str,
+    path: str | None,
+    exists: Callable[[str], bool] = os.path.exists,
+    *,
+    reporter: Reporter | None = None,
+    which: Callable[..., str | None] = shutil.which,
+    resolve: Callable[[str], str] = os.path.realpath,
 ) -> str:
+    """The first Chrome on PATH that is not a snap, or the macOS app.
+
+    A snap Chromium is skipped three ways: a PATH hit under `/snap/`, a hit that
+    resolves under `/snap/`, and a `chromium-browser` script that runs the snap.
+    """
     if platform.startswith("linux"):
         for name in LINUX_CHROMES:
-            found = shutil.which(name, path=path)
-            if found:
-                return found
+            found = which(name, path=path)
+            if not found:
+                continue
+            if _is_snap(name, found, resolve):
+                if reporter is not None:
+                    reporter.line(msg_chrome_snap(found))
+                continue
+            return found
     elif platform == "darwin" and exists(MAC_CHROME):
         return MAC_CHROME
     raise LoginError(EXIT_CONFIG, msg_no_chrome(platform))
@@ -453,25 +564,69 @@ def _child_env(base: dict[str, str]) -> dict[str, str]:
     return {k: v for k, v in base.items() if not k.startswith(CHILD_ENV_PREFIX)}
 
 
-def _run_cmd(cmd: list[str], cwd: Path | None = None) -> None:
-    subprocess.run(cmd, cwd=cwd, check=True, env=_child_env(dict(os.environ)),
-                   stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
-                   stderr=subprocess.DEVNULL, timeout=300)
+def _xvfb_hint(path: str | None) -> tuple[str | None, str | None]:
+    """The install command for the first package tool on PATH, and `apt-get`'s path."""
+    hint: str | None = None
+    for tool, command in XVFB_INSTALL:
+        if shutil.which(tool, path=path):
+            hint = command
+            break
+    return hint, shutil.which("apt-get", path=path)
 
 
-def find_xvfb(platform: str, path: str | None) -> str | None:
-    """Xvfb on PATH. macOS needs none."""
+def find_xvfb(
+    platform: str,
+    path: str | None,
+    *,
+    install: bool = False,
+    env: dict[str, str] | None = None,
+    reporter: Reporter | None = None,
+) -> str | None:
+    """Xvfb on PATH, which wins with or without `install`. macOS needs none.
+
+    With no Xvfb, `install`, `apt-get` on PATH and a terminal, run
+    `sudo apt-get install xvfb`, or `apt-get install xvfb` as root, on the
+    terminal so apt asks for consent. Then look on PATH again. Every tool is
+    looked up on `path` alone, and the child gets `path` with no `MFP_*` variable.
+    """
     if platform == "darwin":
         return None
     found = shutil.which("Xvfb", path=path)
     if found:
         return found
-    raise LoginError(EXIT_CONFIG, msg_no_xvfb())
+    hint, apt_get = _xvfb_hint(path)
+    if not install:
+        raise LoginError(EXIT_CONFIG, msg_no_xvfb(hint, apt_get is not None))
+    if apt_get is None:
+        raise LoginError(EXIT_CONFIG, msg_xvfb_cannot_install("no apt-get on PATH", hint))
+    if not _is_tty():
+        raise LoginError(EXIT_CONFIG, msg_xvfb_cannot_install("no terminal for apt", hint))
+    if os.geteuid() == 0:
+        cmd, step = [apt_get, "install", "xvfb"], "apt-get install xvfb"
+    else:
+        sudo = shutil.which("sudo", path=path)
+        if sudo is None:
+            raise LoginError(EXIT_CONFIG, msg_xvfb_cannot_install("no sudo on PATH", hint))
+        cmd, step = [sudo, apt_get, "install", "xvfb"], "sudo apt-get install xvfb"
+    child = _child_env(dict(os.environ) if env is None else env)
+    if path is not None:
+        child["PATH"] = path
+    if reporter is not None:
+        reporter.line(msg_xvfb_installing(step))
+    code = subprocess.run(cmd, env=child, check=False).returncode
+    found = shutil.which("Xvfb", path=path)
+    if code != 0 or not found:
+        raise LoginError(EXIT_CONFIG, msg_xvfb_install_failed(step, code))
+    return found
 
 
 def xvfb_args(xvfb: str, fd: int) -> list[str]:
-    """Pick a free display, listen only on the abstract socket, leave no lock file."""
-    return [xvfb, "-displayfd", str(fd), "-nolisten", "tcp", "-nolisten", "unix", "-nolock",
+    """Pick a free display and listen only on the abstract socket.
+
+    Xvfb keeps its display lock file, which keeps two servers off one display.
+    Cleanup sends SIGTERM first, so Xvfb removes its own `/tmp/.X<n>-lock`.
+    """
+    return [xvfb, "-displayfd", str(fd), "-nolisten", "tcp", "-nolisten", "unix",
             "-screen", "0", f"{SCREEN[0]}x{SCREEN[1]}x24"]
 
 
@@ -577,12 +732,23 @@ def _read_log(path: Path) -> list[str]:
 
 
 def _parse_stamp(line: str) -> datetime | None:
-    """The line's time, a naive stamp read as UTC. None when the line is not a stamp."""
+    """The line's time, a naive stamp read as UTC. None when the line is not a stamp.
+
+    A stamp so close to the ends of the calendar that its reopen time or its UTC
+    form overflows is not a stamp either, so it counts as unreadable.
+    """
     try:
         stamp = datetime.fromisoformat(line.strip())
     except ValueError:
         return None
-    return stamp if stamp.tzinfo is not None else stamp.replace(tzinfo=timezone.utc)
+    if stamp.tzinfo is None:
+        stamp = stamp.replace(tzinfo=timezone.utc)
+    try:
+        stamp + WINDOW
+        stamp.astimezone(timezone.utc)
+    except OverflowError:
+        return None
+    return stamp
 
 
 def _window(lines: Iterable[str], now: datetime) -> tuple[list[datetime], int]:
@@ -1044,37 +1210,71 @@ def _local_http() -> requests.Session:
 
 
 def _spawn(
-    args: list[str], env: dict[str, str], pass_fds: tuple[int, ...] = ()
+    args: list[str], env: dict[str, str], pass_fds: tuple[int, ...] = (), stderr: Any = None
 ) -> subprocess.Popen[bytes]:
-    """Start a process in its own group, so one killpg takes all its children."""
+    """Start a process in its own group, so one killpg takes all its children.
+
+    stderr goes to `stderr` when given, else nowhere.
+    """
     return subprocess.Popen(
         args,
         env=env,
         stdin=subprocess.DEVNULL,
         stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL if stderr is None else stderr,
         pass_fds=pass_fds,
         start_new_session=True,
     )
 
 
-def _kill_group(proc: subprocess.Popen[bytes]) -> None:
+def _signal_group(proc: subprocess.Popen[bytes], sig: int) -> None:
+    try:
+        os.killpg(proc.pid, sig)
+    except ProcessLookupError:
+        pass
+
+
+def _kill_group(proc: subprocess.Popen[bytes], grace: float = 0.0) -> None:
+    """SIGKILL the group. With `grace`, SIGTERM first, and SIGKILL only after it."""
     if proc.poll() is None:
-        try:
-            os.killpg(proc.pid, signal.SIGKILL)
-        except ProcessLookupError:
-            pass
+        if grace > 0:
+            _signal_group(proc, signal.SIGTERM)
+            try:
+                proc.wait(timeout=grace)
+                return
+            except subprocess.TimeoutExpired:
+                pass
+        _signal_group(proc, signal.SIGKILL)
     try:
         proc.wait(timeout=10)
     except subprocess.TimeoutExpired:
         pass
 
 
-def start_xvfb(xvfb: str, env: dict[str, str]) -> tuple[subprocess.Popen[bytes], int]:
-    """Start Xvfb on a free display and return it with the display number."""
-    read_fd, write_fd = os.pipe()
+def _tail(path: Path, secrets: Iterable[str]) -> str:
+    """The last lines of a log, redacted, then cut to the error detail length."""
     try:
-        proc = _spawn(xvfb_args(xvfb, write_fd), env, pass_fds=(write_fd,))
+        text = path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return ""
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    joined = " / ".join(lines[-XVFB_TAIL_LINES:])
+    return redact(joined, secrets)[-ERROR_DETAIL_LEN:]
+
+
+def start_xvfb(
+    xvfb: str, env: dict[str, str], root: Path, reporter: Reporter
+) -> tuple[subprocess.Popen[bytes], int]:
+    """Start Xvfb on a free display and return it with the display number.
+
+    Its stderr goes to a file in `root`. When no display number comes back, the
+    error holds the last lines of that file.
+    """
+    read_fd, write_fd = os.pipe()
+    log = root / XVFB_LOG
+    try:
+        with open(log, "wb") as err:
+            proc = _spawn(xvfb_args(xvfb, write_fd), env, pass_fds=(write_fd,), stderr=err)
     finally:
         os.close(write_fd)
     try:
@@ -1085,16 +1285,16 @@ def start_xvfb(xvfb: str, env: dict[str, str]) -> tuple[subprocess.Popen[bytes],
     try:
         return proc, parse_display(raw)
     except ValueError:
-        _kill_group(proc)
-        raise LoginError(EXIT_CONFIG, msg_no_xvfb()) from None
+        _kill_group(proc, XVFB_TERM_GRACE)
+        raise LoginError(EXIT_CONFIG,
+                         msg_xvfb_start_failed(_tail(log, reporter.secrets))) from None
 
 
 class ChromeProcess:
     """One headed Chrome in its own process group, with HOME and TMPDIR in `root`."""
 
-    def __init__(self, chrome: str, root: Path, env: dict[str, str]) -> None:
+    def __init__(self, chrome: str, root: Path, env: dict[str, str], platform: str) -> None:
         self.user_data_dir = root / "profile"
-        platform = "darwin" if sys.platform == "darwin" else "linux"
         self.proc = _spawn(chrome_args(chrome, self.user_data_dir, platform), env)
 
     def port(self, timeout: float = 30.0) -> int:
@@ -1150,7 +1350,9 @@ def _kill_leftovers(root: Path | str, proc_dir: Path = Path("/proc")) -> None:
 
 
 @contextmanager
-def chrome_session(chrome: str, reporter: Reporter, xvfb: str | None) -> Iterator[Page]:
+def chrome_session(
+    chrome: str, reporter: Reporter, xvfb: str | None, platform: str
+) -> Iterator[Page]:
     """Start Xvfb when given, then a headed Chrome, and yield a page.
 
     Always kills Chrome and Xvfb and removes the temp folder. A stop signal
@@ -1159,12 +1361,16 @@ def chrome_session(chrome: str, reporter: Reporter, xvfb: str | None) -> Iterato
     """
     root = Path(tempfile.mkdtemp(prefix=TEMP_PREFIX))
     procs: list[subprocess.Popen[bytes]] = []
+    xprocs: list[subprocess.Popen[bytes]] = []
     cdp: CDP | None = None
 
     def cleanup() -> None:
-        # Chrome first, then the display it draws on.
-        for p in reversed(procs):
+        # Chrome first, then the display it draws on. Xvfb gets SIGTERM first, so
+        # it removes its display lock file.
+        for p in procs:
             _kill_group(p)
+        for p in xprocs:
+            _kill_group(p, XVFB_TERM_GRACE)
         _kill_leftovers(root)
         shutil.rmtree(root, ignore_errors=True)
         if root.exists():
@@ -1175,9 +1381,11 @@ def chrome_session(chrome: str, reporter: Reporter, xvfb: str | None) -> Iterato
         http = _local_http()
         display: int | None = None
         if xvfb:
-            xproc, display = start_xvfb(xvfb, browser_env(dict(os.environ), root, None))
-            procs.append(xproc)
-        browser = ChromeProcess(chrome, root, browser_env(dict(os.environ), root, display))
+            xproc, display = start_xvfb(xvfb, browser_env(dict(os.environ), root, None), root,
+                                        reporter)
+            xprocs.append(xproc)
+        browser = ChromeProcess(chrome, root, browser_env(dict(os.environ), root, display),
+                                platform)
         procs.append(browser.proc)
         port = browser.port()
         version = http.get(f"http://127.0.0.1:{port}/json/version", timeout=10).json()
@@ -1250,7 +1458,9 @@ def run_login(
     target: Path,
     reporter: Reporter,
     env: dict[str, str],
-    browser_factory: Callable[[str, Reporter, str | None], Any] | None = None,
+    platform: str,
+    install_xvfb: bool = False,
+    browser_factory: Callable[[str, Reporter, str | None, str], Any] | None = None,
     verify: Verifier | None = None,
     chrome_finder: Callable[[], str] | None = None,
     xvfb_finder: Callable[[], str | None] | None = None,
@@ -1259,12 +1469,14 @@ def run_login(
     sleep: Callable[[float], None] | None = None,
     monotonic: Callable[[], float] | None = None,
 ) -> int:
-    """Read credentials, find Chrome and Xvfb, log in, verify and write.
+    """Find Chrome and Xvfb, read credentials, log in, verify and write.
 
-    `main` calls it under the run lock, after the attempt window check. The
-    attempt record goes to the log beside `target`, just before submit. `now`
-    stamps the cookie file and `utc_now` the attempt, so `saved_at` stays naive.
-    Every `None` default is resolved here, at call time, from the module globals.
+    `main` calls it under the run lock, after the attempt window check. Chrome
+    and Xvfb come first, so a missing tool fails before any credential prompt.
+    Both are looked up on `env`'s PATH alone. The attempt record goes to the log
+    beside `target`, just before submit. `now` stamps the cookie file and
+    `utc_now` the attempt, so `saved_at` stays naive. Every `None` default is
+    resolved here, at call time, from the module globals.
     """
     browser_factory = browser_factory or chrome_session
     verify = verify or verify_session
@@ -1273,21 +1485,29 @@ def run_login(
     sleep = sleep or _sleep
     monotonic = monotonic or _monotonic
     path = env.get("PATH", os.defpath)
+    # Lines printed before `read_credentials` still hide the raw variables.
+    reporter.add_secrets(env.get(key) for key in (*ENV_KEYS, SECRET_KEY_VAR))
     try:
+        if chrome_finder:
+            chrome = chrome_finder()
+        else:
+            chrome = find_chrome(platform, path, reporter=reporter)
+        reporter.line(msg_chrome(chrome))
+        if xvfb_finder:
+            xvfb = xvfb_finder()
+        else:
+            xvfb = find_xvfb(platform, path, install=install_xvfb, env=env, reporter=reporter)
+        if xvfb:
+            reporter.line(msg_xvfb(xvfb))
         username, password = read_credentials(reporter)
         reporter.line(msg_credentials_ok())
         log = attempt_log_path(target)
-        chrome = chrome_finder() if chrome_finder else find_chrome(sys.platform, path)
-        reporter.line(msg_chrome(chrome))
-        xvfb = xvfb_finder() if xvfb_finder else find_xvfb(sys.platform, path)
-        if xvfb:
-            reporter.line(msg_xvfb(xvfb))
 
         def gate() -> None:
             record_attempt(log, utc_now(), reporter)
 
         try:
-            with browser_factory(chrome, reporter, xvfb) as page:
+            with browser_factory(chrome, reporter, xvfb, platform) as page:
                 raw = login_flow(page, username, password, gate, reporter, sleep, monotonic)
                 user_agent = page.user_agent
         except LoginError:
@@ -1336,6 +1556,9 @@ def parse_args(argv: list[str] | None, reporter: Reporter) -> argparse.Namespace
     mode = p.add_mutually_exclusive_group()
     mode.add_argument("--dry-run", action="store_true", help="log in and verify, write nothing")
     mode.add_argument("--check", action="store_true", help="verify the saved file, never log in")
+    p.add_argument("--install-xvfb", action="store_true",
+                   help="on Linux with no Xvfb on PATH, install it with "
+                        "'sudo apt-get install xvfb' on this terminal; apt asks first")
     return p.parse_args(argv)
 
 
@@ -1364,12 +1587,24 @@ def _target_path(cookies_file: str | os.PathLike[str] | None) -> Path:
     return Path(server.COOKIES_FILE if cookies_file is None else cookies_file)
 
 
-def _main(args: argparse.Namespace, target: Path, reporter: Reporter) -> int:
-    """`--check` alone, with no lock. Every other run holds the lock throughout.
+def _platform() -> str:
+    """`sys.platform`, read once per run by `main`. A seam for tests."""
+    return sys.platform
 
-    Under the lock: prune the log, check the saved session unless `--dry-run`,
-    then the attempt window, then `websockets`, and only then `run_login`.
+
+def _main(args: argparse.Namespace, target: Path, reporter: Reporter, platform: str) -> int:
+    """Windows stops first, macOS prints its line, then `--check` alone, with no lock.
+
+    Every other run holds the lock throughout. Under the lock: prune the log,
+    check the saved session unless `--dry-run`, then the attempt window, then
+    `websockets`, and only then `run_login`. Nothing before the Windows check
+    imports `fcntl`.
     """
+    if platform == "win32":
+        reporter.line(msg_windows())
+        return EXIT_CONFIG
+    if platform == "darwin":
+        reporter.line(msg_macos_experimental())
     if args.check:
         return run_check(target, verify_session, reporter, _now())
     try:
@@ -1387,6 +1622,8 @@ def _main(args: argparse.Namespace, target: Path, reporter: Reporter) -> int:
                 target=target,
                 reporter=reporter,
                 env=dict(os.environ),
+                platform=platform,
+                install_xvfb=args.install_xvfb,
             )
     except LoginError as e:
         reporter.line(e.message)
@@ -1421,7 +1658,7 @@ def main(
             try:
                 args = parse_args(argv, reporter)
                 target = _target_path(cookies_file)
-                return _main(args, target, reporter)
+                return _main(args, target, reporter, _platform())
             except _ParserExit as e:
                 return e.status
             except Exception as e:  # noqa: BLE001 - one redacted line, never a traceback
