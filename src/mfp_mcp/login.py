@@ -1243,6 +1243,11 @@ def _quiet_logging() -> Iterator[None]:
         mfp_logger.disabled = old_disabled
 
 
+def _target_path(cookies_file: str | os.PathLike[str] | None) -> Path:
+    """The cookie target: `cookies_file` when given, else `server.COOKIES_FILE` read now."""
+    return Path(server.COOKIES_FILE if cookies_file is None else cookies_file)
+
+
 def _main(args: argparse.Namespace, target: Path, reporter: Reporter) -> int:
     if args.check:
         return run_check(target, verify_session, reporter, _now())
@@ -1287,7 +1292,7 @@ def main(
                 old_handlers[sig] = signal.signal(sig, on_signal)
             try:
                 args = parse_args(argv, reporter)
-                target = Path(server.COOKIES_FILE if cookies_file is None else cookies_file)
+                target = _target_path(cookies_file)
                 return _main(args, target, reporter)
             except _ParserExit as e:
                 return e.status

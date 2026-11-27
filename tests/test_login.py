@@ -149,23 +149,49 @@ class FakeClock:
         self.t += s
 
 
-@pytest.fixture(scope="session")
-def safe_bin(tmp_path_factory) -> Path:
-    """Links to every /usr/bin entry except the masked names."""
-    folder = tmp_path_factory.mktemp("safe-bin")
+SAFE_BIN = "safe-bin"
+
+
+def _safe_bin(tmp_path: Path) -> Path:
+    """Links under this test's tmp_path to every /usr/bin entry but the masked names."""
+    folder = tmp_path / SAFE_BIN
+    folder.mkdir()
     for entry in os.scandir("/usr/bin"):
         if entry.name not in MASKED:
             os.symlink(entry.path, folder / entry.name)
     return folder
 
 
+def _under(path, tmp_path: Path) -> bool:
+    return path is not None and str(path) != "" and Path(path).resolve().is_relative_to(
+        tmp_path.resolve())
+
+
+def _guard_targets(tmp_path: Path):
+    """Wrap `main` and `run_login` so a test cannot reach either with a real target."""
+    real_main, real_run_login = login.main, login.run_login
+
+    def main(argv=None, *, cookies_file=None):
+        if not _under(cookies_file, tmp_path):
+            pytest.fail(f"login.main reached without a tmp_path cookies_file: {cookies_file!r}")
+        return real_main(argv, cookies_file=cookies_file)
+
+    def run_login(**kwargs):
+        log = kwargs["env"].get("MFP_LOGIN_LOG")
+        if not _under(log, tmp_path):
+            pytest.fail(f"login.run_login reached without MFP_LOGIN_LOG under tmp_path: {log!r}")
+        return real_run_login(**kwargs)
+
+    return main, run_login
+
+
 @pytest.fixture(autouse=True)
-def _isolate(monkeypatch, tmp_path, safe_bin):
+def _isolate(monkeypatch, tmp_path):
     monkeypatch.setenv("HOME", str(tmp_path))
     for key in list(os.environ):
         if key.startswith("MFP_"):
             monkeypatch.delenv(key)
-    monkeypatch.setenv("PATH", str(safe_bin))
+    monkeypatch.setenv("PATH", str(_safe_bin(tmp_path)))
     temp = tmp_path / "tmp"
     temp.mkdir()
     monkeypatch.setattr(tempfile, "tempdir", str(temp))
@@ -182,6 +208,10 @@ def _isolate(monkeypatch, tmp_path, safe_bin):
     guard = _Guard(tmp_path)
     monkeypatch.setattr(login, "subprocess", _GuardedSubprocess(guard), raising=False)
     monkeypatch.setattr(login, "os", _GuardedOs(guard), raising=False)
+
+    main, run_login = _guard_targets(tmp_path)
+    monkeypatch.setattr(login, "main", main)
+    monkeypatch.setattr(login, "run_login", run_login)
 
     monkeypatch.setattr(login, "_has_websockets_sync", lambda: True, raising=False)
     monkeypatch.setattr(login, "_is_tty", lambda: False, raising=False)
@@ -232,6 +262,29 @@ def test_fixture_guards_block_package_tools_and_foreign_signals():
         login.os.killpg(os.getpid(), 0)
     assert os.environ["HOME"] == str(Path.home())
     assert not any(k.startswith("MFP_") for k in os.environ)
+
+
+def test_fixture_path_is_a_link_folder_under_tmp_path(tmp_path):
+    folder = Path(os.environ["PATH"])
+    assert folder == tmp_path / SAFE_BIN
+    names = set(os.listdir(folder))
+    assert names == {n for n in os.listdir("/usr/bin")} - MASKED
+    assert not names & MASKED
+    assert all((folder / n).is_symlink() for n in names)
+
+
+def test_fixture_guards_need_tmp_targets(tmp_path, monkeypatch):
+    """`main` needs a cookies_file under tmp_path, `run_login` a log there."""
+    with pytest.raises(pytest.fail.Exception):
+        login.main(["--check"])
+    with pytest.raises(pytest.fail.Exception):
+        login.main(["--check"], cookies_file="/srv/u/cookies.json")
+    kwargs = {"dry_run": True, "no_attempt_log": True, "target": tmp_path / "c.json",
+              "reporter": Capture().reporter, "browser_factory": _tripwire("browser")}
+    with pytest.raises(pytest.fail.Exception):
+        login.run_login(env={}, **kwargs)
+    with pytest.raises(pytest.fail.Exception):
+        login.run_login(env={"MFP_LOGIN_LOG": "/srv/u/attempts.log"}, **kwargs)
 
 
 # --- Chrome finder ----------------------------------------------------------
@@ -448,7 +501,7 @@ def test_finalize_failed_verification_keeps_old_bytes(tmp_path):
     code = login.finalize(RAW_COOKIES[:2], "UA/1", target, False, _bad_verify, cap.reporter, NOW)
     assert code == 4
     assert target.read_bytes() == b"old bytes"
-    assert sorted(p.name for p in tmp_path.iterdir()) == ["cookies.json", "tmp"]
+    assert sorted(p.name for p in tmp_path.iterdir()) == ["cookies.json", SAFE_BIN, "tmp"]
     assert any("chrome-ua" in line and "fail" in line for line in cap.lines)
 
 
@@ -491,7 +544,7 @@ def test_write_failure_leaves_no_temp_file(tmp_path, monkeypatch):
     with pytest.raises(OSError):
         login.write_cookie_file(target, {"cookies": {}})
     assert target.read_bytes() == b"old"
-    assert sorted(p.name for p in tmp_path.iterdir()) == ["cookies.json", "tmp"]
+    assert sorted(p.name for p in tmp_path.iterdir()) == ["cookies.json", SAFE_BIN, "tmp"]
 
 
 # --- verification over HTTP (fake session) ----------------------------------
@@ -603,13 +656,36 @@ def test_check_failed_verification_exits_4(tmp_path):
     assert login.run_check(f, _bad_verify, cap.reporter, NOW) == 4
 
 
-def test_check_reads_server_cookie_file_at_call_time(tmp_path, monkeypatch, capsys):
+def test_check_reads_server_cookie_file_at_call_time(tmp_path, monkeypatch):
+    """The default target is `server.COOKIES_FILE`, read on each call, never at import."""
     monkeypatch.setattr(login, "verify_session", _ok_verify)
-    assert login.main(["--check"]) == 4
-    assert _lines(capsys) == ["check: no cookie file"]
+    cap = Capture()
+    args = login.parse_args(["--check"], cap.reporter)
+    assert login._target_path(None) == server.COOKIES_FILE
+    assert login._main(args, login._target_path(None), cap.reporter) == 4
+    assert cap.lines == ["check: no cookie file"]
     moved = _cookie_file(tmp_path / "elsewhere" / "cookies.json", NOW - timedelta(days=1))
     monkeypatch.setattr(server, "COOKIES_FILE", moved)
-    assert login.main(["--check"]) == 0
+    assert login._target_path(None) == moved
+    assert login._main(args, login._target_path(None), cap.reporter) == 0
+    assert cap.lines[-1] == "check: session still valid"
+    given = tmp_path / "given.json"
+    assert login._target_path(given) == given
+    assert login._target_path(str(given)) == given
+
+
+def test_main_resolves_its_target_through_the_helper(tmp_path, monkeypatch, capsys):
+    seen: list[object] = []
+
+    def recorder(cookies_file):
+        seen.append(cookies_file)
+        return Path(cookies_file)
+
+    monkeypatch.setattr(login, "_target_path", recorder)
+    monkeypatch.setattr(login, "verify_session", _ok_verify)
+    target = _cookie_file(tmp_path / "c.json", NOW - timedelta(days=1))
+    assert login.main(["--check"], cookies_file=target) == 0
+    assert seen == [target]
     assert _lines(capsys)[-1] == "check: session still valid"
 
 
@@ -699,7 +775,7 @@ class FakeBrowser:
         return False
 
 
-def _run_login(monkeypatch, tmp_path, log_lines: int | None, page: FakePage,
+def _run_login(monkeypatch, tmp_path, log_lines: int, page: FakePage,
                no_attempt_log: bool = False, xvfb_finder=lambda: "/fake/Xvfb",
                password: str = PASSWORD, browser: FakeBrowser | None = None):
     """Credentials and the attempt log come from this test's environment only."""
@@ -707,10 +783,9 @@ def _run_login(monkeypatch, tmp_path, log_lines: int | None, page: FakePage,
     monkeypatch.setenv("MFP_PASSWORD", password)
     monkeypatch.setenv("MFP_LOGIN_ROLE", "dev")
     log = tmp_path / "attempts.txt"
-    if log_lines is not None:
-        log.write_text("".join(f"2026-11-11T00:00:0{i} dev\n" for i in range(log_lines)),
-                       encoding="utf-8")
-        monkeypatch.setenv("MFP_LOGIN_LOG", str(log))
+    log.write_text("".join(f"2026-11-11T00:00:0{i} dev\n" for i in range(log_lines)),
+                   encoding="utf-8")
+    monkeypatch.setenv("MFP_LOGIN_LOG", str(log))
     browser = browser or FakeBrowser(page)
     clock = FakeClock()
     cap = Capture()
@@ -801,17 +876,22 @@ def test_attempt_log_five_lines_appends_sixth_and_goes_on(tmp_path, monkeypatch)
     assert cap.lines[-1] == "dry-run: 2 cookies, session ok"
 
 
-def test_attempt_log_unset_refuses_with_2(tmp_path, monkeypatch):
-    code, browser, _log, _ = _run_login(monkeypatch, tmp_path, None, FakePage())
-    assert code == 2
-    assert browser.started == 0
+def test_attempt_log_unset_refuses_with_2():
+    """Driven below `run_login`, which every test reaches with the log set."""
+    for unset in (None, ""):
+        with pytest.raises(login.LoginError) as err:
+            login.attempt_precheck(unset, False)
+        assert err.value.code == 2
+        assert err.value.message == login.msg_log_unset()
 
 
-def test_no_attempt_log_flag_allows_login_without_log(tmp_path, monkeypatch):
-    code, browser, _log, _ = _run_login(monkeypatch, tmp_path, None, FakePage(),
-                                        no_attempt_log=True)
-    assert code == 0
-    assert browser.started == 1
+def test_no_attempt_log_flag_allows_login_without_log(tmp_path):
+    cap = Capture()
+    for unset in (None, ""):
+        assert login.attempt_precheck(unset, True) is None
+        login.record_attempt(unset, "dev", True, NOW, cap.reporter)
+    assert cap.lines == [login.msg_attempt_skipped()] * 2
+    assert sorted(p.name for p in tmp_path.iterdir()) == [SAFE_BIN, "tmp"]
 
 
 def test_turnstile_never_clears_exits_3_without_counting(tmp_path, monkeypatch):
@@ -1233,18 +1313,18 @@ def test_unexpected_exception_prints_one_line_and_returns_5(tmp_path, monkeypatc
     assert out.out.splitlines()[-1] == errors[0]
 
 
-def test_unknown_flag_exits_2_through_the_reporter(monkeypatch, capsys):
+def test_unknown_flag_exits_2_through_the_reporter(tmp_path, monkeypatch, capsys):
     """The dev chose to route argparse output through the Reporter, not stderr."""
     written: list[str] = []
     real = login.Reporter
     monkeypatch.setattr(login, "Reporter", lambda: real(write=written.append))
-    assert login.main(["--nope"]) == 2
+    assert login.main(["--nope"], cookies_file=tmp_path / "c.json") == 2
     out = capsys.readouterr()
     assert (out.out, out.err) == ("", "")
     assert written[0].startswith("usage: mfp-mcp-login")
     assert written[-1] == "mfp-mcp-login: error: unrecognized arguments: --nope"
     written.clear()
-    assert login.main(["--help"]) == 0
+    assert login.main(["--help"], cookies_file=tmp_path / "c.json") == 0
     assert written[0].startswith("usage: mfp-mcp-login")
     assert any("--dry-run" in line for line in written)
 
@@ -1280,10 +1360,11 @@ def test_dry_run_writes_only_the_expected_paths(tmp_path, monkeypatch):
             homes.extend([os.environ["HOME"], str(Path.home())])
 
     _fake_main_browser(monkeypatch, tmp_path, HomePage())
+    links = [Path(SAFE_BIN, name) for name in os.listdir(tmp_path / SAFE_BIN)]
     assert login.main(["--dry-run"], cookies_file=tmp_path / "c.json") == 0
-    assert sorted(p.relative_to(tmp_path) for p in tmp_path.rglob("*")) == [
-        Path("attempts.log"), Path("tmp")
-    ]
+    assert sorted(p.relative_to(tmp_path) for p in tmp_path.rglob("*")) == sorted(
+        [Path("attempts.log"), Path(SAFE_BIN), Path("tmp"), *links]
+    )
     assert homes == [str(tmp_path), str(tmp_path)]
     assert os.environ["HOME"] == str(tmp_path)
 
