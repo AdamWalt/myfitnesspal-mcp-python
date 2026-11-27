@@ -477,6 +477,7 @@ refresh_browser_cookies(browser="firefox") # via browser_cookie3
 ```
 
 ### 4. browser_cookie3 Fallback (Legacy)
+
 A final fallback uses [`browser_cookie3`](https://pypi.org/project/browser-cookie3/). It reads Chrome or Firefox cookies from default profile paths. It may help when macOS auto-discovery cannot reach your keychain. Do not rely on it on Linux. Use `mfp-mcp-login` there.
 
 ## Security Note on Credentials
