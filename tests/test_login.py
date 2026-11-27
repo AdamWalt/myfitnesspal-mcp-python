@@ -1067,9 +1067,11 @@ class FakePage:
             return self.turnstile_len is not None
         return False
 
-    def fill(self, selector: str, text: str) -> None:
+    def fill(self, selector: str, text: str) -> bool:
+        """The field is found, so the fill reports `True`. A dropped fill loses the text."""
         if selector != self.drop_fill:
             self.filled[selector] = text
+        return True
 
     def value_length(self, selector: str) -> int:
         if selector in (login.EMAIL_SEL, login.PASSWORD_SEL):
@@ -1581,9 +1583,9 @@ class FakeCDP:
 
 
 def test_cdp_fill_keeps_the_text_out_of_every_expression():
-    cdp = FakeCDP()
+    cdp = FakeCDP(value=True)
     page = login.CDPPage(cdp, "UA/1")
-    page.fill(login.PASSWORD_SEL, SPECIAL)
+    assert page.fill(login.PASSWORD_SEL, SPECIAL) is True
     expressions = [p["expression"] for m, p in cdp.calls if m == "Runtime.evaluate"]
     assert len(expressions) == 1
     for form in (SPECIAL, json.dumps(SPECIAL), json.dumps(SPECIAL)[1:-1], "w0rd"):
@@ -1591,9 +1593,267 @@ def test_cdp_fill_keeps_the_text_out_of_every_expression():
     assert [p for m, p in cdp.calls if m == "Input.insertText"] == [{"text": SPECIAL}]
 
 
+@pytest.mark.parametrize("value", [False, None], ids=["false", "no-value"])
+def test_cdp_fill_sends_no_text_when_the_page_finds_no_field(value):
+    """Only a page answer of `true` means the field was found and focused."""
+    cdp = FakeCDP(value=value)
+    page = login.CDPPage(cdp, "UA/1")
+    assert page.fill(login.EMAIL_SEL, EMAIL) is False
+    assert [m for m, _p in cdp.calls] == ["Runtime.evaluate"]
+
+
 def test_cdp_value_length_returns_the_page_count():
     page = login.CDPPage(FakeCDP(value=5), "UA/1")
     assert page.value_length(login.PASSWORD_SEL) == 5
+
+
+def _details(cls: str | None, description: str | None, text: str = "Uncaught") -> dict:
+    """Chrome's `exceptionDetails` for an error thrown by an evaluated expression."""
+    details: dict = {"exceptionId": 1, "text": text, "lineNumber": 0, "columnNumber": 52}
+    if cls is not None or description is not None:
+        exception = {"type": "object", "subtype": "error"}
+        if cls is not None:
+            exception["className"] = cls
+        if description is not None:
+            exception["description"] = description
+        details["exception"] = exception
+    return details
+
+
+class ThrowingCDP(FakeCDP):
+    """Every call answers with the same `exceptionDetails`."""
+
+    def __init__(self, details: dict) -> None:
+        super().__init__()
+        self.details = details
+
+    def call(self, method, params=None, timeout=30.0):
+        self.calls.append((method, dict(params or {})))
+        return {"result": {"type": "object"}, "exceptionDetails": self.details}
+
+
+EVAL_PREFIX = "DevTools Runtime.evaluate raised in the page during "
+
+PAGE_STEPS = [
+    ("navigate", lambda p: p.navigate(login.LOGIN_URL)),
+    ("dismiss_consent", lambda p: p.dismiss_consent()),
+    ("exists #email", lambda p: p.exists(login.EMAIL_SEL)),
+    ("fill #email", lambda p: p.fill(login.EMAIL_SEL, EMAIL)),
+    ("fill #password", lambda p: p.fill(login.PASSWORD_SEL, PASSWORD)),
+    ("value_length #password", lambda p: p.value_length(login.PASSWORD_SEL)),
+    ("submit", lambda p: p.submit()),
+    ("text", lambda p: p.text()),
+    ("shows_form", lambda p: p.shows_form()),
+]
+
+
+@pytest.mark.parametrize("label, step", PAGE_STEPS, ids=[s[0] for s in PAGE_STEPS])
+def test_cdp_eval_error_names_its_step_and_chrome_exception(label, step):
+    cdp = ThrowingCDP(_details("TypeError", "boom"))
+    page = login.CDPPage(cdp, "UA/1")
+    with pytest.raises(login.CDPError) as err:
+        step(page)
+    assert str(err.value) == f"{EVAL_PREFIX}{label}: TypeError: boom"
+    expressions = [p["expression"] for m, p in cdp.calls if m == "Runtime.evaluate"]
+    assert len(expressions) == 1
+    assert expressions[0] not in str(err.value)
+    assert [m for m, _p in cdp.calls if m == "Input.insertText"] == []
+
+
+@pytest.mark.parametrize("details, tail", [
+    (_details("TypeError", "TypeError: boom"), ": TypeError: boom"),
+    (_details("TypeError", None), ": TypeError"),
+    (_details(None, None, text="Uncaught SyntaxError: bad token"),
+     ": Uncaught SyntaxError: bad token"),
+    ({}, ""),
+], ids=["class-in-description", "class-only", "text-only", "empty"])
+def test_cdp_eval_error_label_uses_what_chrome_sends(details, tail):
+    page = login.CDPPage(ThrowingCDP(details), "UA/1")
+    with pytest.raises(login.CDPError) as err:
+        page.submit()
+    assert str(err.value) == f"{EVAL_PREFIX}submit{tail}"
+
+
+def test_fill_that_throws_names_its_step_and_class_and_exits_5(tmp_path, monkeypatch, capsys):
+    cdp = DomCDP(throw={"fill": _details(
+        "TypeError", "Cannot read properties of null (reading 'focus')")})
+    page = login.CDPPage(cdp, "UA/1")
+    browser = _fake_main_browser(monkeypatch, tmp_path, page)
+    assert login.main(["--dry-run"], cookies_file=tmp_path / "c.json") == 5
+    out = _lines(capsys)
+    assert out[-1] == ("error: CDPError: " + EVAL_PREFIX + "fill #email: TypeError: "
+                       "Cannot read properties of null (reading 'focus')")
+    assert browser.cleaned == 1
+    assert cdp.submitted is False
+    assert not (tmp_path / LOG_NAME).exists()
+    expressions = [p["expression"] for m, p in cdp.calls if m == "Runtime.evaluate"]
+    fill_expr = [e for e in expressions if ".focus()" in e]
+    assert len(fill_expr) == 1
+    for line in out:
+        assert not any(e in line for e in expressions)
+        assert PASSWORD not in line
+
+
+def test_eval_error_detail_is_redacted_before_the_cut(tmp_path, monkeypatch):
+    """The password sits across the cut. Redacting first leaves no part of it."""
+    prefix = f"{EVAL_PREFIX}value_length #email: TypeError: "
+    pad = "x" * (login.ERROR_DETAIL_LEN - 3 - len(prefix))
+    cdp = DomCDP(throw={"value_length": _details("TypeError", pad + PASSWORD + " tail")})
+    page = login.CDPPage(cdp, "UA/1")
+    code, _browser, log, cap = _run_login(monkeypatch, tmp_path, 0, page,
+                                          browser=FakeBrowser(page))
+    assert code == 5
+    assert cap.lines[-1] == "error: CDPError: " + prefix + pad + "***"
+    for line in cap.lines:
+        assert PASSWORD[:3] not in line
+    assert log.read_text(encoding="utf-8") == ""
+
+
+def test_eval_error_with_a_stack_prints_one_line(tmp_path, monkeypatch):
+    """Chrome's description holds the stack. The line squeezes it after redaction."""
+    description = "TypeError: Cannot read properties of null\n    at <anonymous>:1:63"
+    page = login.CDPPage(DomCDP(throw={"fill": _details("TypeError", description)}), "UA/1")
+    code, _browser, _log, cap = _run_login(monkeypatch, tmp_path, 0, page,
+                                           browser=FakeBrowser(page))
+    assert code == 5
+    assert cap.lines[-1] == ("error: CDPError: " + EVAL_PREFIX + "fill #email: TypeError: "
+                             "Cannot read properties of null at <anonymous>:1:63")
+
+
+# --- the login form re-rendering under a fill --------------------------------
+
+
+class DomCDP(FakeCDP):
+    """A fake DevTools client over a page that holds the two login fields.
+
+    Each `Runtime.evaluate` is answered by the page step its expression belongs
+    to. `fill_results` answers the fill expressions in order, then `True`.
+    `throw` maps a step kind to the `exceptionDetails` Chrome sends for it.
+    `Input.insertText` types into the field the last good fill focused.
+    """
+
+    SELECTORS = (login.EMAIL_SEL, login.PASSWORD_SEL, login.TURNSTILE_SEL)
+
+    def __init__(self, fill_results=(), throw: dict | None = None) -> None:
+        super().__init__()
+        self.fill_results = list(fill_results)
+        self.throw = throw or {}
+        self.values: dict[str | None, str] = {}
+        self.focused: str | None = None
+        self.submitted = False
+
+    @staticmethod
+    def _kind(expr: str) -> str:
+        fixed = {"document.readyState": "navigate", login.CONSENT_JS: "consent",
+                 login.SUBMIT_JS: "submit", login.FORM_JS: "shows_form"}
+        if expr in fixed:
+            return fixed[expr]
+        if "innerText" in expr:
+            return "text"
+        if ".focus()" in expr:
+            return "fill"
+        if ".value" in expr:
+            return "value_length"
+        if expr.startswith("!!document.querySelector("):
+            return "exists"
+        raise AssertionError("an expression no page step makes")
+
+    def _evaluate(self, expr: str):
+        kind = self._kind(expr)
+        selector = next((s for s in self.SELECTORS if json.dumps(s) in expr), None)
+        if kind == "fill":
+            found = self.fill_results.pop(0) if self.fill_results else True
+            self.focused = selector if found else None
+            return found
+        if kind == "exists":
+            return selector in (login.EMAIL_SEL, login.PASSWORD_SEL)
+        if kind == "value_length":
+            return len(self.values.get(selector, ""))
+        if kind == "submit":
+            self.submitted = True
+            return "button"
+        return {"navigate": "complete", "consent": False, "shows_form": True,
+                "text": "Log in Email Password"}[kind]
+
+    def call(self, method, params=None, timeout=30.0):
+        params = dict(params or {})
+        self.calls.append((method, params))
+        if method == "Runtime.evaluate":
+            kind = self._kind(params["expression"])
+            if kind in self.throw:
+                return {"result": {"type": "object"}, "exceptionDetails": self.throw[kind]}
+            return {"result": {"value": self._evaluate(params["expression"])}}
+        if method == "Input.insertText":
+            self.values[self.focused] = params["text"]
+            return {}
+        if method == "Network.getAllCookies":
+            return {"cookies": list(RAW_COOKIES) if self.submitted else [RAW_COOKIES[1]]}
+        return {}
+
+
+def test_fill_that_finds_no_field_waits_and_retries(tmp_path, monkeypatch):
+    """The form re-renders under the first fill. The retry fills both fields once."""
+    cdp = DomCDP(fill_results=[False])
+    page = login.CDPPage(cdp, "UA/1")
+    code, _browser, log, cap = _run_login(monkeypatch, tmp_path, 0, page,
+                                          browser=FakeBrowser(page))
+    assert code == 0
+    assert [p for m, p in cdp.calls if m == "Input.insertText"] == [
+        {"text": EMAIL}, {"text": PASSWORD}]
+    fills = [p["expression"] for m, p in cdp.calls
+             if m == "Runtime.evaluate" and ".focus()" in p["expression"]]
+    selectors = [s for e in fills for s in (login.EMAIL_SEL, login.PASSWORD_SEL)
+                 if json.dumps(s) in e]
+    assert selectors == [login.EMAIL_SEL, login.EMAIL_SEL, login.PASSWORD_SEL]
+    assert cdp.values == {login.EMAIL_SEL: EMAIL, login.PASSWORD_SEL: PASSWORD}
+    assert cdp.submitted is True
+    assert len(_log_lines(log)) == 1
+    assert cap.lines[-1] == "dry-run: 2 cookies, session ok"
+
+
+class NoFieldPage(FakePage):
+    """Every fill finds no field, as on a form that never settles."""
+
+    def __init__(self, text: str = "Log in Email Password") -> None:
+        super().__init__(text=text)
+        self.fills: list[str] = []
+
+    def fill(self, selector: str, text: str) -> bool:
+        self.fills.append(selector)
+        return False
+
+
+@pytest.mark.parametrize("text, code", [
+    ("Log in Email Password", 5),
+    ("Just a moment...", 3),
+], ids=["form", "challenge"])
+def test_fill_that_never_finds_a_field_ends_form_missing_at_the_timeout(text, code):
+    page = NoFieldPage(text=text)
+    clock = FakeClock()
+    cap = Capture()
+    gates: list[int] = []
+    with pytest.raises(login.LoginError) as err:
+        login.login_flow(page, EMAIL, PASSWORD, lambda: gates.append(1), cap.reporter,
+                         clock.sleep, clock.monotonic)
+    assert err.value.code == code
+    assert err.value.message == login.msg_form_missing(login.FORM_TIMEOUT)
+    assert err.value.excerpt == text
+    assert clock.t == login.FORM_TIMEOUT
+    assert page.fills == [login.EMAIL_SEL] * (int(login.FORM_TIMEOUT) + 1)
+    assert page.filled == {}
+    assert page.submitted is False
+    assert gates == []
+    assert cap.lines == [login.msg_form_found()]
+
+
+def test_form_missing_after_fill_exits_5_through_main(tmp_path, monkeypatch, capsys):
+    browser = _fake_main_browser(monkeypatch, tmp_path, NoFieldPage())
+    assert login.main(["--dry-run"], cookies_file=tmp_path / "c.json") == 5
+    out = _lines(capsys)
+    assert out[-2:] == [login.msg_form_missing(login.FORM_TIMEOUT),
+                        login.msg_page_text("Log in Email Password")]
+    assert browser.page.submitted is False
+    assert not (tmp_path / LOG_NAME).exists()
 
 
 # --- credentials ------------------------------------------------------------

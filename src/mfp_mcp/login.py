@@ -175,7 +175,11 @@ class LoginError(Exception):
 
 
 class CDPError(Exception):
-    """A DevTools call answered with an error. Holds the method, never params."""
+    """A DevTools call answered with an error.
+
+    Holds the method, and for an evaluate the page step and Chrome's exception
+    class and description. Never params, and never the evaluated expression.
+    """
 
 
 class _Stopped(BaseException):
@@ -403,8 +407,12 @@ def msg_unexpected(exc: BaseException) -> str:
 
 
 def msg_error(exc: BaseException, secrets: Iterable[str] = ()) -> str:
-    """The type and the start of the message. Redacts before the cut."""
-    detail = redact(str(exc), secrets)[:ERROR_DETAIL_LEN]
+    """The type and the start of the message, on one line.
+
+    Redacts first, then squeezes whitespace, then cuts. A page exception's
+    description holds its stack, so the squeeze keeps it on one line.
+    """
+    detail = " ".join(redact(str(exc), secrets).split())[:ERROR_DETAIL_LEN]
     return f"error: {type(exc).__name__}: {detail}" if detail else f"error: {type(exc).__name__}"
 
 
@@ -986,7 +994,7 @@ class Page(Protocol):
     def navigate(self, url: str) -> None: ...
     def dismiss_consent(self) -> bool: ...
     def exists(self, selector: str) -> bool: ...
-    def fill(self, selector: str, text: str) -> None: ...
+    def fill(self, selector: str, text: str) -> bool: ...
     def value_length(self, selector: str) -> int: ...
     def submit(self) -> None: ...
     def cookies(self) -> list[dict[str, Any]]: ...
@@ -1009,6 +1017,13 @@ def _stop(page: Page, code: int, message: str, secrets: Iterable[str] = ()) -> L
     return LoginError(code, message, excerpt)
 
 
+def _form_missing(page: Page, reporter: Reporter) -> LoginError:
+    """The stop for a login form that never settles. A challenge page exits 3."""
+    err = _stop(page, EXIT_OTHER, msg_form_missing(FORM_TIMEOUT), reporter.secrets)
+    err.code = classify_page(page.text())
+    return err
+
+
 def login_flow(
     page: Page,
     username: str,
@@ -1025,16 +1040,19 @@ def login_flow(
         if page.dismiss_consent():
             reporter.line(msg_consent())
         if monotonic() >= deadline:
-            err = _stop(page, EXIT_OTHER, msg_form_missing(FORM_TIMEOUT), reporter.secrets)
-            err.code = classify_page(page.text())
-            raise err
+            raise _form_missing(page, reporter)
         sleep(1.0)
     if page.dismiss_consent():
         reporter.line(msg_consent())
     reporter.line(msg_form_found())
 
-    page.fill(EMAIL_SEL, username)
-    page.fill(PASSWORD_SEL, password)
+    # A fill that finds no field means the form re-rendered under it. Start
+    # over from the first field, so both land in the same form.
+    deadline = monotonic() + FORM_TIMEOUT
+    while not (page.fill(EMAIL_SEL, username) and page.fill(PASSWORD_SEL, password)):
+        if monotonic() >= deadline:
+            raise _form_missing(page, reporter)
+        sleep(1.0)
     sleep(2.0)
     filled = (page.value_length(EMAIL_SEL), page.value_length(PASSWORD_SEL))
     if filled != (_utf16_len(username), _utf16_len(password)):
@@ -1141,6 +1159,21 @@ FORM_JS = (
 )
 
 
+def _eval_error(step: str, details: dict[str, Any]) -> str:
+    """The step, then Chrome's exception class and description, as Chrome sent them.
+
+    No cut here: the Reporter redacts first, then `msg_error` cuts.
+    """
+    exception = details.get("exception") or {}
+    cls = str(exception.get("className") or "")
+    # Chrome's `text`, such as "Uncaught", stands in only when it sent no class.
+    description = str(exception.get("description") or ("" if cls else details.get("text")) or "")
+    if cls and not description.startswith(cls):
+        description = f"{cls}: {description}" if description else cls
+    label = f"DevTools Runtime.evaluate raised in the page during {step}"
+    return f"{label}: {description}" if description else label
+
+
 class CDPPage:
     """The `Page` protocol on top of one Chrome tab."""
 
@@ -1148,40 +1181,53 @@ class CDPPage:
         self._cdp = cdp
         self.user_agent = user_agent
 
-    def _eval(self, expr: str) -> Any:
+    def _eval(self, expr: str, step: str) -> Any:
+        """Evaluate `expr` in the page. `step` names the call in any error.
+
+        The error carries Chrome's exception class and description, uncut.
+        The Reporter redacts them before any cut. `expr` never enters it.
+        """
         res = self._cdp.call("Runtime.evaluate", {"expression": expr, "returnByValue": True})
         if "exceptionDetails" in res:
-            raise CDPError("DevTools Runtime.evaluate raised in the page")
+            raise CDPError(_eval_error(step, res["exceptionDetails"]))
         return res.get("result", {}).get("value")
 
     def navigate(self, url: str) -> None:
         self._cdp.call("Page.navigate", {"url": url})
         deadline = time.monotonic() + FORM_TIMEOUT
-        while self._eval("document.readyState") != "complete" and time.monotonic() < deadline:
+        while (self._eval("document.readyState", "navigate") != "complete"
+               and time.monotonic() < deadline):
             time.sleep(0.5)
 
     def dismiss_consent(self) -> bool:
-        return bool(self._eval(CONSENT_JS))
+        return bool(self._eval(CONSENT_JS, "dismiss_consent"))
 
     def exists(self, selector: str) -> bool:
-        return bool(self._eval(f"!!document.querySelector({json.dumps(selector)})"))
+        expr = f"!!document.querySelector({json.dumps(selector)})"
+        return bool(self._eval(expr, f"exists {selector}"))
 
-    def fill(self, selector: str, text: str) -> None:
+    def fill(self, selector: str, text: str) -> bool:
+        """Focus the field and type `text`. `False`, with no text sent, when it is gone."""
         sel = json.dumps(selector)
-        self._eval(
-            f"(() => {{ const e = document.querySelector({sel}); "
-            "e.focus(); e.select && e.select(); }})()"
+        found = self._eval(
+            f"(() => {{ const e = document.querySelector({sel}); if (!e) return false; "
+            "e.focus(); e.select && e.select(); return true; }})()",
+            f"fill {selector}",
         )
+        if found is not True:
+            return False
         # The text travels only inside Input.insertText, never in an expression.
         self._cdp.call("Input.insertText", {"text": text})
+        return True
 
     def value_length(self, selector: str) -> int:
         """`.value.length`, in UTF-16 code units, as JavaScript counts."""
         sel = json.dumps(selector)
-        return int(self._eval(f"((document.querySelector({sel}) || {{}}).value || '').length") or 0)
+        expr = f"((document.querySelector({sel}) || {{}}).value || '').length"
+        return int(self._eval(expr, f"value_length {selector}") or 0)
 
     def submit(self) -> None:
-        if self._eval(SUBMIT_JS) == "none":
+        if self._eval(SUBMIT_JS, "submit") == "none":
             for kind in ("keyDown", "keyUp"):
                 self._cdp.call(
                     "Input.dispatchKeyEvent",
@@ -1196,10 +1242,10 @@ class CDPPage:
             return self._cdp.call("Network.getCookies", {"urls": urls}).get("cookies", [])
 
     def text(self) -> str:
-        return str(self._eval("document.body ? document.body.innerText : ''") or "")
+        return str(self._eval("document.body ? document.body.innerText : ''", "text") or "")
 
     def shows_form(self) -> bool:
-        return bool(self._eval(FORM_JS))
+        return bool(self._eval(FORM_JS, "shows_form"))
 
 
 def _local_http() -> requests.Session:
