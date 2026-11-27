@@ -1211,7 +1211,8 @@ class CDPPage:
         sel = json.dumps(selector)
         found = self._eval(
             f"(() => {{ const e = document.querySelector({sel}); if (!e) return false; "
-            "e.focus(); e.select && e.select(); return true; }})()",
+            # A plain piece: its braces are single, not f-string doubled.
+            "e.focus(); e.select && e.select(); return true; })()",
             f"fill {selector}",
         )
         if found is not True:

@@ -18,6 +18,7 @@ import json
 import logging
 import os
 import re
+import shutil
 import signal
 import socket
 import stat
@@ -1605,6 +1606,111 @@ def test_cdp_fill_sends_no_text_when_the_page_finds_no_field(value):
 def test_cdp_value_length_returns_the_page_count():
     page = login.CDPPage(FakeCDP(value=5), "UA/1")
     assert page.value_length(login.PASSWORD_SEL) == 5
+
+
+# --- every JavaScript string CDPPage sends must parse -------------------------
+
+# Found at import, before the fixture narrows PATH. Only these JS checks run it.
+NODE = shutil.which("node")
+PAIRS = {"(": ")", "[": "]", "{": "}"}
+
+
+class AnswerCDP(FakeCDP):
+    """Answers `complete` to the ready-state poll and `true` to the rest."""
+
+    def call(self, method, params=None, timeout=30.0):
+        super().call(method, params, timeout)
+        done = (params or {}).get("expression") == "document.readyState"
+        return {"result": {"value": "complete" if done else True}}
+
+
+def _sent_expressions() -> dict[str, str]:
+    """Each page step's expression, built and sent exactly as `CDPPage` does."""
+    cdp = AnswerCDP()
+    page = login.CDPPage(cdp, "UA/1")
+    steps: list[str] = []
+
+    def run(step, action):
+        before = len(cdp.calls)
+        action()
+        sent = [p["expression"] for m, p in cdp.calls[before:] if m == "Runtime.evaluate"]
+        assert len(sent) == 1, step
+        steps.append(step)
+        return sent[0]
+
+    built = {"navigate": run("navigate", lambda: page.navigate("https://example.com/"))}
+    built["dismiss_consent"] = run("dismiss_consent", page.dismiss_consent)
+    for sel in SELECTORS:
+        built[f"exists {sel}"] = run("exists", lambda s=sel: page.exists(s))
+        built[f"fill {sel}"] = run("fill", lambda s=sel: page.fill(s, SPECIAL))
+        built[f"value_length {sel}"] = run("value_length", lambda s=sel: page.value_length(s))
+    built["submit"] = run("submit", page.submit)
+    built["text"] = run("text", page.text)
+    built["shows_form"] = run("shows_form", page.shows_form)
+    return built
+
+
+SELECTORS = (login.EMAIL_SEL, login.PASSWORD_SEL, login.TURNSTILE_SEL)
+STEPS = sorted(
+    ["navigate", "dismiss_consent", "submit", "text", "shows_form"]
+    + [f"{kind} {sel}" for kind in ("exists", "fill", "value_length") for sel in SELECTORS]
+)
+
+
+def test_every_page_step_is_checked_with_the_constants_it_sends():
+    sent = _sent_expressions()
+    assert sorted(sent) == STEPS
+    assert sent["dismiss_consent"] == login.CONSENT_JS
+    assert sent["submit"] == login.SUBMIT_JS
+    assert sent["shows_form"] == login.FORM_JS
+
+
+@pytest.mark.parametrize("step", STEPS)
+def test_sent_expression_has_single_balanced_braces(step):
+    """No `{{` or `}}` left from an f-string, and every bracket closes in order."""
+    expr = _sent_expressions()[step]
+    assert "{{" not in expr and "}}" not in expr
+    stack: list[str] = []
+    for ch in expr:
+        if ch in PAIRS:
+            stack.append(PAIRS[ch])
+        elif ch in PAIRS.values():
+            assert stack and stack.pop() == ch, f"{step}: unmatched {ch!r}"
+    assert not stack, f"{step}: unclosed {stack!r}"
+
+
+@pytest.mark.skipif(NODE is None, reason="node is not on PATH, so no JS parse")
+@pytest.mark.parametrize("step", STEPS)
+def test_sent_expression_parses_under_node_check(step, tmp_path):
+    script = tmp_path / "expr.js"
+    script.write_text(_sent_expressions()[step], encoding="utf-8")
+    res = subprocess.run([NODE, "--check", str(script)], capture_output=True, text=True,
+                         timeout=60, check=False)
+    assert res.returncode == 0, res.stderr
+
+
+@pytest.mark.skipif(NODE is None, reason="node is not on PATH, so no JS run")
+def test_fill_expression_answers_false_when_gone_and_true_when_focused(tmp_path):
+    """The fill expression, run under node on a stub `document`."""
+    expr = _sent_expressions()[f"fill {login.EMAIL_SEL}"]
+    (tmp_path / "expr.js").write_text(expr, encoding="utf-8")
+    runner = tmp_path / "run.js"
+    runner.write_text(
+        "const expr = require('fs').readFileSync(process.argv[2], 'utf8');\n"
+        "const asked = [];\n"
+        "globalThis.document = { querySelector: (s) => { asked.push(s); return null; } };\n"
+        "const gone = eval(expr);\n"
+        "let focused = false;\n"
+        "const field = { focus() { focused = true; }, select() {} };\n"
+        "globalThis.document = { querySelector: (s) => { asked.push(s); return field; } };\n"
+        "const found = eval(expr);\n"
+        "console.log(JSON.stringify([gone, found, focused, asked]));\n",
+        encoding="utf-8",
+    )
+    res = subprocess.run([NODE, str(runner), str(tmp_path / "expr.js")], capture_output=True,
+                         text=True, timeout=60, check=False)
+    assert res.returncode == 0, res.stderr
+    assert json.loads(res.stdout) == [False, True, True, [login.EMAIL_SEL, login.EMAIL_SEL]]
 
 
 def _details(cls: str | None, description: str | None, text: str = "Uncaught") -> dict:
