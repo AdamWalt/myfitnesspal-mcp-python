@@ -136,7 +136,7 @@ pip install --upgrade pip
 pip install -e ".[login]"
 ```
 
-The `login` extra adds `websockets>=11` and `requests`. The `mfp-mcp-login` command needs them.
+The `login` extra adds `requests` only. The `mfp-mcp-login` command needs it.
 
 ### Option 2: Install from GitHub
 
@@ -190,7 +190,7 @@ A login keeps only the `myfitnesspal.com` cookies. It verifies them against `/us
 
 ### Linux
 
-The command needs Google Chrome and Xvfb. Chrome draws on a private Xvfb display. No window appears.
+The command needs Google Chrome and Xvfb. Chrome draws on a private Xvfb display. Only this run holds the display's X cookie. A `0600` file in the run's temp folder keeps it. Without the cookie, no other client can connect. No window appears.
 
 Install Google Chrome from <https://www.google.com/chrome/>. The command searches `PATH` in this order. It tries `google-chrome`, `google-chrome-stable`, `chromium`, then `chromium-browser`. It skips a snap Chromium, which it does not support.
 
@@ -304,7 +304,6 @@ Every run except `--check` holds `~/.mfp_mcp/login.lock` while it works. A secon
 | 2 | A credential is missing, or it fails to decrypt |
 | 2 | No Chrome, or no Xvfb |
 | 2 | The Xvfb install or start failed |
-| 2 | The `login` extra is missing |
 | 2 | Another run holds the lock |
 | 3 | Captcha, stuck Turnstile, account lock or rate-limit page |
 | 4 | No cookie file, or the file is unreadable |
@@ -734,13 +733,12 @@ pip install -e ".[login]"
 2. `display: no Xvfb on PATH`: install Xvfb with the command it prints. On an `apt-get` system, `mfp-mcp-login --install-xvfb` can install it for you.
 3. `chrome: none found on PATH`: install Google Chrome from <https://www.google.com/chrome/>.
 4. `chrome: skipped ... a snap Chromium`: install Google Chrome. The snap is not supported.
-5. `setup: the browser login needs websockets>=11`: reinstall with `pip install -e ".[login]"`.
-6. `credentials: ... no terminal to prompt on`: run it in a terminal, or export both variables.
-7. `credentials: ... looks encrypted but there is no key`: set `MFP_SECRET_KEY`, or store the key with `npm run store-key`.
-8. `attempts: ... refused`: the attempt window is full. Wait for the time it prints. Or delete the lines it names. To reset it, delete `~/.mfp_mcp/login-attempts.log`.
-9. `lock: another mfp-mcp-login run holds ...`: wait for the other run to end.
-10. Exit 3: MyFitnessPal showed a challenge, lock or limit page. Try again later, and mind the attempt window.
-11. Exit 4 after a login: the new session failed verification. No cookie file was written. Try again later, and mind the attempt window.
+5. `credentials: ... no terminal to prompt on`: run it in a terminal, or export both variables.
+6. `credentials: ... looks encrypted but there is no key`: set `MFP_SECRET_KEY`, or store the key with `npm run store-key`.
+7. `attempts: ... refused`: the attempt window is full. Wait for the time it prints. Or delete the lines it names. To reset it, delete `~/.mfp_mcp/login-attempts.log`.
+8. `lock: another mfp-mcp-login run holds ...`: wait for the other run to end.
+9. Exit 3: MyFitnessPal showed a challenge, lock or limit page. Try again later, and mind the attempt window.
+10. Exit 4 after a login: the new session failed verification. No cookie file was written. Try again later, and mind the attempt window.
 
 ### "No module named 'mfp_mcp'"
 
