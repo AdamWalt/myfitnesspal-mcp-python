@@ -88,6 +88,7 @@ Garmin sleep window + first-meal timestamp) or correcting entries programmatical
 - **pip 21.3+** (for pyproject.toml support; upgrade with `pip install --upgrade pip`)
 - **MyFitnessPal account**
 - **One of the following for authentication:**
+  - **Linux:** Google Chrome and Xvfb, for the `mfp-mcp-login` command. See [The mfp-mcp-login Command](#the-mfp-mcp-login-command).
   - **Recommended (macOS):** any Chromium-based browser (Arc, Dia, Chrome, Edge,
     Brave, Vivaldi, Opera, ...) with an active MyFitnessPal login session —
     the MCP auto-discovers the session on next call
@@ -103,16 +104,13 @@ This MCP supports multiple authentication methods:
 
 | Method | Setup | Persistence |
 |--------|-------|-------------|
+| **`mfp-mcp-login` command, recommended on Linux** | Run `mfp-mcp-login` once. It logs in through a headed Google Chrome. It saves the session to `~/.mfp_mcp/cookies.json`. | Until the session expires. The server ignores a file over 30 days old. |
 | **Chromium browser auto-discovery (macOS, recommended)** | Log into myfitnesspal.com in any Chromium-based browser (Arc, Dia, Chrome, Edge, Brave, Vivaldi, Opera, ...). The MCP auto-detects installed browsers via the macOS keychain and uses whichever one is logged in. | Until browser session expires (cached for 30 days in `~/.mfp_mcp/cookies.json`) |
 | **Encrypted credentials (legacy)** | Add encrypted `MFP_USERNAME` and `MFP_PASSWORD` to Claude Desktop config; set `MFP_SECRET_KEY` outside the config (for example via shell env or OS keychain) | Form login no longer works against MFP's NextAuth backend — only useful if cached cookies are still valid |
 | **Plain credentials (legacy)** | Add `MFP_USERNAME` and `MFP_PASSWORD` to Claude Desktop config | Same as above — form login flow is deprecated |
 | **Browser cookies (browser_cookie3 fallback)** | Log into myfitnesspal.com in Chrome or Firefox via the default profile paths | Until browser session expires |
 
-> **Note**: MyFitnessPal migrated their authentication to NextAuth, so the
-> legacy form-POST `authenticate_with_credentials` path almost always fails
-> for fresh logins. The Chromium auto-discovery path is the reliable way to
-> get a session on macOS — just log in via any modern browser and the MCP
-> picks it up automatically on the next call.
+> **Note**: MyFitnessPal moved its login to NextAuth. So the legacy `authenticate_with_credentials` form login almost always fails. On macOS, Chromium auto-discovery picks up a browser session. Log in with any Chromium browser first. On Linux, auto-discovery does not run. Log in with `mfp-mcp-login` there instead.
 
 ## Installation
 
@@ -134,17 +132,19 @@ source venv/bin/activate  # macOS/Linux
 # Upgrade pip (required for pyproject.toml support)
 pip install --upgrade pip
 
-# Install the package in editable mode
-pip install -e .
+# Install the package and its login extra in editable mode
+pip install -e ".[login]"
 ```
 
-### Option 2: Install with pip (when published)
+The `login` extra adds `requests` only. The `mfp-mcp-login` command needs it.
+
+### Option 2: Install from GitHub
 
 ```bash
-pip install mfp-mcp
+pip install "mfp-mcp[login] @ git+https://github.com/AdamWalt/myfitnesspal-mcp-python.git"
 ```
 
-> **Note**: Option 2 requires the package to be published to PyPI. For now, use Option 1.
+> **Note**: This form works once the login command merges upstream. Until then, use Option 1. The package is not on PyPI. The `mfp-mcp` name there belongs to another project.
 
 ### Verify Installation
 
@@ -157,15 +157,164 @@ python -m mfp_mcp.server
 
 You should see the server waiting for input (it communicates via stdio). Press `Ctrl+C` to stop.
 
-To test authentication (optional):
+To check a saved session without logging in:
 
 ```bash
-MFP_USERNAME="your_email" MFP_PASSWORD="your_password" python -c "
-from mfp_mcp.server import get_mfp_client
-client = get_mfp_client()
-print('Authentication successful!')
-"
+mfp-mcp-login --check
 ```
+
+It exits 0 when the saved session still works. With no session yet, it prints `check: no cookie file` and exits 4. Then log in as [The mfp-mcp-login Command](#the-mfp-mcp-login-command) shows.
+
+## The mfp-mcp-login Command
+
+`mfp-mcp-login` logs in to MyFitnessPal and saves the session. It drives a headed Chrome over the DevTools protocol. Cloudflare Turnstile never clears in headless Chrome. The session goes to `~/.mfp_mcp/cookies.json`, the file the server reads. The server re-reads that file on every call. So it needs no restart after a login.
+
+The command comes with the `login` extra, as [Installation](#installation) shows. Run it from the activated virtual environment. `python -m mfp_mcp.login` runs the same command.
+
+### Usage
+
+```bash
+mfp-mcp-login                  # check the saved session, log in only when it fails
+mfp-mcp-login --check          # check the saved session, never log in
+mfp-mcp-login --dry-run        # log in and verify, write no cookie file
+mfp-mcp-login --install-xvfb   # on Linux, install Xvfb with apt when it is missing
+```
+
+- With no flag, it checks the saved session first. It logs in only when that check fails.
+- `--check` never logs in. It takes no lock and never touches the attempt log.
+- `--dry-run` skips the saved-session check and always logs in. Its submission counts against the attempt window.
+- `--check` and `--dry-run` cannot be combined.
+- `--install-xvfb` combines with a plain run or `--dry-run`.
+
+A login keeps only the `myfitnesspal.com` cookies. It verifies them against `/user/auth_token` twice. One request sends Chrome's user agent. The other sends the one `python-myfitnesspal` uses. Only then does it write the cookie file. The write is atomic, with mode `0600`.
+
+### Linux
+
+The command needs Google Chrome and Xvfb. Chrome draws on a private Xvfb display. Only this run holds the display's X cookie. A `0600` file in the run's temp folder keeps it. Without the cookie, no other client can connect. No window appears.
+
+Install Google Chrome from <https://www.google.com/chrome/>. The command searches `PATH` in this order. It tries `google-chrome`, `google-chrome-stable`, `chromium`, then `chromium-browser`. It skips a snap Chromium, which it does not support.
+
+With Xvfb missing from `PATH`, a run exits 2. It prints how to install Xvfb. Install Xvfb with your package manager:
+
+| Distribution | Command |
+|--------------|---------|
+| Debian, Ubuntu and other `apt-get` systems | `sudo apt-get install xvfb` |
+| Fedora | `sudo dnf install xorg-x11-server-Xvfb` |
+| Arch | `sudo pacman -S xorg-server-xvfb` |
+
+On an `apt-get` system, `--install-xvfb` can run it for you. It runs only when Xvfb is missing from `PATH`. It needs a terminal, so apt can ask first. With no terminal or no `apt-get`, it exits 2. It then prints how to install Xvfb instead.
+
+### macOS
+
+macOS support is experimental. It was never run live. The command prints one line saying so on every run.
+
+Install Chrome with `brew install --cask google-chrome`. The command looks for it in `/Applications/Google Chrome.app`. macOS needs no Xvfb. The Chrome window opens off-screen instead.
+
+### Windows
+
+The command does not run on Windows directly. It exits 2 there. Run it under WSL2, where the Linux steps apply.
+
+### Credentials
+
+Give your credentials to `mfp-mcp-login` only. Keep them out of the server config. The server would post them whenever its session fails.
+
+The command reads `MFP_USERNAME` and `MFP_PASSWORD` from the environment. It prompts on the terminal for an unset one:
+
+```
+MyFitnessPal email:
+MyFitnessPal password:
+```
+
+The password prompt hides what you type. A typed value is used as typed, never decrypted. With no terminal, an unset value exits 2. Output never shows a credential, the key or a cookie. Chrome, Xvfb and helper commands get no `MFP_*` variable.
+
+### Encrypted Credentials
+
+The environment values may be encrypted with [Fernet symmetric encryption](https://cryptography.io/en/latest/fernet/). The command decrypts them as the server does. It looks for the key in this order:
+
+1. The `MFP_SECRET_KEY` environment variable.
+2. The OS keychain, service `mfp-mcp`, account `MFP_SECRET_KEY`. This is the recommended place.
+
+The key lookup runs only when a value looks encrypted. A plain value is used as is. An encrypted value with no key exits 2. So does a value that fails to decrypt.
+
+**Step 1: Generate the key and store it.**
+
+```bash
+npm install
+npm run store-key
+```
+
+`store-key` generates a Fernet key. It stores the key in the OS keychain. It also prints the key for Step 2. See [Key Management CLI](#key-management-cli) for every flag.
+
+**Step 2: Encrypt your credentials.**
+
+```python
+from cryptography.fernet import Fernet
+
+key = b"abc123XYZ...=="  # your key from Step 1
+f = Fernet(key)
+
+encrypted_user = f.encrypt(b"your_email@example.com").decode()
+encrypted_pass = f.encrypt(b"your_password").decode()
+
+print("MFP_USERNAME:", encrypted_user)
+print("MFP_PASSWORD:", encrypted_pass)
+```
+
+**Step 3: Export the encrypted values, then run the command.**
+
+```bash
+export MFP_USERNAME=gAAAAAB...
+export MFP_PASSWORD=gAAAAAB...
+mfp-mcp-login
+```
+
+Fernet tokens need no quotes. Never export the plain password this way. Use the prompt for plain values.
+
+The key stays in the keychain. You can export it from your shell profile instead:
+
+```bash
+# Add to ~/.zshrc or ~/.bashrc
+export MFP_SECRET_KEY="abc123XYZ...=="
+```
+
+### Attempt Window
+
+The command allows 3 login submissions in any 24 hours. Each submission appends one UTC timestamp to `~/.mfp_mcp/login-attempts.log`. Dry runs count too. The window is checked before any prompt or browser starts.
+
+- A full window stops a login with exit 6. It prints the log path and when the window reopens.
+- A submission stops counting 24 hours after it was made.
+- A non-timestamp line counts against the limit. Such a line is never dropped. When such lines fill the window, exit 6 counts them. Delete them to log in again.
+- Each run except `--check` drops timestamps older than 30 days.
+- To reset the window, delete `~/.mfp_mcp/login-attempts.log`.
+
+Every run except `--check` holds `~/.mfp_mcp/login.lock` while it works. A second run at the same time exits 2.
+
+### Session Age
+
+`--check` fails a session saved 29 days ago or more. The server ignores a cookie file over 30 days old. So `--check` flags an old session a day early. A plain `mfp-mcp-login` then logs in again.
+
+`--check` also needs a real session cookie. Both verify requests must pass too.
+
+### Exit Codes
+
+| Code | Meaning |
+|------|---------|
+| 0 | Session saved, verified in a dry run, or still valid |
+| 2 | Bad usage, or Windows outside WSL2 |
+| 2 | A credential is missing, or it fails to decrypt |
+| 2 | No Chrome, or no Xvfb |
+| 2 | The Xvfb install or start failed |
+| 2 | Another run holds the lock |
+| 3 | Captcha, stuck Turnstile, account lock or rate-limit page |
+| 4 | No cookie file, or the file is unreadable |
+| 4 | Verification failed, or the session reached 29 days |
+| 5 | No login form, or a field refused its text |
+| 5 | Another page after submit, or a timeout |
+| 5 | An unexpected error |
+| 6 | Three submissions in 24 hours, or unreadable log lines |
+| 128 plus N | Stopped by signal N: SIGINT, SIGTERM or SIGHUP |
+
+On exit 3 or 5, a page excerpt may print. It is redacted and at most 300 characters. Only a login or challenge page gets one. A stopped run kills Chrome and Xvfb before it exits.
 
 ## Configuration for Claude Desktop
 
@@ -180,9 +329,30 @@ print('Authentication successful!')
 
 If the file doesn't exist, create it. Add or merge the following configuration:
 
-#### Option A: With Encrypted Credentials (Enhanced Security)
+#### Option A: No Credentials, Recommended
 
-Encrypt your credentials before storing them in the config file. See [Encrypted Credentials](#encrypted-credentials-enhanced-security) for setup instructions.
+This setup puts no credentials in the config. The server reads the session from `~/.mfp_mcp/cookies.json`. On Linux, create it first with [`mfp-mcp-login`](#the-mfp-mcp-login-command). On macOS, a logged-in Chromium browser can supply it instead.
+
+Give credentials to `mfp-mcp-login` only. The server posts `env` credentials on every failed call. The server's form login rarely works against NextAuth.
+
+**macOS Example:**
+
+```json
+{
+  "mcpServers": {
+    "myfitnesspal": {
+      "command": "/Users/yourname/myfitnesspal-mcp-python/venv/bin/python",
+      "args": ["-m", "mfp_mcp.server"]
+    }
+  }
+}
+```
+
+On Linux, use the same `command` and `args`.
+
+#### Option B: Encrypted Credentials, Legacy
+
+Not recommended, for the reasons under Option A. Encrypt your credentials before storing them in the config. See [Encrypted Credentials](#encrypted-credentials) for the setup.
 
 > ⚠️ **Security note**: Encryption only provides meaningful protection if `MFP_SECRET_KEY` is stored **separately** from the config file (e.g., set in your shell profile or OS keychain). Storing the key alongside the encrypted values in the same config file means anyone who obtains the config can still decrypt your credentials.
 
@@ -202,7 +372,9 @@ Encrypt your credentials before storing them in the config file. See [Encrypted 
 }
 ```
 
-#### Option B: With Plain Credentials (No Browser Required)
+#### Option C: Plain Credentials, Legacy
+
+Not recommended. This puts your password in plaintext in the config.
 
 **macOS Example:**
 ```json
@@ -236,20 +408,6 @@ Encrypt your credentials before storing them in the config file. See [Encrypted 
 }
 ```
 
-#### Option C: Without Credentials (Browser Cookie Fallback)
-
-**macOS Example:**
-```json
-{
-  "mcpServers": {
-    "myfitnesspal": {
-      "command": "/Users/yourname/myfitnesspal-mcp-python/venv/bin/python",
-      "args": ["-m", "mfp_mcp.server"]
-    }
-  }
-}
-```
-
 > ⚠️ **Important**: Use **full absolute paths** to the Python executable in your virtual environment. Replace `yourname`/`YourName` with your actual username.
 
 ### Step 3: Restart Claude Desktop
@@ -264,7 +422,7 @@ In Claude Desktop, you should see a hammer icon (🔨) indicating MCP tools are 
 
 ## Authentication Methods
 
-The MCP server supports four authentication methods, tried in this order:
+The server tries four methods, in this order. `mfp-mcp-login` is not one of them. It writes the cookie file that method 2 reads.
 
 ### 1. Environment Variables (Legacy)
 Set `MFP_USERNAME` and `MFP_PASSWORD` in your Claude Desktop config's `env`
@@ -284,60 +442,14 @@ section. You can store them as plain text or encrypted (see below).
 }
 ```
 
-### Encrypted Credentials (Enhanced Security)
+Not recommended. The server posts these on every failed call. Give credentials to `mfp-mcp-login` instead.
 
-Instead of storing plain-text credentials, you can encrypt them using [Fernet symmetric encryption](https://cryptography.io/en/latest/fernet/) from the `cryptography` library. The server decrypts them at runtime using `MFP_SECRET_KEY`.
-
-> ⚠️ **Important**: For encryption to be meaningful, `MFP_SECRET_KEY` must be kept **outside** the Claude Desktop config file. The server resolves it in this order:
-> 1. `MFP_SECRET_KEY` environment variable (shell profile, not the Claude config)
-> 2. OS keychain — service `mfp-mcp`, account `MFP_SECRET_KEY` **(recommended)**
-
-**Step 1 — Generate and store the key in one command:**
-
-```bash
-npm install
-npm run store-key
-```
-
-`store-key` generates a Fernet-compatible key, stores it in the OS keychain (`mfp-mcp` / `MFP_SECRET_KEY`), and prints the key so you can use it in Step 2. See [Key Management CLI](#key-management-cli) for all available flags.
-
-**Step 2 — Encrypt your credentials:**
-
-```python
-from cryptography.fernet import Fernet
-
-key = b"abc123XYZ...=="  # your key from Step 1
-f = Fernet(key)
-
-encrypted_user = f.encrypt(b"your_email@example.com").decode()
-encrypted_pass = f.encrypt(b"your_password").decode()
-
-print("MFP_USERNAME:", encrypted_user)
-print("MFP_PASSWORD:", encrypted_pass)
-```
-
-**Step 3 — Add only the encrypted values to your Claude Desktop config:**
-
-```json
-"env": {
-  "MFP_USERNAME": "gAAAAAB...<encrypted>",
-  "MFP_PASSWORD": "gAAAAAB...<encrypted>"
-}
-```
-
-The key stays in the keychain — it never touches the config file.
-
-**Alternative: shell profile (simpler, still outside the Claude config):**
-
-```bash
-# Add to ~/.zshrc or ~/.bashrc — do NOT put this in claude_desktop_config.json
-export MFP_SECRET_KEY="abc123XYZ...=="
-```
-
-If `MFP_SECRET_KEY` is not found in the environment or keychain, the server treats `MFP_USERNAME` and `MFP_PASSWORD` as plain text (backward compatible).
+The encrypted credentials setup now lives under the login command. See [Encrypted Credentials](#encrypted-credentials).
 
 ### 2. Stored Session Cookies
 After successful authentication, session cookies are saved to `~/.mfp_mcp/cookies.json`. These persist for 30 days, so you won't need to re-authenticate frequently.
+
+`mfp-mcp-login` writes this file too. The server re-reads it on every call.
 
 ### 3. Chromium Browser Auto-Discovery (macOS)
 
@@ -364,10 +476,8 @@ refresh_browser_cookies(browser="firefox") # via browser_cookie3
 ```
 
 ### 4. browser_cookie3 Fallback (Legacy)
-A final fallback uses [`browser_cookie3`](https://pypi.org/project/browser-cookie3/)
-to read Chrome or Firefox cookies from the default profile paths. Useful on
-Linux/Windows or if the macOS auto-discovery path can't access your
-keychain.
+
+A final fallback uses [`browser_cookie3`](https://pypi.org/project/browser-cookie3/). It reads Chrome or Firefox cookies from default profile paths. It may help when macOS auto-discovery cannot reach your keychain. Do not rely on it on Linux. Use `mfp-mcp-login` there.
 
 ## Security Note on Credentials
 
@@ -375,7 +485,7 @@ Your MyFitnessPal credentials in the Claude Desktop config are stored locally on
 
 ### 1. **Encrypt credentials + store the key in the OS keychain**
 
-The strongest option. The ciphertext lives in the config; the key never does. See [Encrypted Credentials](#encrypted-credentials-enhanced-security).
+The strongest option. The ciphertext lives in the config; the key never does. See [Encrypted Credentials](#encrypted-credentials).
 
 ### 2. **Encrypt credentials + export the key in your shell profile**
 
@@ -383,9 +493,7 @@ Still separates key from ciphertext, though the key is on disk.
 
 ### 3. Storing `MFP_PASSWORD` in your MCP client
 
-Storing `MFP_PASSWORD` in your MCP client config puts your MyFitnessPal password in **plaintext
-on disk**, readable by anything running as your user. It is convenient — the server can
-re-authenticate indefinitely — but it is a real tradeoff, not a formality.
+Avoid storing `MFP_PASSWORD` in your MCP client config. It sits there in **plaintext on disk**. Anything running as your user can read it. It also buys little. The server's form login rarely works against NextAuth. Yet the server posts the password on every failed call. Give it to `mfp-mcp-login` instead.
 
 ### 4. Use browser cookies instead (no credentials stored in config at all)
 
@@ -393,11 +501,13 @@ Prefer browser-cookie auth if you would rather not store the password: log into
 myfitnesspal.com and the server reads the session from your browser. The cost is that MFP
 sessions expire, so you will occasionally need to log in again.
 
-Files this server writes to `~/.mfp_mcp/` (directory mode `0700`):
+Files the server and `mfp-mcp-login` write to `~/.mfp_mcp/`. The folder has mode `0700`.
 
 | File | Contents | Mode |
 |------|----------|------|
 | `cookies.json` | Session cookies — full account access, treat as a password | `0600` |
+| `login-attempts.log` | One UTC timestamp per `mfp-mcp-login` submission | `0600` |
+| `login.lock` | Empty lock file, held during an `mfp-mcp-login` run | `0600` |
 
 Note that this server can **modify your diary** — adding food entries and updating goals,
 measurements, and water.
@@ -508,6 +618,7 @@ myfitnesspal-mcp-python/
 └── src/
     └── mfp_mcp/
         ├── __init__.py     # Package initialization
+        ├── login.py        # mfp-mcp-login command
         └── server.py       # MCP server implementation
 ```
 
@@ -526,7 +637,7 @@ source venv/bin/activate
 
 # Upgrade pip and install with dev dependencies
 pip install --upgrade pip
-pip install -e ".[dev]"
+pip install -e ".[dev,login]"
 ```
 
 ### Run Tests
@@ -582,7 +693,7 @@ docker run -it --rm \
 **Solution**: Upgrade pip first:
 ```bash
 pip install --upgrade pip
-pip install -e .
+pip install -e ".[login]"
 ```
 
 ### "Failed to authenticate with MyFitnessPal"
@@ -610,6 +721,24 @@ pip install -e .
    returns "no browser had a session", bring Claude Desktop to the
    foreground and retry so the prompt is visible. Once approved, the key
    is cached and the prompt won't repeat.
+7. On **Linux**, browser auto-discovery does not run. Log in with `mfp-mcp-login` instead. See [The mfp-mcp-login Command](#the-mfp-mcp-login-command). The server uses the new session on its next call.
+
+### `mfp-mcp-login` fails on Linux
+
+**Problem**: The login command exits with a nonzero code.
+
+**Solutions**:
+
+1. Run `mfp-mcp-login --check` first. Exit 0 means the saved session still works.
+2. `display: no Xvfb on PATH`: install Xvfb with the command it prints. On an `apt-get` system, `mfp-mcp-login --install-xvfb` can install it for you.
+3. `chrome: none found on PATH`: install Google Chrome from <https://www.google.com/chrome/>.
+4. `chrome: skipped ... a snap Chromium`: install Google Chrome. The snap is not supported.
+5. `credentials: ... no terminal to prompt on`: run it in a terminal, or export both variables.
+6. `credentials: ... looks encrypted but there is no key`: set `MFP_SECRET_KEY`, or store the key with `npm run store-key`.
+7. `attempts: ... refused`: the attempt window is full. Wait for the time it prints. Or delete the lines it names. To reset it, delete `~/.mfp_mcp/login-attempts.log`.
+8. `lock: another mfp-mcp-login run holds ...`: wait for the other run to end.
+9. Exit 3: MyFitnessPal showed a challenge, lock or limit page. Try again later, and mind the attempt window.
+10. Exit 4 after a login: the new session failed verification. No cookie file was written. Try again later, and mind the attempt window.
 
 ### "No module named 'mfp_mcp'"
 
@@ -617,7 +746,7 @@ pip install -e .
 
 **Solutions**:
 1. Ensure you're using the correct Python from your virtual environment
-2. Reinstall the package: `pip install -e .`
+2. Reinstall the package: `pip install -e ".[login]"`
 3. Verify the path in your Claude Desktop config points to the venv Python:
    ```
    /path/to/project/venv/bin/python  # macOS/Linux
@@ -840,7 +969,8 @@ Get nutrition report over a date range.
 
 ## Security & Privacy
 
-- **Encrypted Credentials**: Credentials can be stored as Fernet-encrypted ciphertext in your config. `MFP_SECRET_KEY` is resolved at runtime from the environment variable first, then the OS keychain (`mfp-mcp` / `MFP_SECRET_KEY`). See [Encrypted Credentials](#encrypted-credentials-enhanced-security) for setup.
+- **Login Command**: `mfp-mcp-login` types credentials only into MyFitnessPal's login page. Its output never prints a credential or a cookie value. Chrome and Xvfb run with no `MFP_*` variable.
+- **Encrypted Credentials**: The server and `mfp-mcp-login` accept Fernet-encrypted credentials. `MFP_SECRET_KEY` comes from the environment first, then the OS keychain. See [Encrypted Credentials](#encrypted-credentials) for setup.
 - **OS Keychain**: Storing `MFP_SECRET_KEY` in the native keychain (macOS Keychain, Windows Credential Vault, Linux Secret Service) means the decryption key never touches the config file or any backup.
 - **Plain Credentials**: If `MFP_SECRET_KEY` is absent from both environment and keychain, `MFP_USERNAME` and `MFP_PASSWORD` are used as-is (backward compatible).
 - **Session Cookies**: After successful authentication, session cookies are cached in `~/.mfp_mcp/cookies.json` (restricted permissions) for 30 days.
