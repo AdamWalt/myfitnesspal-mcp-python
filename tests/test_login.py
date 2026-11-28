@@ -10,7 +10,6 @@ from __future__ import annotations
 
 import base64
 import html
-import importlib.machinery
 import importlib.metadata
 import importlib.util
 import inspect
@@ -19,6 +18,7 @@ import json
 import logging
 import os
 import re
+import select
 import shutil
 import signal
 import socket
@@ -27,6 +27,7 @@ import struct
 import subprocess
 import sys
 import tempfile
+import threading
 import types
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -54,14 +55,15 @@ SPECIAL = 'p@ss w0rd+"<&>'
 # subprocess guard fails any call to one that does not resolve under tmp_path.
 MASKED = frozenset({
     "sudo", "apt", "apt-get", "dpkg", "dpkg-deb", "dnf", "pacman", "pkexec", "snap",
-    "Xvfb", "xauth", "google-chrome", "google-chrome-stable", "chromium", "chromium-browser",
+    "Xvfb", "xauth", "chrome", "google-chrome", "google-chrome-stable", "chromium",
+    "chromium-browser",
 })
 
 # Saved before the fixture replaces them, for tests of the functions themselves.
 ORIG = {
     name: getattr(login, name, None)
-    for name in ("chrome_session", "_spawn", "verify_session", "_has_websockets_sync",
-                 "_kill_leftovers", "_utc_now", "find_xvfb", "find_chrome")
+    for name in ("chrome_session", "_spawn", "verify_session", "_kill_leftovers", "_utc_now",
+                 "find_xvfb", "find_chrome")
 }
 
 
@@ -255,7 +257,6 @@ def _isolate(monkeypatch, tmp_path):
     monkeypatch.setattr(login, "main", main)
     monkeypatch.setattr(login, "run_login", run_login)
 
-    monkeypatch.setattr(login, "_has_websockets_sync", lambda: True, raising=False)
     monkeypatch.setattr(login, "_is_tty", lambda: False, raising=False)
     clock = FakeClock()
     monkeypatch.setattr(login, "_sleep", clock.sleep, raising=False)
@@ -326,6 +327,16 @@ def test_fixture_masks_xauth(monkeypatch):
     monkeypatch.setattr(subprocess, "run", lambda *a, **kw: ran.append(a))
     with pytest.raises(pytest.fail.Exception):
         login.subprocess.run(["xauth", "list"])
+    assert ran == []
+
+
+def test_fixture_masks_chrome(monkeypatch):
+    """A bare `chrome` is never found or run; fake Chrome scripts live under tmp_path."""
+    assert shutil.which("chrome", path=os.environ["PATH"]) is None
+    ran: list = []
+    monkeypatch.setattr(subprocess, "Popen", lambda *a, **kw: ran.append(a))
+    with pytest.raises(pytest.fail.Exception):
+        login.subprocess.Popen(["chrome", "--remote-debugging-pipe"])
     assert ran == []
 
 
@@ -856,18 +867,15 @@ def test_chrome_session_stops_chrome_then_sends_xvfb_sigterm_first(tmp_path, mon
     monkeypatch.setattr(login, "start_xvfb", start_xvfb)
     spawned: list[list[str]] = []
 
-    def spawn(args, env, pass_fds=(), stderr=None):
+    def spawn(args, env, pass_fds=(), stderr=None, **kw):
         spawned.append(args)
         return chrome
 
     monkeypatch.setattr(login, "_spawn", spawn)
-
-    def port(self, timeout=30.0):
-        raise OSError("Chrome exited")
-
-    monkeypatch.setattr(login.ChromeProcess, "port", port)
+    _fail_on_silent_wait(monkeypatch)
+    # No Chrome holds the pipes, so the first command fails and the wait times out.
     session = login.chrome_session("/fake/chrome", Capture().reporter, "/fake/Xvfb", "darwin")
-    with pytest.raises(OSError), session:
+    with pytest.raises(OSError, match="^Chrome did not exit$"), session:
         pass
     assert signals == [(chrome.pid, signal.SIGKILL), (xvfb.pid, signal.SIGTERM),
                        (xvfb.pid, signal.SIGKILL)]
@@ -891,11 +899,12 @@ def test_chrome_args_linux_headed(tmp_path):
     assert not any(a.startswith("--enable-automation") for a in args)
     assert not any(a.startswith("--user-agent") for a in args)
     assert args[1:] == [
-        "--remote-debugging-port=0", "--password-store=basic", "--no-first-run",
+        "--remote-debugging-pipe", "--password-store=basic", "--no-first-run",
         "--no-default-browser-check", f"--user-data-dir={tmp_path / 'profile'}",
         "--disable-blink-features=AutomationControlled", "--window-size=1366,768",
         "--window-position=0,0", "--ozone-platform=x11", "about:blank",
     ]
+    assert not any(a.startswith("--remote-debugging-port") for a in args)
 
 
 def test_chrome_args_macos_off_screen(tmp_path):
@@ -1114,14 +1123,6 @@ def test_library_ua_matches_the_installed_client():
     assert spec is not None and spec.submodule_search_locations
     client = Path(spec.submodule_search_locations[0]) / "client.py"
     assert f'"User-Agent": "{login.LIBRARY_UA}"' in client.read_text(encoding="utf-8")
-
-
-def test_local_http_ignores_proxy_variables():
-    session = login._local_http()
-    try:
-        assert session.trust_env is False
-    finally:
-        session.close()
 
 
 # --- --check age rule -------------------------------------------------------
@@ -1652,7 +1653,7 @@ def test_window_check_comes_before_the_credential_prompt(tmp_path, monkeypatch, 
     assert browser.started == 0
 
 
-def test_window_check_comes_before_the_websockets_check(tmp_path, monkeypatch, capsys):
+def test_full_window_without_websockets_still_exits_6(tmp_path, monkeypatch, capsys):
     browser = _fake_main_browser(monkeypatch, tmp_path, FakePage())
     _hide_websockets(monkeypatch)
     log = _seed_log(tmp_path, [_stamp(timedelta(hours=h)) for h in (1, 2, 3)])
@@ -2271,34 +2272,25 @@ def test_plain_credentials_never_touch_the_keychain(tmp_path, monkeypatch):
     assert (secret_key.calls, keyring_calls.calls) == (0, 0)
 
 
-# --- websockets check ---------------------------------------------------------
+# --- no websockets needed -------------------------------------------------------
 
 
 def _hide_websockets(monkeypatch) -> None:
-    monkeypatch.setattr(login, "_has_websockets_sync", ORIG["_has_websockets_sync"])
-    monkeypatch.setitem(sys.modules, "websockets", None)
-    monkeypatch.setitem(sys.modules, "websockets.sync", None)
+    """An install without websockets: every import of it fails."""
+    for name in ("websockets", "websockets.sync", "websockets.sync.client"):
+        monkeypatch.setitem(sys.modules, name, None)
 
 
-WS_HINT = 'pip install "websockets>=11"'
-
-
-def test_missing_websockets_exits_2_before_any_browser(tmp_path, monkeypatch, capsys):
+@pytest.mark.parametrize("argv", [[], ["--dry-run"]], ids=["login", "dry-run"])
+def test_login_without_websockets_reaches_the_browser(tmp_path, monkeypatch, capsys, argv):
+    """The DevTools pipe needs no websockets, so no setup check stops the run."""
     browser = _fake_main_browser(monkeypatch, tmp_path, FakePage())
     _hide_websockets(monkeypatch)
-    assert login.main([], cookies_file=tmp_path / "c.json") == 2
+    assert login.main(argv, cookies_file=tmp_path / "c.json") == 0
     lines = _lines(capsys)
-    assert lines == ["check: no cookie file", login.msg_no_websockets()]
-    assert WS_HINT in lines[-1]
-    assert browser.started == 0
-
-
-def test_dry_run_without_websockets_exits_2_before_any_browser(tmp_path, monkeypatch, capsys):
-    browser = _fake_main_browser(monkeypatch, tmp_path, FakePage())
-    _hide_websockets(monkeypatch)
-    assert login.main(["--dry-run"], cookies_file=tmp_path / "c.json") == 2
-    assert _lines(capsys) == [login.msg_no_websockets()]
-    assert browser.started == 0
+    assert browser.started == 1
+    assert [line for line in lines if line.startswith("setup:")] == []
+    assert not hasattr(login, "msg_no_websockets")
 
 
 def test_check_runs_without_websockets(tmp_path, monkeypatch, capsys):
@@ -2318,26 +2310,6 @@ def test_valid_session_without_websockets_exits_0(tmp_path, monkeypatch, capsys)
     assert login.main([], cookies_file=target) == 0
     assert _lines(capsys)[-1] == "check: session still valid"
     assert browser.started == 0
-
-
-def _fake_package(name: str, package: bool) -> types.ModuleType:
-    module = types.ModuleType(name)
-    module.__spec__ = importlib.machinery.ModuleSpec(name, None, is_package=package)
-    if package:
-        module.__path__ = []
-    return module
-
-
-def test_websockets_check_needs_the_sync_client(monkeypatch):
-    check = ORIG["_has_websockets_sync"]
-    monkeypatch.setitem(sys.modules, "websockets", _fake_package("websockets", True))
-    monkeypatch.delitem(sys.modules, "websockets.sync", raising=False)
-    monkeypatch.delitem(sys.modules, "websockets.sync.client", raising=False)
-    assert check() is False  # a 10.x install: no `sync` package
-    monkeypatch.setitem(sys.modules, "websockets.sync", _fake_package("websockets.sync", True))
-    monkeypatch.setitem(sys.modules, "websockets.sync.client",
-                        _fake_package("websockets.sync.client", False))
-    assert check() is True
 
 
 # --- packaging ----------------------------------------------------------------
@@ -2381,7 +2353,7 @@ def test_module_imports_with_websockets_hidden(monkeypatch):
 def test_pyproject_declares_the_command_and_the_login_extra():
     project = _load_toml(REPO / "pyproject.toml")["project"]
     assert project["scripts"]["mfp-mcp-login"] == "mfp_mcp.login:main"
-    assert project["optional-dependencies"]["login"] == ["websockets>=11", "requests"]
+    assert project["optional-dependencies"]["login"] == ["requests"]
     base = {_requirement_name(req) for req in project["dependencies"]}
     assert "websockets" not in base
 
@@ -2456,14 +2428,18 @@ def test_signal_inside_the_real_chrome_session_cleans_its_root(tmp_path, monkeyp
     spawned: list[tuple[list[str], dict]] = []
     monkeypatch.setattr(login, "chrome_session", ORIG["chrome_session"])
     monkeypatch.setattr(login, "_kill_leftovers", lambda root, *a: kills.append(Path(root)))
-    monkeypatch.setattr(login, "_spawn", lambda args, env, pass_fds=(): (
+    monkeypatch.setattr(login, "_spawn", lambda args, env, pass_fds=(), **kw: (
         spawned.append((args, env)) or FakeProc()))
 
-    def port(self, timeout=30.0):
-        os.kill(os.getpid(), signal.SIGTERM)
-        return 0
+    class StoppingCDP:
+        def __init__(self, proc, cmd_fd, reply_fd) -> None:
+            self.session_id = None
 
-    monkeypatch.setattr(login.ChromeProcess, "port", port)
+        def call(self, method, params=None, timeout=30.0):
+            os.kill(os.getpid(), signal.SIGTERM)
+            return {}
+
+    monkeypatch.setattr(login, "CDP", StoppingCDP)
     monkeypatch.setattr(login, "find_chrome", lambda platform, path, **kw: "/fake/chrome")
     monkeypatch.setattr(login, "find_xvfb", lambda platform, path, **kw: None)
     monkeypatch.setenv("MFP_USERNAME", EMAIL)
@@ -2604,23 +2580,21 @@ class _RecordingShutil:
         return shutil.rmtree(path, *args, **kwargs)
 
 
-class _SessionHttp:
-    """Chrome's `/json/version` and `/json/list` answers."""
-
-    def get(self, url, timeout=None):
-        if url.endswith("/json/version"):
-            body = {"User-Agent": FakePage.user_agent}
-        else:
-            body = [{"type": "page", "webSocketDebuggerUrl": "ws://127.0.0.1:1/devtools/page/1"}]
-        return types.SimpleNamespace(json=lambda: body)
+STARTUP_ANSWERS = {
+    "Browser.getVersion": {"userAgent": FakePage.user_agent},
+    "Target.getTargets": {"targetInfos": [{"type": "page", "targetId": "T1"}]},
+    "Target.attachToTarget": {"sessionId": "S1"},
+}
 
 
 class _QuietCDP:
-    def __init__(self, ws_url: str) -> None:
-        self.ws_url = ws_url
+    """Chrome's startup answers over the pipe: its version, one page, one session."""
 
-    def close(self) -> None:
-        pass
+    def __init__(self, proc, cmd_fd: int, reply_fd: int) -> None:
+        self.session_id = None
+
+    def call(self, method, params=None, timeout=30.0):
+        return STARTUP_ANSWERS[method]
 
 
 class _StubbornXvfb:
@@ -2649,7 +2623,7 @@ def _main_to_the_end_of_the_session(tmp_path, monkeypatch, page: FakePage,
                                     xproc: _StubbornXvfb | None = None) -> _RecordingShutil:
     """`main` runs the real `chrome_session` through its whole `with` body.
 
-    Chrome, Xvfb, Chrome's HTTP answers and the DevTools socket are fakes.
+    Chrome, Xvfb and Chrome's DevTools answers are fakes.
     A given `xproc` stands in for Xvfb and writes display 9 to its pipe.
     """
     monkeypatch.setattr(login, "chrome_session", ORIG["chrome_session"])
@@ -2661,15 +2635,13 @@ def _main_to_the_end_of_the_session(tmp_path, monkeypatch, page: FakePage,
     monkeypatch.setenv("MFP_USERNAME", EMAIL)
     monkeypatch.setenv("MFP_PASSWORD", PASSWORD)
 
-    def spawn(args, env, pass_fds=(), stderr=None):
+    def spawn(args, env, pass_fds=(), stderr=None, **kw):
         if stderr is None:
             return FakeProc()
         os.write(pass_fds[0], b"9\n")
         return xproc
 
     monkeypatch.setattr(login, "_spawn", spawn)
-    monkeypatch.setattr(login.ChromeProcess, "port", lambda self, timeout=30.0: 9222)
-    monkeypatch.setattr(login, "_local_http", _SessionHttp)
     monkeypatch.setattr(login, "CDP", _QuietCDP)
     monkeypatch.setattr(login, "CDPPage", lambda cdp, user_agent: page)
     recorder = _RecordingShutil()
@@ -2867,7 +2839,7 @@ def test_real_chrome_session_locks_xvfb_with_the_cookie_chrome_holds(
     monkeypatch.setenv("XAUTHORITY", "/srv/u/.Xauthority")
     calls: list[dict] = []
 
-    def spawn(args, env, pass_fds=(), stderr=None):
+    def spawn(args, env, pass_fds=(), stderr=None, **kw):
         auth = Path(args[args.index("-auth") + 1]) if "-auth" in args else None
         held = auth.read_bytes() if auth is not None and auth.is_file() else None
         calls.append({"args": list(args), "env": dict(env), "auth": auth, "held": held,
@@ -2901,6 +2873,572 @@ def test_real_chrome_session_locks_xvfb_with_the_cookie_chrome_holds(
     shown = lines + [text for c in calls for text in (*c["args"], *c["env"].values())]
     for form in _cookie_forms(COOKIE):
         assert [text for text in shown if form in text] == []
+
+
+# --- DevTools over the pipe ------------------------------------------------------
+
+FAKE_UA = "Mozilla/5.0 FakeChrome/158.0.0.0"
+
+# A fake Chrome for the real spawn path. It first checks that fds 3 and 4 are
+# its only fds above 2, read and write in that order, and that it leads its own
+# session. A failed check exits 9. Then it answers each command read on fd 3
+# on fd 4, after one event, and logs each command. `<argv0>.json` sets it up.
+FAKE_CHROME = r'''
+import fcntl, json, os, sys
+
+
+def open_fds():
+    folder = "/proc/self/fd" if os.path.isdir("/proc/self/fd") else "/dev/fd"
+    found = []
+    for name in os.listdir(folder):
+        try:
+            os.fstat(int(name))
+        except OSError:
+            continue  # the listing's own directory fd, closed by now
+        found.append(int(name))
+    return sorted(found)
+
+
+fds = open_fds()
+checks = {
+    "fds": [fd for fd in fds if fd > 2],
+    "modes": [fcntl.fcntl(fd, fcntl.F_GETFL) & os.O_ACCMODE for fd in (3, 4) if fd in fds],
+    "own_session": os.getsid(0) == os.getpid(),
+}
+ok = (checks["fds"] == [3, 4] and checks["modes"] == [os.O_RDONLY, os.O_WRONLY]
+      and checks["own_session"])
+here = sys.argv[0]
+with open(here + ".json", encoding="utf-8") as fh:
+    conf = json.load(fh)
+log = open(here + ".log", "a", encoding="utf-8")
+log.write(json.dumps({"checks": checks, "ok": ok}) + "\n")
+log.flush()
+if not ok:
+    sys.exit(9)
+state = {"polls": 0, "focus": None, "values": {}, "submitted": False}
+
+
+def selector(expr):
+    start = expr.index("querySelector(") + len("querySelector(")
+    return json.JSONDecoder().raw_decode(expr, start)[0]
+
+
+def evaluate(expr):
+    if expr == "document.readyState":
+        return "complete"
+    if "challenges.cloudflare.com" in expr:
+        return True
+    if "onetrust" in expr:
+        return False
+    if "requestSubmit" in expr:
+        state["submitted"] = True
+        return "button"
+    if "innerText" in expr:
+        return "Log in Email Password"
+    if expr.startswith("!!document.querySelector("):
+        return selector(expr) in ("#email", "#password")
+    if "e.focus()" in expr:
+        state["focus"] = selector(expr)
+        return True
+    if ".value || '').length" in expr:
+        text = "" if conf["short_fill"] else state["values"].get(selector(expr), "")
+        return len(text.encode("utf-16-le")) // 2
+    return None
+
+
+def answer(method, params):
+    if method == "Browser.getVersion":
+        return {"product": "FakeChrome/158", "userAgent": conf["user_agent"]}
+    if method == "Target.getTargets":
+        state["polls"] += 1
+        infos = [{"type": "browser", "targetId": "B0"}]
+        if conf["page_after"] is not None and state["polls"] > conf["page_after"]:
+            infos.append({"type": "page", "targetId": "T1"})
+        return {"targetInfos": infos}
+    if method == "Target.attachToTarget":
+        return {"sessionId": "S1"}
+    if method == "Runtime.evaluate":
+        return {"result": {"type": "object", "value": evaluate(params["expression"])}}
+    if method == "Input.insertText":
+        state["values"][state["focus"]] = params["text"]
+        return {}
+    if method == "Network.getAllCookies":
+        return {"cookies": conf["cookies"] if state["submitted"] else conf["cookies"][1:]}
+    return {}
+
+
+def send(msg):
+    data = json.dumps(msg).encode("utf-8") + b"\0"
+    while data:
+        data = data[os.write(4, data):]
+
+
+buf = b""
+while True:
+    chunk = os.read(3, 65536)
+    if not chunk:
+        break
+    buf += chunk
+    while b"\0" in buf:
+        raw, _, buf = buf.partition(b"\0")
+        msg = json.loads(raw)
+        log.write(json.dumps(msg) + "\n")
+        log.flush()
+        reply = {"id": msg["id"], "result": answer(msg["method"], msg.get("params", {}))}
+        if "sessionId" in msg:
+            reply["sessionId"] = msg["sessionId"]
+        send({"method": "Target.targetInfoChanged", "params": {}})
+        send(reply)
+'''
+
+# A fake Xvfb: it needs its cookie file, writes display 9, then waits for SIGTERM.
+FAKE_XVFB = r'''
+import os, signal, sys
+
+args = sys.argv
+fd = int(args[args.index("-displayfd") + 1])
+if not os.path.isfile(args[args.index("-auth") + 1]):
+    sys.exit(8)
+os.write(fd, b"9\n")
+os.close(fd)
+while True:
+    signal.pause()
+'''
+
+
+def _script(path: Path, source: str) -> Path:
+    path.write_text(f"#!{sys.executable}\n{source}", encoding="utf-8")
+    path.chmod(0o755)
+    return path
+
+
+def _fake_chrome(tmp_path: Path, page_after: int | None = 0, short_fill: bool = False) -> Path:
+    """The fake Chrome script. Its first `page_after` target polls list no page."""
+    chrome = _script(tmp_path / "chrome", FAKE_CHROME)
+    conf = {"user_agent": FAKE_UA, "page_after": page_after, "short_fill": short_fill,
+            "cookies": RAW_COOKIES}
+    Path(f"{chrome}.json").write_text(json.dumps(conf), encoding="utf-8")
+    return chrome
+
+
+def _chrome_log(chrome: Path) -> tuple[dict, list[dict]]:
+    """The fake's own checks, then every command it read, in order."""
+    entries = [json.loads(line) for line in
+               Path(f"{chrome}.log").read_text(encoding="utf-8").splitlines()]
+    return entries[0], entries[1:]
+
+
+CHECKS_OK = {"checks": {"fds": [3, 4], "modes": [os.O_RDONLY, os.O_WRONLY], "own_session": True},
+             "ok": True}
+
+
+class _PollClock(FakeClock):
+    def __init__(self) -> None:
+        super().__init__()
+        self.sleeps: list[float] = []
+
+    def sleep(self, s: float) -> None:
+        self.sleeps.append(s)
+        super().sleep(s)
+
+
+def _fail_on_silent_wait(monkeypatch) -> None:
+    """A real `select` that fails the test when it sees nothing.
+
+    The fixture's clock moves only on `_sleep`, so a pipe that stays silent
+    would otherwise keep a DevTools call waiting forever.
+    """
+    real_select = select.select
+
+    def wait(rlist, wlist, xlist, timeout=None):
+        ready = real_select(rlist, wlist, xlist, timeout)
+        if not any(ready):
+            pytest.fail(f"a {timeout}s wait saw nothing: a fake went silent")
+        return ready
+
+    monkeypatch.setattr(login, "select", types.SimpleNamespace(select=wait))
+
+
+def _main_with_fake_chrome(tmp_path, monkeypatch, chrome: Path,
+                           xvfb: Path | None = None) -> _PollClock:
+    """`main` runs the real `chrome_session` and the real spawn on fake scripts.
+
+    The clock moves only on `_sleep`. A wait that sees nothing fails the test,
+    so a fake that goes silent can never hang it.
+    """
+    clock = _PollClock()
+    monkeypatch.setattr(login, "_monotonic", clock.monotonic)
+    monkeypatch.setattr(login, "_sleep", clock.sleep)
+    _fail_on_silent_wait(monkeypatch)
+    monkeypatch.setattr(login, "chrome_session", ORIG["chrome_session"])
+    monkeypatch.setattr(login, "_spawn", ORIG["_spawn"])
+    monkeypatch.setattr(login, "_platform", lambda: "linux")
+    monkeypatch.setattr(login, "find_chrome", lambda platform, path, **kw: str(chrome))
+    monkeypatch.setattr(login, "find_xvfb",
+                        lambda platform, path, **kw: str(xvfb) if xvfb else None)
+    monkeypatch.setattr(login, "verify_session", _ok_verify)
+    monkeypatch.setenv("MFP_USERNAME", EMAIL)
+    monkeypatch.setenv("MFP_PASSWORD", PASSWORD)
+    return clock
+
+
+class _Pipes:
+    """Real pipes for a `CDP`. The test holds Chrome's ends. Teardown closes the rest."""
+
+    def __init__(self) -> None:
+        self.open: list[int] = []
+
+    def pipe(self) -> tuple[int, int]:
+        read, write = os.pipe()
+        self.open += [read, write]
+        return read, write
+
+    def close(self, fd: int) -> None:
+        self.open.remove(fd)
+        os.close(fd)
+
+
+@pytest.fixture
+def pipes():
+    held = _Pipes()
+    yield held
+    while held.open:
+        os.close(held.open.pop())
+
+
+class _ChromeProc:
+    """A Chrome stand-in for `CDP`. `wait` gives `code`, or times out when it is None."""
+
+    def __init__(self, code: int | None = None, polled: int | None = None) -> None:
+        self.code = code
+        self.polled = polled
+        self.waits: list[float | None] = []
+
+    def poll(self):
+        return self.polled
+
+    def wait(self, timeout=None):
+        self.waits.append(timeout)
+        if self.code is None:
+            raise subprocess.TimeoutExpired("chrome", timeout)
+        return self.code
+
+
+def _sent(fd: int) -> list[dict]:
+    raw = os.read(fd, 1 << 16)
+    assert raw.endswith(b"\0")
+    return [json.loads(part) for part in raw[:-1].split(b"\0")]
+
+
+def test_cdp_splits_replies_on_nul_across_reads(pipes, monkeypatch):
+    """Two writes: a reply, an event and half a reply, then the other half."""
+    cmd_read, cmd_write = pipes.pipe()
+    reply_read, reply_write = pipes.pipe()
+    cdp = login.CDP(_ChromeProc(), cmd_write, reply_read)
+    chunks = [b'{"id":1,"result":{}}\0{"method":"x"}\0{"id":2,', b'"result":{"v":1}}\0']
+    real_select = select.select
+    waits: list[float] = []
+
+    def feed(rlist, wlist, xlist, timeout=None):
+        waits.append(timeout)
+        if not chunks:
+            pytest.fail("a read past the last write")
+        os.write(reply_write, chunks.pop(0))
+        return real_select(rlist, wlist, xlist, timeout)
+
+    monkeypatch.setattr(login, "select", types.SimpleNamespace(select=feed))
+    assert cdp.call("A.one") == {}
+    assert cdp.call("A.two", {"k": 1}) == {"v": 1}
+    assert len(waits) == 2
+    assert _sent(cmd_read) == [{"id": 1, "method": "A.one", "params": {}},
+                               {"id": 2, "method": "A.two", "params": {"k": 1}}]
+
+
+def test_cdp_sends_the_session_id_once_attached_and_raises_chrome_errors(pipes):
+    cmd_read, cmd_write = pipes.pipe()
+    reply_read, reply_write = pipes.pipe()
+    os.write(reply_write, b'{"id":1,"result":{"ok":true}}\0'
+                          b'{"id":2,"sessionId":"S1","result":{"ok":true}}\0'
+                          b'{"id":3,"sessionId":"S1","error":{"code":-32000,"message":"boom"}}\0')
+    cdp = login.CDP(_ChromeProc(), cmd_write, reply_read)
+    assert cdp.call("Browser.getVersion") == {"ok": True}
+    cdp.session_id = "S1"
+    assert cdp.call("Runtime.evaluate", {"expression": "1"}) == {"ok": True}
+    with pytest.raises(login.CDPError, match="^DevTools Page.navigate failed: boom$"):
+        cdp.call("Page.navigate", {"url": "about:blank"})
+    assert _sent(cmd_read) == [
+        {"id": 1, "method": "Browser.getVersion", "params": {}},
+        {"id": 2, "method": "Runtime.evaluate", "params": {"expression": "1"}, "sessionId": "S1"},
+        {"id": 3, "method": "Page.navigate", "params": {"url": "about:blank"}, "sessionId": "S1"},
+    ]
+
+
+def test_cdp_writes_every_byte_of_a_command(pipes, monkeypatch):
+    cmd_read, cmd_write = pipes.pipe()
+    reply_read, reply_write = pipes.pipe()
+    os.write(reply_write, b'{"id":1,"result":{}}\0')
+    real_write = os.write
+    sizes: list[int] = []
+
+    def short_write(fd, data):
+        sizes.append(real_write(fd, bytes(data[:3])))
+        return sizes[-1]
+
+    monkeypatch.setattr(login.os, "write", short_write)
+    cdp = login.CDP(_ChromeProc(), cmd_write, reply_read)
+    assert cdp.call("Input.insertText", {"text": "x" * 40}) == {}
+    assert _sent(cmd_read) == [{"id": 1, "method": "Input.insertText", "params": {"text": "x" * 40}}]
+    assert len(sizes) > 10 and set(sizes) == {3} | {sizes[-1]}
+
+
+def test_cdp_silent_reply_pipe_times_out_on_the_clock(pipes, monkeypatch):
+    _, cmd_write = pipes.pipe()
+    reply_read, _ = pipes.pipe()
+    clock = FakeClock()
+    monkeypatch.setattr(login, "_monotonic", clock.monotonic)
+    waits: list[float] = []
+
+    def silent(rlist, wlist, xlist, timeout=None):
+        waits.append(timeout)
+        clock.t += timeout
+        return [], [], []
+
+    monkeypatch.setattr(login, "select", types.SimpleNamespace(select=silent))
+    proc = _ChromeProc()
+    cdp = login.CDP(proc, cmd_write, reply_read)
+    with pytest.raises(TimeoutError, match="^DevTools Page.navigate timed out$"):
+        cdp.call("Page.navigate", timeout=7.5)
+    assert 7.5 <= clock.t <= 7.5 + 1.0
+    assert max(waits) <= login.CDP_POLL == 1.0
+    assert proc.waits == []
+
+
+@pytest.mark.parametrize("code, text", [(7, "Chrome exited with code 7"),
+                                        (None, "Chrome did not exit")],
+                         ids=["exits-7", "never-exits"])
+@pytest.mark.parametrize("end", ["reply-eof", "command-epipe", "dead-poll"])
+def test_cdp_maps_a_closed_pipe_to_chrome_exit(pipes, monkeypatch, end, code, text):
+    """EOF, a broken command pipe or a dead poll: the code comes from a 5 second wait."""
+    cmd_read, cmd_write = pipes.pipe()
+    reply_read, reply_write = pipes.pipe()
+    proc = _ChromeProc(code)
+    if end == "reply-eof":
+        pipes.close(reply_write)
+    elif end == "command-epipe":
+        pipes.close(cmd_read)
+    else:
+        proc.polled = 7
+        clock = FakeClock()
+        monkeypatch.setattr(login, "_monotonic", clock.monotonic)
+
+        def silent(rlist, wlist, xlist, timeout=None):
+            clock.t += timeout
+            return [], [], []
+
+        monkeypatch.setattr(login, "select", types.SimpleNamespace(select=silent))
+    cdp = login.CDP(proc, cmd_write, reply_read)
+    with pytest.raises(OSError) as err:
+        cdp.call("Browser.getVersion")
+    assert type(err.value) is OSError
+    assert str(err.value) == text
+    assert proc.waits == [5.0]
+    assert login.CHROME_EXIT_WAIT == 5.0
+    if end == "command-epipe":
+        assert isinstance(err.value.__cause__, BrokenPipeError)
+
+
+def test_fake_chrome_over_the_pipe_logs_in_without_websockets(tmp_path, monkeypatch, capsys):
+    """The whole login through `main`, on the real spawn path, with websockets gone."""
+    _hide_websockets(monkeypatch)
+    chrome = _fake_chrome(tmp_path)
+    clock = _main_with_fake_chrome(tmp_path, monkeypatch, chrome)
+    agents: list[str] = []
+    threads: list[int] = []
+
+    def verify(cookies, ua):
+        agents.append(ua)
+        return True, "ok"
+
+    def sleep(s):
+        threads.append(threading.active_count())
+        clock.sleep(s)
+
+    monkeypatch.setattr(login, "verify_session", verify)
+    monkeypatch.setattr(login, "_sleep", sleep)
+    before = threading.active_count()
+    assert login.main(["--dry-run"], cookies_file=tmp_path / "c.json") == 0
+    lines = _lines(capsys)
+    checks, sent = _chrome_log(chrome)
+    assert checks == CHECKS_OK
+    assert [m["method"] for m in sent[:4]] == ["Browser.getVersion", "Target.getTargets",
+                                              "Target.attachToTarget", "Page.navigate"]
+    assert sent[2]["params"] == {"targetId": "T1", "flatten": True}
+    assert [m["method"] for m in sent[:3] if "sessionId" in m] == []
+    assert [m["method"] for m in sent[3:] if m.get("sessionId") != "S1"] == []
+    assert [m["params"] for m in sent if m["method"] == "Input.insertText"] == [
+        {"text": EMAIL}, {"text": PASSWORD}]
+    expressions = [m["params"]["expression"] for m in sent if m["method"] == "Runtime.evaluate"]
+    assert [e for e in expressions if PASSWORD in e or EMAIL in e] == []
+    assert agents == [FAKE_UA, login.LIBRARY_UA]
+    assert login.msg_browser_started("an off-screen window") in lines
+    assert [line for line in lines if line.startswith("error")] == []
+    assert lines[-1] == login.msg_dry_run(2)
+    assert sys.modules["websockets"] is None
+    assert threads and set(threads) == {before}
+    assert _roots_left(tmp_path) == []
+
+
+def test_page_target_found_on_the_third_poll_gets_attached(tmp_path, monkeypatch, capsys):
+    chrome = _fake_chrome(tmp_path, page_after=2)
+    clock = _main_with_fake_chrome(tmp_path, monkeypatch, chrome)
+    assert login.main(["--dry-run"], cookies_file=tmp_path / "c.json") == 0
+    _, sent = _chrome_log(chrome)
+    assert [m["method"] for m in sent[:5]] == [
+        "Browser.getVersion", "Target.getTargets", "Target.getTargets", "Target.getTargets",
+        "Target.attachToTarget"]
+    assert sent[4]["params"] == {"targetId": "T1", "flatten": True}
+    assert clock.sleeps[:3] == [0.2, 0.2, 2.0]
+    assert login.PAGE_POLL == 0.2
+    assert _lines(capsys)[-1] == login.msg_dry_run(2)
+
+
+def test_chrome_that_never_lists_a_page_exits_5(tmp_path, monkeypatch, capsys):
+    chrome = _fake_chrome(tmp_path, page_after=None)
+    clock = _main_with_fake_chrome(tmp_path, monkeypatch, chrome)
+    assert login.main(["--dry-run"], cookies_file=tmp_path / "c.json") == 5
+    lines = _lines(capsys)
+    assert lines[-1] == login.msg_error(OSError("Chrome opened no page"))
+    assert login.msg_unexpected(OSError()) not in lines
+    _, sent = _chrome_log(chrome)
+    methods = [m["method"] for m in sent]
+    assert "Target.attachToTarget" not in methods
+    assert methods.count("Target.getTargets") == len(clock.sleeps)
+    assert set(clock.sleeps) == {0.2}
+    assert clock.t == pytest.approx(login.CHROME_START_TIMEOUT, abs=login.PAGE_POLL)
+    assert login.CHROME_START_TIMEOUT == 30.0
+    assert _roots_left(tmp_path) == []
+
+
+def test_chrome_that_exits_before_a_reply_reads_its_code_every_time(tmp_path, monkeypatch,
+                                                                     capsys):
+    chrome = tmp_path / "chrome"
+    chrome.write_text("#!/bin/sh\nexit 7\n", encoding="utf-8")
+    chrome.chmod(0o755)
+    _main_with_fake_chrome(tmp_path, monkeypatch, chrome)
+    want = login.msg_error(OSError("Chrome exited with code 7"))
+    for _ in range(20):
+        assert login.main(["--dry-run"], cookies_file=tmp_path / "c.json") == 5
+        lines = _lines(capsys)
+        assert [line for line in lines if line.startswith("error")] == [want]
+        assert lines[-1] == want
+    assert _roots_left(tmp_path) == []
+
+
+def test_chrome_path_that_cannot_exec_ends_with_code_255(tmp_path, monkeypatch, capsys):
+    """The child closes the exec-error pipe, so a failed exec reads as exit 255."""
+    chrome = tmp_path / "chrome"
+    chrome.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    chrome.chmod(0o644)
+    _main_with_fake_chrome(tmp_path, monkeypatch, chrome)
+    want = login.msg_error(OSError("Chrome exited with code 255"))
+    for _ in range(20):
+        assert login.main(["--dry-run"], cookies_file=tmp_path / "c.json") == 5
+        lines = _lines(capsys)
+        assert [line for line in lines if line.startswith("error")] == [want]
+        assert [line for line in lines if "Broken pipe" in line] == []
+    assert _roots_left(tmp_path) == []
+
+
+# Run in a fresh Python: it places the two child ends on the fd numbers given,
+# before any import can take them, then spawns the fake Chrome through
+# `ChromeProcess` and makes one call.
+CHILD_SPAWN = r'''
+import fcntl, json, os, sys
+from pathlib import Path
+
+src, chrome, root, wanted = sys.argv[1], sys.argv[2], Path(sys.argv[3]), json.loads(sys.argv[4])
+for fd in wanted.values():
+    try:
+        os.fstat(fd)
+    except OSError:
+        continue
+    sys.exit(f"fd {fd} is already open")
+
+
+def placed_pipe(name):
+    ends = []
+    for fd in os.pipe():
+        ends.append(fcntl.fcntl(fd, fcntl.F_DUPFD_CLOEXEC, 20))
+        os.close(fd)
+    read, write = ends
+    child = read if name == "cmd" else write
+    os.dup2(child, wanted[name], inheritable=False)
+    os.close(child)
+    return (wanted[name], write) if name == "cmd" else (read, wanted[name])
+
+
+ready = [placed_pipe("cmd"), placed_pipe("reply")]
+sys.path.insert(0, src)
+from mfp_mcp import login
+
+real_pipe = os.pipe
+os.pipe = lambda: ready.pop(0) if ready else real_pipe()  # then Popen's own pipe
+fds = []
+browser = login.ChromeProcess(chrome, root, dict(os.environ), "linux", fds)
+cdp = login.CDP(browser.proc, browser.cmd_fd, browser.reply_fd)
+agent = cdp.call("Browser.getVersion", timeout=20)["userAgent"]
+for fd in fds:
+    os.close(fd)
+print(json.dumps({"left": ready, "agent": agent, "code": browser.proc.wait(timeout=20)}))
+'''
+
+
+@pytest.mark.parametrize("wanted", [
+    {"cmd": 4, "reply": 3}, {"cmd": 3, "reply": 30}, {"cmd": 31, "reply": 3}, {"cmd": 3, "reply": 4},
+], ids=["swapped", "command-end-on-3", "reply-end-on-3", "in-place"])
+def test_pipe_ends_reach_3_and_4_wherever_the_parent_holds_them(tmp_path, wanted):
+    chrome = _fake_chrome(tmp_path)
+    root = tmp_path / "root"
+    root.mkdir()
+    out = subprocess.run(
+        [sys.executable, "-c", CHILD_SPAWN, str(REPO / "src"), str(chrome), str(root),
+         json.dumps(wanted)],
+        capture_output=True, text=True, timeout=120, env=dict(os.environ), check=False,
+    )
+    assert out.returncode == 0, out.stderr[-1500:]
+    assert json.loads(out.stdout) == {"left": [], "agent": FAKE_UA, "code": 0}
+    checks, sent = _chrome_log(chrome)
+    assert checks == CHECKS_OK
+    assert [m["method"] for m in sent] == ["Browser.getVersion"]
+
+
+@pytest.mark.skipif(not Path("/proc/self/fd").is_dir(), reason="no /proc/self/fd here")
+@pytest.mark.parametrize("outcome, code", [("normal", 0), ("login-error", 5), ("sigint", 130)],
+                         ids=["normal-exit", "login-error", "sigint"])
+def test_real_session_closes_every_fd_it_opens(tmp_path, monkeypatch, capsys, outcome, code):
+    """Chrome's pipes, Xvfb's display fd and the X cookie file, on every way out."""
+    chrome = _fake_chrome(tmp_path, short_fill=outcome == "login-error")
+    xvfb = _script(tmp_path / "Xvfb", FAKE_XVFB)
+    clock = _main_with_fake_chrome(tmp_path, monkeypatch, chrome, xvfb)
+    if outcome == "sigint":
+        def sleep(s):
+            clock.sleep(s)
+            os.kill(os.getpid(), signal.SIGINT)
+
+        monkeypatch.setattr(login, "_sleep", sleep)
+    before = sorted(os.listdir("/proc/self/fd"))
+    assert login.main(["--dry-run"], cookies_file=tmp_path / "c.json") == code
+    assert sorted(os.listdir("/proc/self/fd")) == before
+    lines = _lines(capsys)
+    checks, sent = _chrome_log(chrome)
+    assert checks == CHECKS_OK
+    assert [m["method"] for m in sent[3:] if m.get("sessionId") != "S1"] == []
+    assert login.msg_browser_started("Xvfb :9") in lines
+    last = {"normal": login.msg_dry_run(2), "login-error": login.msg_fill_failed(),
+            "sigint": login.msg_stopped(signal.SIGINT)}[outcome]
+    assert last in lines[-2:]
+    assert _roots_left(tmp_path) == []
+
 
 
 # --- platform, discovery order -------------------------------------------------
@@ -3129,7 +3667,6 @@ MESSAGE_CALLS = {
     "msg_credential_missing": lambda f: f("MFP_PASSWORD"),
     "msg_credential_no_key": lambda f: f("MFP_PASSWORD"),
     "msg_credential_bad_token": lambda f: f("MFP_PASSWORD"),
-    "msg_no_websockets": lambda f: f(),
     "msg_windows": lambda f: f(),
     "msg_macos_experimental": lambda f: f(),
     "msg_no_chrome": lambda f: f("linux"),

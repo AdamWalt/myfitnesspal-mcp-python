@@ -21,7 +21,12 @@ finds. With `--install-xvfb`, `apt-get` on PATH and a terminal, it runs
 `sudo apt-get install xvfb` itself, so apt asks for consent. On macOS the
 window opens off-screen; that path is experimental and was never run live. On
 Windows the command exits 2: run it under WSL2, where the Linux steps apply.
-The browser login needs `websockets>=11`.
+
+Chrome speaks DevTools over two pipes, never a TCP port, so no other local
+user can reach it. It reads commands on fd 3 and writes replies on fd 4. The
+child closes every other fd before exec, the pipe `subprocess` reports exec
+errors on included, so a Chrome that cannot start shows as exit code 255.
+`find_chrome` returns only an executable.
 
 Chrome and Xvfb are found before any credential prompt, so a missing tool
 fails before a password is typed.
@@ -44,7 +49,7 @@ Exit codes:
     0      session saved, verified in dry-run, or still valid
     2      setup error: bad usage, Windows, a missing or undecryptable
            credential, no Chrome, no Xvfb, a failed Xvfb install or start,
-           no `websockets>=11`, or another run holds the lock
+           or another run holds the lock
     3      captcha, Turnstile that never clears, lock or rate-limit page
     4      session fails verification, or the saved file is too old
     5      any other page after the submission, a timeout, or an unexpected error
@@ -58,8 +63,6 @@ the password prompt to the terminal. Neither holds a secret. The apt install
 that `--install-xvfb` runs writes to the terminal directly.
 
 Known limits:
-    - The DevTools port listens on loopback. Any local user can reach it
-      during a run.
     - Consent banners inside an iframe are not dismissed.
     - The timeouts are 30 seconds for the form and Turnstile, and 60 seconds
       for the session cookie.
@@ -71,7 +74,6 @@ from __future__ import annotations
 import argparse
 import getpass
 import html
-import importlib.util
 import json
 import logging
 import os
@@ -85,7 +87,7 @@ import sys
 import tempfile
 import time
 from collections.abc import Callable, Iterable, Iterator
-from contextlib import ExitStack, contextmanager
+from contextlib import contextmanager, suppress
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, NoReturn, Protocol
@@ -133,6 +135,14 @@ XAUTH_FAMILY_WILD = 65535
 XAUTH_PROTOCOL = b"MIT-MAGIC-COOKIE-1"
 XAUTH_COOKIE_LEN = 16
 XVFB_TAIL_LINES = 5
+# Chrome's startup: a page target within 30 seconds, polled every 0.2 seconds.
+CHROME_START_TIMEOUT = 30.0
+PAGE_POLL = 0.2
+# The longest single wait on the reply pipe, so a dead Chrome is seen soon.
+CDP_POLL = 1.0
+CDP_READ_BYTES = 65536
+# How long a Chrome that closed its pipe gets to exit, so its code can be read.
+CHROME_EXIT_WAIT = 5.0
 TEMP_PREFIX = "mfp-login-"
 
 EMAIL_SEL = "#email"
@@ -229,10 +239,6 @@ def msg_credential_no_key(key: str) -> str:
 
 def msg_credential_bad_token(key: str) -> str:
     return f"credentials: {key} is a bad token, it failed to decrypt with the key found"
-
-
-def msg_no_websockets() -> str:
-    return 'setup: the browser login needs websockets>=11, run: pip install "websockets>=11"'
 
 
 def msg_windows() -> str:
@@ -690,7 +696,7 @@ def chrome_args(chrome: str, user_data_dir: Path, platform: str) -> list[str]:
     """Headed Chrome with its own user agent. Never `--enable-automation`."""
     args = [
         chrome,
-        "--remote-debugging-port=0",
+        "--remote-debugging-pipe",
         "--password-store=basic",
         "--no-first-run",
         "--no-default-browser-check",
@@ -1140,35 +1146,81 @@ def login_flow(
 
 
 class CDP:
-    """Minimal synchronous DevTools client over one target websocket."""
+    """Minimal synchronous DevTools client over Chrome's two pipes.
 
-    def __init__(self, ws_url: str, timeout: float = 30.0) -> None:
-        from websockets.sync.client import connect
+    Commands go out on `cmd_fd` and replies and events come in on `reply_fd`.
+    Each message is one JSON text ended by a NUL byte, both ways. Once
+    `session_id` is set, every command carries it, so it reaches that page.
+    The caller owns both fds and closes them.
 
-        # Entered as a context manager: a bare connect() is deprecated in websockets 15+.
-        self._stack = ExitStack()
-        self._ws = self._stack.enter_context(connect(ws_url, max_size=None, open_timeout=timeout))
+    A closed pipe or a dead `proc` raises `OSError` with Chrome's exit code.
+    """
+
+    def __init__(self, proc: subprocess.Popen[bytes], cmd_fd: int, reply_fd: int) -> None:
+        self._proc = proc
+        self._cmd_fd = cmd_fd
+        self._reply_fd = reply_fd
+        self._buf = b""
         self._id = 0
+        self.session_id: str | None = None
+
+    def _exited(self) -> OSError:
+        """Chrome's exit as an `OSError`, with the code from a wait.
+
+        A bare `poll` can still read `None` just after the pipe closed.
+        """
+        try:
+            code = self._proc.wait(timeout=CHROME_EXIT_WAIT)
+        except subprocess.TimeoutExpired:
+            return OSError("Chrome did not exit")
+        return OSError(f"Chrome exited with code {code}")
+
+    def _send(self, msg: dict[str, Any]) -> None:
+        view = memoryview(json.dumps(msg).encode("utf-8") + b"\0")
+        while view:
+            try:
+                written = os.write(self._cmd_fd, view)
+            except BrokenPipeError as e:
+                raise self._exited() from e
+            view = view[written:]
+
+    def _next(self, method: str, deadline: float) -> dict[str, Any]:
+        """The next whole message on the reply pipe, waiting until `deadline`."""
+        while b"\0" not in self._buf:
+            remaining = deadline - _monotonic()
+            if remaining <= 0:
+                raise TimeoutError(f"DevTools {method} timed out")
+            ready, _, _ = select.select([self._reply_fd], [], [], min(remaining, CDP_POLL))
+            if not ready:
+                if self._proc.poll() is not None:
+                    raise self._exited()
+                continue
+            chunk = os.read(self._reply_fd, CDP_READ_BYTES)
+            if not chunk:
+                raise self._exited()
+            self._buf += chunk
+        raw, _, self._buf = self._buf.partition(b"\0")
+        message: dict[str, Any] = json.loads(raw)
+        return message
 
     def call(
         self, method: str, params: dict[str, Any] | None = None, timeout: float = 30.0
     ) -> dict[str, Any]:
         self._id += 1
         mid = self._id
-        self._ws.send(json.dumps({"id": mid, "method": method, "params": params or {}}))
-        deadline = time.monotonic() + timeout
+        msg: dict[str, Any] = {"id": mid, "method": method, "params": params or {}}
+        if self.session_id is not None:
+            msg["sessionId"] = self.session_id
+        self._send(msg)
+        deadline = _monotonic() + timeout
         while True:
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                raise TimeoutError(f"DevTools {method} timed out")
-            msg = json.loads(self._ws.recv(timeout=remaining))
-            if msg.get("id") == mid:
-                if "error" in msg:
-                    raise CDPError(f"DevTools {method} failed: {msg['error'].get('message', '')}")
-                return msg.get("result", {})
-
-    def close(self) -> None:
-        self._stack.close()
+            reply = self._next(method, deadline)
+            # Events and other replies carry no matching id; they are dropped.
+            if reply.get("id") == mid:
+                if "error" in reply:
+                    raise CDPError(f"DevTools {method} failed: {reply['error'].get('message', '')}")
+                result: dict[str, Any] = reply.get("result", {})
+                return result
 
 
 CONSENT_JS = r"""
@@ -1296,19 +1348,18 @@ class CDPPage:
         return bool(self._eval(FORM_JS, "shows_form"))
 
 
-def _local_http() -> requests.Session:
-    """A session for the local DevTools endpoint. It ignores proxy variables."""
-    s = requests.Session()
-    s.trust_env = False
-    return s
-
-
 def _spawn(
-    args: list[str], env: dict[str, str], pass_fds: tuple[int, ...] = (), stderr: Any = None
+    args: list[str],
+    env: dict[str, str],
+    pass_fds: tuple[int, ...] = (),
+    stderr: Any = None,
+    preexec_fn: Callable[[], None] | None = None,
+    close_fds: bool = True,
 ) -> subprocess.Popen[bytes]:
     """Start a process in its own group, so one killpg takes all its children.
 
-    stderr goes to `stderr` when given, else nowhere.
+    stderr goes to `stderr` when given, else nowhere. `preexec_fn` runs in the
+    child before exec, and with `close_fds` off it closes fds itself.
     """
     return subprocess.Popen(
         args,
@@ -1318,6 +1369,8 @@ def _spawn(
         stderr=subprocess.DEVNULL if stderr is None else stderr,
         pass_fds=pass_fds,
         start_new_session=True,
+        preexec_fn=preexec_fn,  # noqa: PLW1509 - the login runs in one thread
+        close_fds=close_fds,
     )
 
 
@@ -1399,24 +1452,46 @@ def start_xvfb(
 
 
 class ChromeProcess:
-    """One headed Chrome in its own process group, with HOME and TMPDIR in `root`."""
+    """One headed Chrome in its own process group, with HOME and TMPDIR in `root`.
 
-    def __init__(self, chrome: str, root: Path, env: dict[str, str], platform: str) -> None:
+    Chrome speaks DevTools on two pipes. It reads commands on fd 3 and writes
+    replies on fd 4. `cmd_fd` and `reply_fd` are this side's ends. They go into
+    `fds` as soon as they exist, so the caller's cleanup closes them on every
+    path. The child's ends are closed here once Chrome holds its copies.
+    """
+
+    def __init__(
+        self, chrome: str, root: Path, env: dict[str, str], platform: str, fds: list[int]
+    ) -> None:
+        # Imported here, before the fork: an import in the forked child can deadlock.
+        import fcntl
+
         self.user_data_dir = root / "profile"
-        self.proc = _spawn(chrome_args(chrome, self.user_data_dir, platform), env)
+        child: list[int] = []
+        try:
+            cmd_read, cmd_write = os.pipe()
+            child.append(cmd_read)
+            fds.append(cmd_write)
+            reply_read, reply_write = os.pipe()
+            fds.append(reply_read)
+            child.append(reply_write)
+            self.cmd_fd, self.reply_fd = cmd_write, reply_read
 
-    def port(self, timeout: float = 30.0) -> int:
-        marker = self.user_data_dir / "DevToolsActivePort"
-        deadline = time.monotonic() + timeout
-        while time.monotonic() < deadline:
-            if self.proc.poll() is not None:
-                raise OSError(f"Chrome exited with code {self.proc.returncode}")
-            if marker.is_file():
-                first = marker.read_text(encoding="utf-8").splitlines()[:1]
-                if first and first[0].strip().isdigit():
-                    return int(first[0])
-            time.sleep(0.2)
-        raise TimeoutError("DevToolsActivePort never appeared")
+            def map_pipes() -> None:
+                # In the child, before exec. Copy both ends above 4 first, so an end
+                # that already sits on 3 or 4 is never overwritten before it moves.
+                # dup2 clears close-on-exec on 3 and 4. Then every fd above 4 goes.
+                cmd = fcntl.fcntl(cmd_read, fcntl.F_DUPFD, 5)
+                reply = fcntl.fcntl(reply_write, fcntl.F_DUPFD, 5)
+                os.dup2(cmd, 3)
+                os.dup2(reply, 4)
+                os.closerange(5, os.sysconf("SC_OPEN_MAX"))
+
+            self.proc = _spawn(chrome_args(chrome, self.user_data_dir, platform), env,
+                               preexec_fn=map_pipes, close_fds=False)
+        finally:
+            for fd in child:
+                os.close(fd)
 
     def kill(self) -> None:
         _kill_group(self.proc)
@@ -1483,6 +1558,29 @@ def _run_held(cleanup: Callable[[], None], old_mask: Iterable[int] | None) -> No
             raise pending
 
 
+def _open_page(cdp: CDP) -> str:
+    """Attach `cdp` to Chrome's first page and return Chrome's user agent.
+
+    The targets are polled every `PAGE_POLL` seconds. No page within
+    `CHROME_START_TIMEOUT` raises `OSError`. Every later command on `cdp`
+    carries the page's session id.
+    """
+    deadline = _monotonic() + CHROME_START_TIMEOUT
+    user_agent = str(cdp.call("Browser.getVersion", timeout=CHROME_START_TIMEOUT)["userAgent"])
+    while True:
+        left = deadline - _monotonic()
+        if left <= 0:
+            raise OSError("Chrome opened no page")
+        infos = cdp.call("Target.getTargets", timeout=left).get("targetInfos", [])
+        page = next((info for info in infos if info.get("type") == "page"), None)
+        if page is not None:
+            break
+        _sleep(PAGE_POLL)
+    attached = cdp.call("Target.attachToTarget", {"targetId": page["targetId"], "flatten": True})
+    cdp.session_id = str(attached["sessionId"])
+    return user_agent
+
+
 @contextmanager
 def chrome_session(
     chrome: str, reporter: Reporter, xvfb: str | None, platform: str
@@ -1503,11 +1601,14 @@ def chrome_session(
     root = Path(tempfile.mkdtemp(prefix=TEMP_PREFIX))
     procs: list[subprocess.Popen[bytes]] = []
     xprocs: list[subprocess.Popen[bytes]] = []
-    cdp: CDP | None = None
+    fds: list[int] = []
 
     def cleanup() -> None:
-        # Chrome first, then the display it draws on. Xvfb gets SIGTERM first, so
-        # it removes its display lock file.
+        # Our ends of Chrome's pipes first. Then Chrome, then the display it draws
+        # on. Xvfb gets SIGTERM first, so it removes its display lock file.
+        while fds:
+            with suppress(OSError):
+                os.close(fds.pop())
         for p in procs:
             _kill_group(p)
         for p in xprocs:
@@ -1519,7 +1620,6 @@ def chrome_session(
             shutil.rmtree(root, ignore_errors=True)
 
     try:
-        http = _local_http()
         display: int | None = None
         if xvfb:
             # Whole before Xvfb starts: the X server lets anyone in while it has no record.
@@ -1528,53 +1628,23 @@ def chrome_session(
             _, display = start_xvfb(xvfb, browser_env(dict(os.environ), root, None), root,
                                     reporter, xprocs, auth)
         browser = ChromeProcess(chrome, root, browser_env(dict(os.environ), root, display),
-                                platform)
+                                platform, fds)
         procs.append(browser.proc)
-        port = browser.port()
-        version = http.get(f"http://127.0.0.1:{port}/json/version", timeout=10).json()
-        user_agent = version["User-Agent"]
-        targets = http.get(f"http://127.0.0.1:{port}/json/list", timeout=10).json()
-        page_ws = next(t["webSocketDebuggerUrl"] for t in targets if t.get("type") == "page")
-        cdp = CDP(page_ws)
+        cdp = CDP(browser.proc, browser.cmd_fd, browser.reply_fd)
+        user_agent = _open_page(cdp)
         where = f"Xvfb :{display}" if display is not None else "an off-screen window"
         reporter.line(msg_browser_started(where))
         yield CDPPage(cdp, user_agent)
     finally:
-        try:
-            if cdp is not None:
-                try:
-                    cdp.close()
-                except Exception:  # noqa: BLE001 - closing a dying socket must not mask the result
-                    pass
-        finally:
-            _run_held(cleanup, old_mask)
+        _run_held(cleanup, old_mask)
 
 
 # --- entry points ------------------------------------------------------------------------
 
 
 def _runtime_errors() -> tuple[type[BaseException], ...]:
-    errors: list[type[BaseException]] = [CDPError, TimeoutError, OSError, requests.RequestException,
-                                         ValueError, KeyError, StopIteration]
-    try:
-        from websockets.exceptions import WebSocketException
-
-        errors.append(WebSocketException)
-    except ImportError:
-        pass
-    return tuple(errors)
-
-
-def _has_websockets_sync() -> bool:
-    """True when `websockets.sync.client` exists, so `websockets>=11` is installed.
-
-    A plain `import websockets` passes on 10.x, which has no `sync` package.
-    `find_spec` raises when a parent package is missing, hence the `try`.
-    """
-    try:
-        return importlib.util.find_spec("websockets.sync.client") is not None
-    except (ImportError, ValueError):
-        return False
+    return (CDPError, TimeoutError, OSError, requests.RequestException, ValueError, KeyError,
+            StopIteration)
 
 
 def _now() -> datetime:
@@ -1739,9 +1809,8 @@ def _main(args: argparse.Namespace, target: Path, reporter: Reporter, platform: 
     """Windows stops first, macOS prints its line, then `--check` alone, with no lock.
 
     Every other run holds the lock throughout. Under the lock: prune the log,
-    check the saved session unless `--dry-run`, then the attempt window, then
-    `websockets`, and only then `run_login`. Nothing before the Windows check
-    imports `fcntl`.
+    check the saved session unless `--dry-run`, then the attempt window, and
+    only then `run_login`. Nothing before the Windows check imports `fcntl`.
     """
     if platform == "win32":
         reporter.line(msg_windows())
@@ -1757,9 +1826,6 @@ def _main(args: argparse.Namespace, target: Path, reporter: Reporter, platform: 
             if not args.dry_run and run_check(target, verify_session, reporter, _now()) == EXIT_OK:
                 return EXIT_OK
             check_attempt_window(log, _utc_now())
-            if not _has_websockets_sync():
-                reporter.line(msg_no_websockets())
-                return EXIT_CONFIG
             return run_login(
                 dry_run=args.dry_run,
                 target=target,
