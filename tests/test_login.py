@@ -8,6 +8,7 @@ PIDs and sockets, so a test that forgets a fake fails instead of reaching out.
 
 from __future__ import annotations
 
+import base64
 import html
 import importlib.machinery
 import importlib.metadata
@@ -22,6 +23,7 @@ import shutil
 import signal
 import socket
 import stat
+import struct
 import subprocess
 import sys
 import tempfile
@@ -52,7 +54,7 @@ SPECIAL = 'p@ss w0rd+"<&>'
 # subprocess guard fails any call to one that does not resolve under tmp_path.
 MASKED = frozenset({
     "sudo", "apt", "apt-get", "dpkg", "dpkg-deb", "dnf", "pacman", "pkexec", "snap",
-    "Xvfb", "google-chrome", "google-chrome-stable", "chromium", "chromium-browser",
+    "Xvfb", "xauth", "google-chrome", "google-chrome-stable", "chromium", "chromium-browser",
 })
 
 # Saved before the fixture replaces them, for tests of the functions themselves.
@@ -315,6 +317,16 @@ def test_fixture_path_is_a_link_folder_under_tmp_path(tmp_path):
     assert names == {n for n in os.listdir("/usr/bin")} - MASKED
     assert not names & MASKED
     assert all((folder / n).is_symlink() for n in names)
+
+
+def test_fixture_masks_xauth(monkeypatch):
+    """No test finds or runs a real `xauth`; the login writes its X cookie itself."""
+    assert shutil.which("xauth", path=os.environ["PATH"]) is None
+    ran: list = []
+    monkeypatch.setattr(subprocess, "run", lambda *a, **kw: ran.append(a))
+    with pytest.raises(pytest.fail.Exception):
+        login.subprocess.run(["xauth", "list"])
+    assert ran == []
 
 
 def test_fixture_guards_need_tmp_targets(tmp_path, monkeypatch):
@@ -634,12 +646,118 @@ def test_find_xvfb_macos_needs_none(tmp_path):
 
 
 def test_xvfb_args():
-    args = login.xvfb_args("/x/Xvfb", 7)
+    auth = Path("/srv/u/mfp-login-x/xauth")
+    args = login.xvfb_args("/x/Xvfb", 7, auth)
     assert args == [
-        "/x/Xvfb", "-displayfd", "7", "-nolisten", "tcp", "-nolisten", "unix",
-        "-screen", "0", "1366x768x24",
+        "/x/Xvfb", "-displayfd", "7", "-auth", "/srv/u/mfp-login-x/xauth",
+        "-nolisten", "tcp", "-nolisten", "unix", "-screen", "0", "1366x768x24",
     ]
+    assert args[args.index("-auth") + 1] == str(auth)
     assert "-nolock" not in args
+
+
+# --- X cookie file -------------------------------------------------------------
+
+COOKIE = bytes.fromhex("8f3a5c71e2d94b06a1c7f0e35b29d84c")
+MIT_COOKIE = b"MIT-MAGIC-COOKIE-1"
+
+
+def _hand_built_record(cookie: bytes) -> bytes:
+    return (struct.pack(">H", 65535) + struct.pack(">H", 0) + struct.pack(">H", 0)
+            + struct.pack(">H", 18) + MIT_COOKIE + struct.pack(">H", 16) + cookie)
+
+
+def _read_xauth(data: bytes) -> list[tuple[int, bytes, bytes, bytes, bytes]]:
+    """Every record, read as libXau reads them: a family, then four sized fields."""
+    records: list[tuple[int, bytes, bytes, bytes, bytes]] = []
+    at = 0
+
+    def u16() -> int:
+        nonlocal at
+        if at + 2 > len(data):
+            raise ValueError(f"short record at byte {at}")
+        (value,) = struct.unpack_from(">H", data, at)
+        at += 2
+        return value
+
+    def field() -> bytes:
+        nonlocal at
+        size = u16()
+        if at + size > len(data):
+            raise ValueError(f"short field at byte {at}")
+        at += size
+        return data[at - size:at]
+
+    while at < len(data):
+        family = u16()
+        records.append((family, field(), field(), field(), field()))
+    return records
+
+
+def _fixed_token(monkeypatch) -> list[int]:
+    """`secrets.token_bytes` as `login` sees it, returning COOKIE and recording each size."""
+    asked: list[int] = []
+
+    def token_bytes(n: int) -> bytes:
+        asked.append(n)
+        return COOKIE
+
+    # raising=False: on a base with no `secrets` import, a test still reaches its asserts.
+    monkeypatch.setattr(login, "secrets", types.SimpleNamespace(token_bytes=token_bytes),
+                        raising=False)
+    return asked
+
+
+def _cookie_forms(cookie: bytes) -> list[str]:
+    b64 = base64.b64encode(cookie).decode()
+    url = base64.urlsafe_b64encode(cookie).decode()
+    return [cookie.hex(), cookie.hex().upper(), b64, b64.rstrip("="), url, url.rstrip("="),
+            cookie.decode("latin-1"), repr(cookie)[2:-1]]
+
+
+def test_write_xauth_holds_one_wildcard_cookie_record(tmp_path):
+    path = tmp_path / "xauth"
+    login.write_xauth(path)
+    records = _read_xauth(path.read_bytes())
+    assert len(records) == 1
+    family, address, number, name, data = records[0]
+    assert (family, address, number, name) == (65535, b"", b"", MIT_COOKIE)
+    assert len(data) == 16
+    assert stat.S_IMODE(path.stat().st_mode) == 0o600
+    first = path.read_bytes()
+    with pytest.raises(FileExistsError):
+        login.write_xauth(path)
+    assert path.read_bytes() == first
+    other = tmp_path / "other"
+    login.write_xauth(other)
+    assert _read_xauth(other.read_bytes())[0][4] != data
+
+
+def test_write_xauth_bytes_match_a_hand_built_record(tmp_path, monkeypatch):
+    given = tmp_path / "given"
+    login.write_xauth(given, COOKIE)
+    assert given.read_bytes() == _hand_built_record(COOKIE)
+    asked = _fixed_token(monkeypatch)
+    drawn = tmp_path / "drawn"
+    login.write_xauth(drawn)
+    assert asked == [16]
+    assert drawn.read_bytes() == _hand_built_record(COOKIE)
+
+
+@pytest.mark.skipif(not Path("/proc/self/fd").is_dir(), reason="no /proc/self/fd here")
+def test_write_xauth_closes_its_fd_on_every_path(tmp_path, monkeypatch):
+    before = sorted(os.listdir("/proc/self/fd"))
+    login.write_xauth(tmp_path / "a")
+    with pytest.raises(FileExistsError):
+        login.write_xauth(tmp_path / "a")
+
+    def fsync(fd):
+        raise OSError(5, "disk gone")
+
+    monkeypatch.setattr(login.os, "fsync", fsync)
+    with pytest.raises(OSError, match="disk gone"):
+        login.write_xauth(tmp_path / "b")
+    assert sorted(os.listdir("/proc/self/fd")) == before
 
 
 def test_xvfb_start_failure_prints_its_own_stderr(tmp_path, monkeypatch):
@@ -653,7 +771,7 @@ def test_xvfb_start_failure_prints_its_own_stderr(tmp_path, monkeypatch):
     env = login.browser_env(dict(os.environ), root, None)
     xprocs: list = []
     with pytest.raises(login.LoginError) as err:
-        login.start_xvfb(str(fake), env, root, cap.reporter, xprocs)
+        login.start_xvfb(str(fake), env, root, cap.reporter, xprocs, root / "xauth")
     assert err.value.code == 2
     # It stays listed after its own kill, so cleanup can kill it again.
     assert [p.args[0] for p in xprocs] == [str(fake)]
@@ -731,7 +849,7 @@ def test_chrome_session_stops_chrome_then_sends_xvfb_sigterm_first(tmp_path, mon
     monkeypatch.setattr(login, "chrome_session", ORIG["chrome_session"])
     monkeypatch.setattr(login, "_kill_leftovers", lambda root, *a: None)
 
-    def start_xvfb(xvfb_path, env, root, reporter, xprocs):
+    def start_xvfb(xvfb_path, env, root, reporter, xprocs, auth):
         xprocs.append(xvfb)
         return xvfb, 9
 
@@ -790,15 +908,18 @@ def test_chrome_args_macos_off_screen(tmp_path):
 
 def test_browser_env_points_home_and_display_at_ours(tmp_path):
     base = {"HOME": "/srv/u", "TMPDIR": "/tmp", "DISPLAY": ":5", "WAYLAND_DISPLAY": "wayland-0",
-            "PATH": "/usr/bin", "MFP_USERNAME": EMAIL, "MFP_PASSWORD": PASSWORD,
-            "MFP_SECRET_KEY": "k3y", "MFP_FOO": "bar"}
+            "XAUTHORITY": "/srv/u/.Xauthority", "PATH": "/usr/bin", "MFP_USERNAME": EMAIL,
+            "MFP_PASSWORD": PASSWORD, "MFP_SECRET_KEY": "k3y", "MFP_FOO": "bar"}
     env = login.browser_env(base, tmp_path, 3)
     assert env == {"HOME": str(tmp_path), "TMPDIR": str(tmp_path), "DISPLAY": ":3",
-                   "PATH": "/usr/bin"}
+                   "XAUTHORITY": str(tmp_path / "xauth"), "PATH": "/usr/bin"}
+    # No display, as for Xvfb itself and on macOS: no X cookie, ours or inherited.
     mac = login.browser_env(base, tmp_path, None)
     assert mac == {"HOME": str(tmp_path), "TMPDIR": str(tmp_path), "DISPLAY": ":5",
                    "WAYLAND_DISPLAY": "wayland-0", "PATH": "/usr/bin"}
+    assert "XAUTHORITY" not in mac
     assert base["HOME"] == "/srv/u"
+    assert base["XAUTHORITY"] == "/srv/u/.Xauthority"
     assert base["MFP_PASSWORD"] == PASSWORD
 
 
@@ -2728,6 +2849,58 @@ def test_kill_leftovers_kills_only_the_process_naming_our_root(tmp_path, monkeyp
     monkeypatch.setattr(login.os, "kill", lambda pid, sig: sent.append((pid, sig)))
     ORIG["_kill_leftovers"](root, proc_dir=proc_dir)
     assert sent == [(4242, signal.SIGKILL)]
+
+
+# --- the X cookie through the real session ---------------------------------------
+
+
+def test_real_chrome_session_locks_xvfb_with_the_cookie_chrome_holds(
+    tmp_path, monkeypatch, capsys
+):
+    """The cookie file is whole before Xvfb starts. Xvfb and Chrome name the same file."""
+    asked = _fixed_token(monkeypatch)
+    xproc = _StartingXvfb()
+    shutil_calls = _main_to_the_end_of_the_session(tmp_path, monkeypatch, FakePage(), xproc)
+    monkeypatch.setattr(login, "_kill_leftovers", lambda root, *a: None)
+    signals: list[tuple[int, int]] = []
+    monkeypatch.setattr(login.os, "killpg", lambda pgid, s: signals.append((pgid, s)))
+    monkeypatch.setenv("XAUTHORITY", "/srv/u/.Xauthority")
+    calls: list[dict] = []
+
+    def spawn(args, env, pass_fds=(), stderr=None):
+        auth = Path(args[args.index("-auth") + 1]) if "-auth" in args else None
+        held = auth.read_bytes() if auth is not None and auth.is_file() else None
+        calls.append({"args": list(args), "env": dict(env), "auth": auth, "held": held,
+                      "mode": stat.S_IMODE(auth.stat().st_mode) if held is not None else None})
+        if stderr is None:
+            return FakeProc()
+        os.write(pass_fds[0], b"9\n")
+        return xproc
+
+    monkeypatch.setattr(login, "_spawn", spawn)
+    assert login.main(["--dry-run"], cookies_file=tmp_path / "c.json") == 0
+    lines = _lines(capsys)
+    assert [c["args"][0] for c in calls] == ["/fake/Xvfb", "/fake/chrome"]
+    xvfb_call, chrome_call = calls
+    root = Path(chrome_call["env"]["HOME"])
+    auth = root / "xauth"
+    assert xvfb_call["auth"] == auth
+    assert xvfb_call["held"] == _hand_built_record(COOKIE)
+    assert xvfb_call["mode"] == 0o600
+    assert [k for k in xvfb_call["env"] if k == "XAUTHORITY"] == []
+    assert chrome_call["env"]["XAUTHORITY"] == str(auth)
+    assert chrome_call["env"]["DISPLAY"] == ":9"
+    assert "-auth" not in chrome_call["args"]
+    assert asked == [16]
+    assert signals == [(xproc.pid, signal.SIGTERM)]
+    assert shutil_calls.removed == [root]
+    assert not auth.exists()
+    assert _roots_left(tmp_path) == []
+    assert login.msg_browser_started("Xvfb :9") in lines
+    assert lines[-1] == login.msg_dry_run(2)
+    shown = lines + [text for c in calls for text in (*c["args"], *c["env"].values())]
+    for form in _cookie_forms(COOKIE):
+        assert [text for text in shown if form in text] == []
 
 
 # --- platform, discovery order -------------------------------------------------

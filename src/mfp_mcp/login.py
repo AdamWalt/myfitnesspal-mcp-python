@@ -13,9 +13,11 @@ server. An unset value is prompted for on a terminal: the username with
 
 Chrome runs headed, since Cloudflare Turnstile never clears in headless Chrome.
 On Linux it is Google Chrome or Chromium from PATH; a snap Chromium is skipped.
-It draws on a private Xvfb display, found on PATH. With no Xvfb there, the run
-exits 2 and prints the install command for the package tool it finds. With
-`--install-xvfb`, `apt-get` on PATH and a terminal, it runs
+It draws on a private Xvfb display, found on PATH. The display admits only
+clients holding a random X cookie, kept in a 0600 file in the run's temp
+folder; Xvfb and Chrome get the file's path, never the cookie. With no Xvfb
+there, the run exits 2 and prints the install command for the package tool it
+finds. With `--install-xvfb`, `apt-get` on PATH and a terminal, it runs
 `sudo apt-get install xvfb` itself, so apt asks for consent. On macOS the
 window opens off-screen; that path is experimental and was never run live. On
 Windows the command exits 2: run it under WSL2, where the Linux steps apply.
@@ -73,9 +75,11 @@ import importlib.util
 import json
 import logging
 import os
+import secrets
 import select
 import shutil
 import signal
+import struct
 import subprocess
 import sys
 import tempfile
@@ -122,6 +126,12 @@ SCREEN = (1366, 768)
 XVFB_TIMEOUT = 15.0
 XVFB_TERM_GRACE = 5.0
 XVFB_LOG = "xvfb.log"
+XAUTH_FILE = "xauth"
+# One Xauthority record: family 65535 with an empty address and display number
+# matches any display, so it works before `-displayfd` reports the number.
+XAUTH_FAMILY_WILD = 65535
+XAUTH_PROTOCOL = b"MIT-MAGIC-COOKIE-1"
+XAUTH_COOKIE_LEN = 16
 XVFB_TAIL_LINES = 5
 TEMP_PREFIX = "mfp-login-"
 
@@ -628,14 +638,45 @@ def find_xvfb(
     return found
 
 
-def xvfb_args(xvfb: str, fd: int) -> list[str]:
-    """Pick a free display and listen only on the abstract socket.
+def xauth_path(root: Path) -> Path:
+    """The X cookie file of the run whose temp folder is `root`."""
+    return root / XAUTH_FILE
+
+
+def _xauth_field(data: bytes) -> bytes:
+    return struct.pack(">H", len(data)) + data
+
+
+def write_xauth(path: Path, cookie: bytes | None = None) -> None:
+    """Write one wildcard MIT-MAGIC-COOKIE-1 record to a new 0600 file at `path`.
+
+    The cookie is 16 random bytes unless given. An existing file raises
+    `FileExistsError`: the X server reloads the file whenever it changes, and
+    lets anyone in when a reload finds no record, so the file is written once,
+    whole, before Xvfb starts, and never again. The cookie never leaves here.
+    """
+    if cookie is None:
+        cookie = secrets.token_bytes(XAUTH_COOKIE_LEN)
+    record = (struct.pack(">H", XAUTH_FAMILY_WILD) + _xauth_field(b"") + _xauth_field(b"")
+              + _xauth_field(XAUTH_PROTOCOL) + _xauth_field(cookie))
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    try:
+        view = memoryview(record)
+        while view:
+            view = view[os.write(fd, view):]
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def xvfb_args(xvfb: str, fd: int, auth: Path) -> list[str]:
+    """Pick a free display, listen only on the abstract socket, admit only `auth`'s cookie.
 
     Xvfb keeps its display lock file, which keeps two servers off one display.
     Cleanup sends SIGTERM first, so Xvfb removes its own `/tmp/.X<n>-lock`.
     """
-    return [xvfb, "-displayfd", str(fd), "-nolisten", "tcp", "-nolisten", "unix",
-            "-screen", "0", f"{SCREEN[0]}x{SCREEN[1]}x24"]
+    return [xvfb, "-displayfd", str(fd), "-auth", str(auth), "-nolisten", "tcp",
+            "-nolisten", "unix", "-screen", "0", f"{SCREEN[0]}x{SCREEN[1]}x24"]
 
 
 def parse_display(raw: bytes) -> int:
@@ -666,11 +707,17 @@ def chrome_args(chrome: str, user_data_dir: Path, platform: str) -> list[str]:
 
 
 def browser_env(base: dict[str, str], root: Path, display: int | None) -> dict[str, str]:
-    """No `MFP_*` variable. HOME and TMPDIR in our temp folder. On Linux, our display only."""
+    """No `MFP_*` variable. HOME and TMPDIR in our temp folder. On Linux, our display only.
+
+    With a display, XAUTHORITY names this run's X cookie file. Without one, as
+    for Xvfb itself and on macOS, an inherited XAUTHORITY is dropped.
+    """
     env = _child_env(base)
     env.update(HOME=str(root), TMPDIR=str(root))
+    env.pop("XAUTHORITY", None)
     if display is not None:
         env["DISPLAY"] = f":{display}"
+        env["XAUTHORITY"] = str(xauth_path(root))
         env.pop("WAYLAND_DISPLAY", None)
     return env
 
@@ -1315,8 +1362,12 @@ def start_xvfb(
     root: Path,
     reporter: Reporter,
     xprocs: list[subprocess.Popen[bytes]],
+    auth: Path,
 ) -> tuple[subprocess.Popen[bytes], int]:
     """Start Xvfb on a free display and return it with the display number.
+
+    `auth` is the X cookie file, already written in full. Xvfb admits only
+    clients that hold its cookie.
 
     The new process goes into `xprocs` before the wait for its display number,
     so a stop signal during that wait still reaches the caller's cleanup. It
@@ -1329,7 +1380,8 @@ def start_xvfb(
     log = root / XVFB_LOG
     try:
         with open(log, "wb") as err:
-            proc = _spawn(xvfb_args(xvfb, write_fd), env, pass_fds=(write_fd,), stderr=err)
+            proc = _spawn(xvfb_args(xvfb, write_fd, auth), env, pass_fds=(write_fd,),
+                          stderr=err)
             xprocs.append(proc)
     finally:
         os.close(write_fd)
@@ -1470,8 +1522,11 @@ def chrome_session(
         http = _local_http()
         display: int | None = None
         if xvfb:
+            # Whole before Xvfb starts: the X server lets anyone in while it has no record.
+            auth = xauth_path(root)
+            write_xauth(auth)
             _, display = start_xvfb(xvfb, browser_env(dict(os.environ), root, None), root,
-                                    reporter, xprocs)
+                                    reporter, xprocs, auth)
         browser = ChromeProcess(chrome, root, browser_env(dict(os.environ), root, display),
                                 platform)
         procs.append(browser.proc)
