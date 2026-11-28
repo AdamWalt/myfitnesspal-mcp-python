@@ -1405,6 +1405,32 @@ def _kill_leftovers(root: Path | str, proc_dir: Path = Path("/proc")) -> None:
             continue
 
 
+def _can_mask() -> bool:
+    return hasattr(signal, "pthread_sigmask")
+
+
+def _run_held(cleanup: Callable[[], None], old_mask: Iterable[int] | None) -> None:
+    """Run `cleanup` with the stop signals blocked, then put `old_mask` back.
+
+    A signal held meanwhile is delivered by the restore. A `_Stopped` raised
+    by the block call itself is kept and raised after cleanup.
+    """
+    if old_mask is None:
+        cleanup()
+        return
+    pending: BaseException | None = None
+    try:
+        signal.pthread_sigmask(signal.SIG_BLOCK, STOP_SIGNALS)
+    except BaseException as e:  # noqa: BLE001 - raised below, once cleanup ran
+        pending = e
+    try:
+        cleanup()
+    finally:
+        signal.pthread_sigmask(signal.SIG_SETMASK, old_mask)
+        if pending is not None:
+            raise pending
+
+
 @contextmanager
 def chrome_session(
     chrome: str, reporter: Reporter, xvfb: str | None, platform: str
@@ -1414,7 +1440,14 @@ def chrome_session(
     Always kills Chrome and Xvfb and removes the temp folder. A stop signal
     reaches here as the `_Stopped` that `main`'s handler raises, so this
     `finally` cleans up on SIGINT, SIGTERM and SIGHUP too.
+
+    The cleanup itself runs with those signals blocked. One that arrives
+    during it is held until every step ran, then raised, so the run still
+    exits 128 plus the signal. The mask is per thread, and the login runs in
+    one thread. Without `pthread_sigmask`, the cleanup runs unblocked.
     """
+    # Read before anything exists: CPython runs pending handlers inside this call.
+    old_mask = signal.pthread_sigmask(signal.SIG_BLOCK, []) if _can_mask() else None
     root = Path(tempfile.mkdtemp(prefix=TEMP_PREFIX))
     procs: list[subprocess.Popen[bytes]] = []
     xprocs: list[subprocess.Popen[bytes]] = []
@@ -1459,7 +1492,7 @@ def chrome_session(
                 except Exception:  # noqa: BLE001 - closing a dying socket must not mask the result
                     pass
         finally:
-            cleanup()
+            _run_held(cleanup, old_mask)
 
 
 # --- entry points ------------------------------------------------------------------------
@@ -1693,6 +1726,7 @@ def main(
     SIGINT, SIGTERM and SIGHUP are handled for the whole run. The first one
     raises `_Stopped`, which unwinds through every cleanup, and `main` returns
     128 plus the signal. Later signals are ignored while that cleanup runs.
+    One that arrives during the browser cleanup is held until it ends.
     """
     reporter = Reporter()
     state = {"stopped": False, "done": False}

@@ -197,8 +197,36 @@ def _guard_targets(tmp_path: Path):
     return main, run_login
 
 
+# The real call, saved before any test wraps the `signal` that `login` sees.
+SIGMASK = getattr(signal, "pthread_sigmask", None)
+
+
+def _thread_mask() -> set[int]:
+    return SIGMASK(signal.SIG_BLOCK, [])
+
+
+def _restore_mask(mask: set[int]) -> None:
+    """Drop any held stop signal, then put the thread's mask back.
+
+    A held signal must never reach pytest's own handler once it is unblocked.
+    Without `sigtimedwait`, as on macOS, a no-op handler takes it instead.
+    """
+    if hasattr(signal, "sigtimedwait"):
+        for _ in signal.sigpending() & set(login.STOP_SIGNALS):
+            signal.sigtimedwait(login.STOP_SIGNALS, 0)
+        SIGMASK(signal.SIG_SETMASK, mask)
+        return
+    old = {sig: signal.signal(sig, lambda signum, frame: None) for sig in login.STOP_SIGNALS}
+    try:
+        SIGMASK(signal.SIG_SETMASK, mask)
+    finally:
+        for sig, handler in old.items():
+            signal.signal(sig, handler)
+
+
 @pytest.fixture(autouse=True)
 def _isolate(monkeypatch, tmp_path):
+    mask = _thread_mask() if SIGMASK is not None else None
     monkeypatch.setenv("HOME", str(tmp_path))
     for key in list(os.environ):
         if key.startswith("MFP_"):
@@ -237,6 +265,9 @@ def _isolate(monkeypatch, tmp_path):
     for key in list(os.environ):
         if key.startswith("MFP_"):
             os.environ.pop(key)
+    # A test that fails mid-cleanup must not leave stop signals blocked.
+    if mask is not None:
+        _restore_mask(mask)
 
 
 class Capture:
@@ -2331,7 +2362,7 @@ class _StartingXvfb:
     """An Xvfb fake still in its startup wait: alive, and gone after one wait."""
 
     pid = 727_272
-    args = ["Xvfb"]
+    args = ("Xvfb",)
 
     def poll(self):
         return None
@@ -2409,6 +2440,262 @@ def test_xvfb_that_prints_nothing_is_listed_through_its_wait(tmp_path, monkeypat
     assert seen == [[str(xvfb_exe)]]
     assert _roots_left(tmp_path) == []
     assert _lines(capsys)[-1] == login.msg_xvfb_start_failed("")
+
+
+# --- signals during cleanup ----------------------------------------------------
+
+needs_sigmask = pytest.mark.skipif(SIGMASK is None, reason="no pthread_sigmask on this platform")
+
+
+@pytest.fixture(params=["sigtimedwait", "no-sigtimedwait"])
+def drain(request, monkeypatch):
+    """Runs a test twice: once as on Linux, once without `sigtimedwait`, as on macOS."""
+    if request.param == "no-sigtimedwait" and hasattr(signal, "sigtimedwait"):
+        monkeypatch.delattr(signal, "sigtimedwait")
+    return request.param
+
+
+class _SignalProxy:
+    """`signal` as `login` sees it, with `pthread_sigmask` wrapped, or gone when None."""
+
+    def __init__(self, sigmask) -> None:
+        self._sigmask = sigmask
+
+    def __getattr__(self, name):
+        if name == "pthread_sigmask":
+            if self._sigmask is None:
+                raise AttributeError(name)
+            return self._sigmask
+        return getattr(signal, name)
+
+
+class _RecordingShutil:
+    """`shutil` as `login` sees it, recording each `rmtree` before running it."""
+
+    def __init__(self) -> None:
+        self.removed: list[Path] = []
+
+    def __getattr__(self, name):
+        return getattr(shutil, name)
+
+    def rmtree(self, path, *args, **kwargs):
+        self.removed.append(Path(path))
+        return shutil.rmtree(path, *args, **kwargs)
+
+
+class _SessionHttp:
+    """Chrome's `/json/version` and `/json/list` answers."""
+
+    def get(self, url, timeout=None):
+        if url.endswith("/json/version"):
+            body = {"User-Agent": FakePage.user_agent}
+        else:
+            body = [{"type": "page", "webSocketDebuggerUrl": "ws://127.0.0.1:1/devtools/page/1"}]
+        return types.SimpleNamespace(json=lambda: body)
+
+
+class _QuietCDP:
+    def __init__(self, ws_url: str) -> None:
+        self.ws_url = ws_url
+
+    def close(self) -> None:
+        pass
+
+
+class _StubbornXvfb:
+    """An Xvfb fake that outlives SIGTERM. Its grace wait sends a stop signal."""
+
+    pid = 838_383
+    args = ("Xvfb",)
+
+    def __init__(self, sig: int) -> None:
+        self.sig = sig
+        self.alive = True
+        self.waits: list[float | None] = []
+
+    def poll(self):
+        return None if self.alive else 0
+
+    def wait(self, timeout=None):
+        self.waits.append(timeout)
+        if timeout == login.XVFB_TERM_GRACE:
+            os.kill(os.getpid(), self.sig)
+            raise subprocess.TimeoutExpired("Xvfb", timeout)
+        return 0
+
+
+def _main_to_the_end_of_the_session(tmp_path, monkeypatch, page: FakePage,
+                                    xproc: _StubbornXvfb | None = None) -> _RecordingShutil:
+    """`main` runs the real `chrome_session` through its whole `with` body.
+
+    Chrome, Xvfb, Chrome's HTTP answers and the DevTools socket are fakes.
+    A given `xproc` stands in for Xvfb and writes display 9 to its pipe.
+    """
+    monkeypatch.setattr(login, "chrome_session", ORIG["chrome_session"])
+    monkeypatch.setattr(login, "_platform", lambda: "linux")
+    monkeypatch.setattr(login, "find_chrome", lambda platform, path, **kw: "/fake/chrome")
+    monkeypatch.setattr(login, "find_xvfb",
+                        lambda platform, path, **kw: "/fake/Xvfb" if xproc else None)
+    monkeypatch.setattr(login, "verify_session", _ok_verify)
+    monkeypatch.setenv("MFP_USERNAME", EMAIL)
+    monkeypatch.setenv("MFP_PASSWORD", PASSWORD)
+
+    def spawn(args, env, pass_fds=(), stderr=None):
+        if stderr is None:
+            return FakeProc()
+        os.write(pass_fds[0], b"9\n")
+        return xproc
+
+    monkeypatch.setattr(login, "_spawn", spawn)
+    monkeypatch.setattr(login.ChromeProcess, "port", lambda self, timeout=30.0: 9222)
+    monkeypatch.setattr(login, "_local_http", _SessionHttp)
+    monkeypatch.setattr(login, "CDP", _QuietCDP)
+    monkeypatch.setattr(login, "CDPPage", lambda cdp, user_agent: page)
+    recorder = _RecordingShutil()
+    monkeypatch.setattr(login, "shutil", recorder)
+    return recorder
+
+
+class _FailingPage(FakePage):
+    def navigate(self, url: str) -> None:
+        raise login.LoginError(login.EXIT_CHALLENGE, "challenge page")
+
+
+@needs_sigmask
+@pytest.mark.parametrize("page", [FakePage, _FailingPage], ids=["normal-exit", "login-error"])
+def test_sigint_inside_cleanup_is_held_until_every_step_ran(tmp_path, monkeypatch, capsys,
+                                                            drain, page):
+    """SIGINT from `_kill_leftovers`: rmtree still runs, then the stop exits 130."""
+    shutil_calls = _main_to_the_end_of_the_session(tmp_path, monkeypatch, page())
+    kills: list[Path] = []
+
+    def kill_leftovers(root, *a):
+        kills.append(Path(root))
+        os.kill(os.getpid(), signal.SIGINT)
+
+    monkeypatch.setattr(login, "_kill_leftovers", kill_leftovers)
+    before = _thread_mask()
+    assert login.main(["--dry-run"], cookies_file=tmp_path / "c.json") == 130
+    assert _thread_mask() == before
+    assert _roots_left(tmp_path) == []
+    assert len(kills) == 1
+    assert shutil_calls.removed == kills
+    assert _lines(capsys)[-1] == login.msg_stopped(signal.SIGINT)
+
+
+@needs_sigmask
+def test_sighup_inside_the_xvfb_grace_wait_still_sends_sigkill(tmp_path, monkeypatch, capsys,
+                                                               drain):
+    xproc = _StubbornXvfb(signal.SIGHUP)
+    _main_to_the_end_of_the_session(tmp_path, monkeypatch, FakePage(), xproc)
+    monkeypatch.setattr(login, "_kill_leftovers", lambda root, *a: None)
+    signals: list[tuple[int, int]] = []
+
+    def killpg(pgid, sig):
+        signals.append((pgid, sig))
+        if sig == signal.SIGKILL:
+            xproc.alive = False
+
+    monkeypatch.setattr(login.os, "killpg", killpg)
+    before = _thread_mask()
+    assert login.main(["--dry-run"], cookies_file=tmp_path / "c.json") == 129
+    assert _thread_mask() == before
+    assert signals == [(xproc.pid, signal.SIGTERM), (xproc.pid, signal.SIGKILL)]
+    assert xproc.waits == [login.XVFB_TERM_GRACE, 10]
+    assert _roots_left(tmp_path) == []
+    assert _lines(capsys)[-1] == login.msg_stopped(signal.SIGHUP)
+
+
+@needs_sigmask
+def test_cleanup_puts_back_the_mask_main_started_with(tmp_path, monkeypatch, capsys, drain):
+    """A stop signal blocked before `main` stays blocked after it."""
+    _main_to_the_end_of_the_session(tmp_path, monkeypatch, FakePage())
+    monkeypatch.setattr(login, "_kill_leftovers",
+                        lambda root, *a: os.kill(os.getpid(), signal.SIGINT))
+    SIGMASK(signal.SIG_BLOCK, [signal.SIGHUP])
+    before = _thread_mask()
+    assert signal.SIGHUP in before
+    assert login.main(["--dry-run"], cookies_file=tmp_path / "c.json") == 130
+    assert _thread_mask() == before
+    assert _roots_left(tmp_path) == []
+    assert _lines(capsys)[-1] == login.msg_stopped(signal.SIGINT)
+
+
+def _sigmask_that_stops(on: str, calls: list[tuple[int, set[int]]]):
+    """The real call, then `_Stopped(SIGINT)` once: on the entry read or on the block."""
+    raised: list[bool] = []
+
+    def sigmask(how, mask):
+        mask = set(mask)
+        result = SIGMASK(how, mask)
+        calls.append((how, mask))
+        wanted = set() if on == "read" else set(login.STOP_SIGNALS)
+        if how == signal.SIG_BLOCK and mask == wanted and not raised:
+            raised.append(True)
+            raise login._Stopped(signal.SIGINT)
+        return result
+
+    return sigmask
+
+
+@needs_sigmask
+def test_stop_raised_inside_the_block_call_still_cleans_up(tmp_path, monkeypatch, capsys,
+                                                           drain):
+    shutil_calls = _main_to_the_end_of_the_session(tmp_path, monkeypatch, FakePage())
+    monkeypatch.setattr(login, "_kill_leftovers", lambda root, *a: None)
+    calls: list[tuple[int, set[int]]] = []
+    monkeypatch.setattr(login, "signal", _SignalProxy(_sigmask_that_stops("block", calls)))
+    before = _thread_mask()
+    assert login.main(["--dry-run"], cookies_file=tmp_path / "c.json") == 130
+    assert _thread_mask() == before
+    assert [how for how, _ in calls] == [signal.SIG_BLOCK, signal.SIG_BLOCK, signal.SIG_SETMASK]
+    assert calls[-1] == (signal.SIG_SETMASK, before)
+    assert len(shutil_calls.removed) == 1
+    assert _roots_left(tmp_path) == []
+    assert _lines(capsys)[-1] == login.msg_stopped(signal.SIGINT)
+
+
+@needs_sigmask
+def test_stop_raised_inside_the_entry_mask_read_leaves_no_root(tmp_path, monkeypatch, capsys,
+                                                               drain):
+    _main_to_the_end_of_the_session(tmp_path, monkeypatch, FakePage())
+    calls: list[tuple[int, set[int]]] = []
+    monkeypatch.setattr(login, "signal", _SignalProxy(_sigmask_that_stops("read", calls)))
+    before = _thread_mask()
+    assert login.main(["--dry-run"], cookies_file=tmp_path / "c.json") == 130
+    assert _thread_mask() == before
+    assert calls == [(signal.SIG_BLOCK, set())]
+    assert _roots_left(tmp_path) == []
+    assert _lines(capsys)[-1] == login.msg_stopped(signal.SIGINT)
+
+
+def test_without_pthread_sigmask_cleanup_runs_as_before(tmp_path, monkeypatch, capsys):
+    shutil_calls = _main_to_the_end_of_the_session(tmp_path, monkeypatch, FakePage())
+    monkeypatch.setattr(login, "_kill_leftovers", lambda root, *a: None)
+    monkeypatch.setattr(login, "signal", _SignalProxy(None))
+    assert not hasattr(login.signal, "pthread_sigmask")
+    assert login.main(["--dry-run"], cookies_file=tmp_path / "c.json") == 0
+    assert len(shutil_calls.removed) == 1
+    assert _roots_left(tmp_path) == []
+
+
+@needs_sigmask
+def test_fixture_mask_restore_drops_a_held_stop_signal(drain):
+    """A stop signal held when a test ends never reaches the handler after it."""
+    seen: list[int] = []
+    old = signal.signal(signal.SIGINT, lambda signum, frame: seen.append(signum))
+    try:
+        before = _thread_mask()
+        SIGMASK(signal.SIG_BLOCK, [signal.SIGINT])
+        os.kill(os.getpid(), signal.SIGINT)
+        assert signal.SIGINT in signal.sigpending()
+        _restore_mask(before)
+        assert signal.SIGINT not in signal.sigpending()
+        assert _thread_mask() == before
+    finally:
+        signal.signal(signal.SIGINT, old)
+    assert seen == []
+    assert hasattr(signal, "sigtimedwait") == (drain == "sigtimedwait")
 
 
 def _proc_entry(proc_dir: Path, pid: int | str, cmdline: bytes) -> None:
