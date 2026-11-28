@@ -1310,9 +1310,17 @@ def _tail(path: Path, secrets: Iterable[str]) -> str:
 
 
 def start_xvfb(
-    xvfb: str, env: dict[str, str], root: Path, reporter: Reporter
+    xvfb: str,
+    env: dict[str, str],
+    root: Path,
+    reporter: Reporter,
+    xprocs: list[subprocess.Popen[bytes]],
 ) -> tuple[subprocess.Popen[bytes], int]:
     """Start Xvfb on a free display and return it with the display number.
+
+    The new process goes into `xprocs` before the wait for its display number,
+    so a stop signal during that wait still reaches the caller's cleanup. It
+    stays there on failure too, so cleanup can kill it again.
 
     Its stderr goes to a file in `root`. When no display number comes back, the
     error holds the last lines of that file.
@@ -1322,6 +1330,7 @@ def start_xvfb(
     try:
         with open(log, "wb") as err:
             proc = _spawn(xvfb_args(xvfb, write_fd), env, pass_fds=(write_fd,), stderr=err)
+            xprocs.append(proc)
     finally:
         os.close(write_fd)
     try:
@@ -1428,9 +1437,8 @@ def chrome_session(
         http = _local_http()
         display: int | None = None
         if xvfb:
-            xproc, display = start_xvfb(xvfb, browser_env(dict(os.environ), root, None), root,
-                                        reporter)
-            xprocs.append(xproc)
+            _, display = start_xvfb(xvfb, browser_env(dict(os.environ), root, None), root,
+                                    reporter, xprocs)
         browser = ChromeProcess(chrome, root, browser_env(dict(os.environ), root, display),
                                 platform)
         procs.append(browser.proc)

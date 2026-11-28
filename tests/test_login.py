@@ -620,9 +620,12 @@ def test_xvfb_start_failure_prints_its_own_stderr(tmp_path, monkeypatch):
     root.mkdir()
     cap = Capture()
     env = login.browser_env(dict(os.environ), root, None)
+    xprocs: list = []
     with pytest.raises(login.LoginError) as err:
-        login.start_xvfb(str(fake), env, root, cap.reporter)
+        login.start_xvfb(str(fake), env, root, cap.reporter, xprocs)
     assert err.value.code == 2
+    # It stays listed after its own kill, so cleanup can kill it again.
+    assert [p.args[0] for p in xprocs] == [str(fake)]
     assert err.value.message == login.msg_xvfb_start_failed("boom")
     assert "boom" in err.value.message
     assert not err.value.message.startswith("display: no Xvfb")
@@ -696,7 +699,12 @@ def test_chrome_session_stops_chrome_then_sends_xvfb_sigterm_first(tmp_path, mon
     monkeypatch.setattr(login.os, "killpg", killpg)
     monkeypatch.setattr(login, "chrome_session", ORIG["chrome_session"])
     monkeypatch.setattr(login, "_kill_leftovers", lambda root, *a: None)
-    monkeypatch.setattr(login, "start_xvfb", lambda *a: (xvfb, 9))
+
+    def start_xvfb(xvfb_path, env, root, reporter, xprocs):
+        xprocs.append(xvfb)
+        return xvfb, 9
+
+    monkeypatch.setattr(login, "start_xvfb", start_xvfb)
     spawned: list[list[str]] = []
 
     def spawn(args, env, pass_fds=(), stderr=None):
@@ -2317,6 +2325,90 @@ def test_signal_inside_the_real_chrome_session_cleans_its_root(tmp_path, monkeyp
     assert sorted(k for k in spawned[0][1] if k.startswith("MFP_")) == []
     assert spawned[0][1]["HOME"] == str(root)
     assert _lines(capsys)[-1] == login.msg_stopped(signal.SIGTERM)
+
+
+class _StartingXvfb:
+    """An Xvfb fake still in its startup wait: alive, and gone after one wait."""
+
+    pid = 727_272
+    args = ["Xvfb"]
+
+    def poll(self):
+        return None
+
+    def wait(self, timeout=None):
+        return 0
+
+
+def _main_with_fake_tools(tmp_path, monkeypatch) -> tuple[Path, Path]:
+    """`main` reaches the real `chrome_session` with fake Chrome and Xvfb scripts."""
+    chrome, xvfb = _fake_exe(tmp_path, "google-chrome"), _fake_exe(tmp_path, "Xvfb")
+    monkeypatch.setattr(login, "chrome_session", ORIG["chrome_session"])
+    monkeypatch.setattr(login, "_platform", lambda: "linux")
+    monkeypatch.setattr(login, "find_chrome", lambda platform, path, **kw: str(chrome))
+    monkeypatch.setattr(login, "find_xvfb", lambda platform, path, **kw: str(xvfb))
+    monkeypatch.setenv("MFP_USERNAME", EMAIL)
+    monkeypatch.setenv("MFP_PASSWORD", PASSWORD)
+    return chrome, xvfb
+
+
+def _roots_left(tmp_path: Path) -> list[str]:
+    return sorted(p.name for p in (tmp_path / "tmp").iterdir() if p.name.startswith("mfp-login-"))
+
+
+@pytest.mark.parametrize("sig, code", STOPS, ids=["SIGINT", "SIGTERM", "SIGHUP"])
+def test_signal_in_the_xvfb_startup_wait_still_kills_xvfb(
+    tmp_path, monkeypatch, capsys, sig, code
+):
+    """A stop before Xvfb writes its display number: cleanup still signals Xvfb."""
+    _, xvfb_exe = _main_with_fake_tools(tmp_path, monkeypatch)
+    xproc = _StartingXvfb()
+    spawned: list[str] = []
+    signals: list[tuple[int, int]] = []
+    monkeypatch.setattr(login, "_kill_leftovers", lambda root, *a: None)
+    monkeypatch.setattr(login.os, "killpg", lambda pgid, s: signals.append((pgid, s)))
+
+    def spawn(args, env, pass_fds=(), stderr=None):
+        spawned.append(args[0])
+        return xproc
+
+    def wait(rlist, wlist, xlist, timeout=None):
+        assert timeout == login.XVFB_TIMEOUT
+        os.kill(os.getpid(), sig)
+        return [], [], []
+
+    monkeypatch.setattr(login, "_spawn", spawn)
+    monkeypatch.setattr(login, "select", types.SimpleNamespace(select=wait))
+    assert login.main(["--dry-run"], cookies_file=tmp_path / "c.json") == code
+    assert signals == [(xproc.pid, signal.SIGTERM)]
+    assert spawned == [str(xvfb_exe)]
+    assert _roots_left(tmp_path) == []
+    assert _lines(capsys)[-1] == login.msg_stopped(sig)
+
+
+def test_xvfb_that_prints_nothing_is_listed_through_its_wait(tmp_path, monkeypatch, capsys):
+    """A fake Xvfb that writes nothing and exits: listed in the wait, then the start error."""
+    _, xvfb_exe = _main_with_fake_tools(tmp_path, monkeypatch)
+    xvfb_exe.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    monkeypatch.setattr(login, "_spawn", ORIG["_spawn"])
+    real_start, real_select = login.start_xvfb, login.select.select
+    lists: list[list] = []
+    seen: list[list[str] | None] = []
+
+    def start_xvfb(*args):
+        lists.extend(a for a in args[4:] if isinstance(a, list))
+        return real_start(*args)
+
+    def wait(rlist, wlist, xlist, timeout=None):
+        seen.append([p.args[0] for p in lists[0]] if lists else None)
+        return real_select(rlist, wlist, xlist, timeout)
+
+    monkeypatch.setattr(login, "start_xvfb", start_xvfb)
+    monkeypatch.setattr(login, "select", types.SimpleNamespace(select=wait))
+    assert login.main(["--dry-run"], cookies_file=tmp_path / "c.json") == 2
+    assert seen == [[str(xvfb_exe)]]
+    assert _roots_left(tmp_path) == []
+    assert _lines(capsys)[-1] == login.msg_xvfb_start_failed("")
 
 
 def _proc_entry(proc_dir: Path, pid: int | str, cmdline: bytes) -> None:
